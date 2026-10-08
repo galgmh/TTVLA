@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tempvla"
+version = "0.1.0"
+description = "Temperature + tactile VLA dataset generation on Genesis (Franka Panda + parallel gripper)"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "genesis-world==1.4.1",
+    "numpy>=1.26.4",
+    "h5py>=3.10",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+# torch must be installed separately with the CUDA index (see README):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+dev = ["pytest", "matplotlib"]
+
+[tool.setuptools.packages.find]
+include = ["tempvla*"]

@@ -1,0 +1,20 @@
+# 字节码 / 环境 / 构建产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+.pytest_cache/
+
+# 生成数据集与输出（data/、data_cam/、data_lift/、将来的 data_gel/ 等都不入库）
+data*/
+*.hdf5
+*.npz
+
+# 视频默认不入库（生成物 / 一次性实验产物）；
+# docs/figures/ 的交付视频例外——docs/status.md 直接引用它们
+*.mp4
+!docs/figures/*.mp4
+
+logs/

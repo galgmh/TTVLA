@@ -1,0 +1,192 @@
+# ROUND-TRIP FIXTURE — identical to configs/lift_object.yaml except for the
+# marked lines below. The shipped configs record world-frame tactile vectors and
+# rely on obs/link_pose to rotate them back; this file records the same episode
+# in the link frame (world_frame: false). Generating one seed with each and
+# asserting `disp_world @ R(q) == disp_link` is the proof that the recorded
+# marker field is exactly invertible (docs §9-R8, plan step 4).
+# Reproduce (WSL2 software GL required for the cameras):
+#   python scripts/generate.py --config configs/lift_gel_preview.yaml \
+#          --material aluminum --episodes 1 --out /tmp/gel_preview
+#
+# TemperatureVLA task: lift the object (the minimal task of the suite).
+#
+# "Lift" is the smallest thing the scripted expert does: APPROACH -> DESCEND ->
+# CLOSE -> LIFT -> HOLD, with success = the object rose `lift_success_m` above
+# where it started. pick_hot_cylinder is this plus the hot-object framing; the
+# v2 suite adds place_hot_object / push_hot_object on top of the same expert.
+#
+# The sensing stack is deliberately NOT reduced here (tactile probes, thermal
+# grids, cameras): a task that recorded less would not show what the dataset
+# actually contains, and every downstream consumer reads the same channel table.
+#
+# One material per output file (thermal properties, object size and mass are
+# frozen at scene build); pose / yaw / initial temperature vary per episode.
+# Everything here maps 1:1 onto tempvla/config.py dataclasses.
+
+task_id: lift_object
+language_template: "lift the {material} cylinder"
+materials: [aluminum, copper, abs, steel]
+
+# Thermal properties handed to gs.sensors.TemperatureGrid (properties_dict).
+# conductivity W/(m*K), density kg/m^3, specific_heat J/(kg*K), emissivity 0-1.
+# emissivity is forced to 0 for every material: the engine's per-voxel
+# radiation term is ~1e4x too strong at our voxel sizes (docs §9-R14) and a
+# hot object would otherwise reach ambient within seconds. Real emissivities
+# for the data card: aluminum 0.10, copper 0.30, abs 0.90, steel 0.30.
+material_properties:
+  aluminum: {conductivity: 205.0, density: 2700.0, specific_heat: 900.0, emissivity: 0.0}
+  copper: {conductivity: 385.0, density: 8960.0, specific_heat: 385.0, emissivity: 0.0}
+  abs: {conductivity: 0.20, density: 1040.0, specific_heat: 1400.0, emissivity: 0.0}
+  steel: {conductivity: 45.0, density: 7850.0, specific_heat: 470.0, emissivity: 0.0}
+
+robot:
+  urdf: urdf/panda_bullet/panda.urdf
+  merge_fixed_links: false
+  hand_link_name: panda_hand
+  finger_link_names: [panda_leftfinger, panda_rightfinger]
+  ik_link_name: panda_hand
+  tcp_offset: [0.0, 0.0, 0.105]   # grip center in the hand frame (see gate1 calibration)
+  open_finger_pos: 0.04
+  closed_finger_pos: 0.0
+  base_pos: [0.0, 0.0, 0.0]
+  base_quat: [1.0, 0.0, 0.0, 0.0]
+  init_qpos: [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785, 0.04, 0.04]
+
+controller:
+  pos_scale_m: 0.05          # action a[0:3] * pos_scale -> TCP delta (m)
+  rot_scale_rad: 0.5         # action a[3:6] * rot_scale -> TCP rotvec delta
+  control_hz: 20.0
+  sim_dt: 0.005
+  decimation: 10
+  ik_damping: 0.1
+  ik_max_iters: 25
+  ik_max_samples: 4
+  # Rate-limit the finger setpoint (m/s of finger-joint travel, 0 = unlimited).
+  # 0.04 -> a full 40 mm stroke takes 1 s. Measured 2026-10-03: this does slow
+  # the physical close ~10x (episodes 34 -> 42-44 steps, +25% generation time,
+  # success unchanged), but it does NOT smooth the recorded tactile onset — the
+  # 0 -> ~45 N step is probe standoff + the contact-gated SDF query, unchanged
+  # even at 10x slower closing (docs §9-R22). Set 0 to restore the old timing.
+  finger_speed_m_per_s: 0.04
+
+# Scripted-expert knobs. Tuned automatically by `python scripts/autotune.py`
+# (which writes a *.tuned.yaml copy); controller scales above are not tuned.
+expert:
+  approach_clearance_m: 0.08   # approach height above the grasp point
+  grasp_z_offset_m: 0.0        # TCP target z relative to the object center
+  pos_tol_m: 0.01              # APPROACH -> DESCEND position tolerance
+  rot_tol_rad: 0.2             # APPROACH -> DESCEND orientation tolerance
+  descend_tol_m: 0.015         # DESCEND -> CLOSE position tolerance
+  contact_depth_m: 1.0e-5      # probe depth above which contact counts
+  squeeze_steps: 10            # closed-loop steps held before lifting
+  close_timeout_steps: 40      # give up closing after this many steps
+  lift_height_m: 0.10
+  lift_tol_m: 0.012            # LIFT -> HOLD position tolerance
+  grasp_xy_jitter_m: 0.004     # per-episode grasp xy randomization
+  approach_yaw_jitter_rad: 0.15
+  close_extra: 1.0             # grip command in CLOSE/LIFT/HOLD (1.0 = closed)
+
+tactile:
+  # The marker field (`elastomer`) is the tactile representation: one 3D
+  # displacement per gel marker, with the undeformed marker positions in
+  # layouts/. Probe density is PER MODALITY, so the dense gel grid does not
+  # widen force/depth — they keep their 12 probes per finger (docs §5.2).
+  modalities: [force, depth, elastomer]
+  probe_grid: {default: [4, 3], elastomer: [16, 16]}   # 12 and 256 probes/finger
+  probe_offset_m: 0.0005
+  pad_tol_m: 0.0015          # mesh pad-slab thickness (see docs §5.2); 0.5..2 mm stable
+  probe_radius_m: 0.004
+  as_grid: true
+  # HydroShear length scales (1/m^2). The engine default 700 spreads the
+  # response over the whole pad (1/sqrt(700) = 38 mm); 5e4 -> 4.5 mm bulge,
+  # 2e4 -> 7 mm shear spread. Keep compressibility at 1: compressibility<1 or
+  # elastomer_thickness>0 takes an FFT path that crashes (docs §9-R8).
+  elastomer_params: {lambda_d: 50000.0, lambda_s: 20000.0}
+  contact_links: true
+  temporal_reduction: median
+  world_frame: false         # FIXTURE: link-frame vectors — the reference the
+  #                            world-frame file is checked against, step by step
+
+temperature:
+  finger_grid: [4, 4, 1]
+  object_grid: [4, 4, 4]
+  ambient_temp_c: 21.0
+  # 0 + emissivity 0 = adiabatic episodes: the engine's per-voxel rad/conv term
+  # is missing the face-area factor and over-cools ~1e4x at our voxel sizes
+  # (130 C -> ambient in ~0.4 s). Physically, air cooling of a metal part has
+  # tau ~1e3 s, so 0 is also the closer model over a <=20 s episode; contact
+  # conduction remains the only thermal channel (docs §9-R14).
+  convection_coefficient: 0.0
+  simulate_all_link_temperatures: true
+  sensor_time_constant: 0.0
+  # 0 -> the engine uses the contact-polygon area only. The engine's fallback
+  # area = max(polygon, pi * weight * penetration) is 14 cm^2 at 4.6 mm
+  # penetration, which makes the explicit contact update diverge (docs §9-R16).
+  contact_depth_weight: 0.0
+  record_ground_truth: true
+  # k also *is* the contact-coupling gain: the engine's explicit per-voxel
+  # update amplifies by c = dt*k_eff*A^2/(V^2*rho*cp) per substep with A the
+  # full contact patch and V = voxel_volume + gs.EPS (docs §9-R16). The pad's
+  # voxel_volume is 1.44 mm^3 — below gs.EPS = 1.19e-7 (= float32 eps, added by
+  # the kernel), so V is eps-dominated at ~121 mm^3 and c stays sane: with the
+  # ~2.3 cm^2 patch a closed grasp produces, k=0.02 -> c ~ 5e-3 (measured pad
+  # ramp +0.07 C/substep, i.e., ~2 s to the object temperature — a rate, not a
+  # step), while k=10 with the pi*penetration area fallback diverges (verified:
+  # cells pin at the +-1000 C clamp).
+  finger_properties: {conductivity: 0.02, density: 1100.0, specific_heat: 1400.0, emissivity: 0.0}
+  environment_properties: {conductivity: 0.15, density: 700.0, specific_heat: 1600.0, emissivity: 0.0}
+
+object:
+  shape: cylinder
+  radius_m: [0.015, 0.025]
+  height_m: [0.05, 0.08]
+  mass_kg: [0.05, 0.15]
+  temp_c: [60.0, 200.0]
+  xy_jitter_m: 0.04
+  yaw_jitter_rad: 3.14159
+
+table:
+  pos: [0.4, 0.0, 0.0]     # xy = table center (z comes from height_m)
+  size: [0.6, 0.8, 0.04]
+  height_m: 0.4
+
+recording:
+  output_dir: /tmp/gel_preview
+  keep_failed: true
+  compression: gzip
+  compression_opts: 4
+  contact_burst: true
+  burst_pre_s: 0.05
+  burst_post_s: 0.25
+  burst_max_windows: 10
+  # Every modality is packed into the 200 Hz windows, including the 16x16 marker
+  # field (~218 KiB per window gzipped, ~2.2 MiB/episode at 10 windows). Set
+  # `burst_modalities: [force, depth]` to drop it — see docs §4.7-L4.
+
+cameras:
+  # Same rig as pick_hot_cylinder: `enabled: true` writes obs/agentview_rgb +
+  # obs/eye_in_hand_rgb (Gate 3 rendering + Gate 4 round trip, docs §8).
+  # Requires software GL under WSL2 — generate.py refuses to start without it.
+  enabled: true
+  renderer: raster           # raster | batch (batch needs a Vulkan loader) | raytrace
+  # 256² since 2026-10-03: measured on this box, dual cameras cost +63 ms/step at
+  # 256² vs +65 ms/step at 128² — the llvmpipe raster path is dominated by
+  # per-frame overhead, not by pixel count, so 4x the pixels is free in time.
+  # The bill is disk instead: ~1.25 MiB/episode vs ~0.49 (docs §8). Prompted by
+  # the object being ~10 px at 128²; it is ~20 px here (0.94 mm/px at 512²).
+  resolution: [256, 256]
+  agentview_pos: [0.78, -0.38, 0.70]     # close view: the object is ~20 px at 256²
+  agentview_lookat: [0.40, 0.0, 0.48]
+  fov: 45.0
+  eye_in_hand: true
+  eye_in_hand_pos: [0.10, 0.0, 0.02]     # hand frame: out to the side of the flange
+  eye_in_hand_lookat: [0.0, 0.0, 0.10]   # the TCP, between the fingers
+  eye_in_hand_up: [0.0, 0.0, -1.0]       # image-up = world-up with the gripper down
+  eye_in_hand_fov: 60.0
+  near: 0.01                 # the default 0.1 would clip a wrist camera's fingers
+  far: 20.0
+
+max_episode_steps: 400
+lift_success_m: 0.05
+stable_steps: 10
+seed: 0
