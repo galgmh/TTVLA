@@ -1,0 +1,221 @@
+# ThermTacVLA task: pick the cold can.
+
+task_id: pick_cold_can
+
+language_template:
+  # Level 1: Basic pick-and-place
+  # Locate the target, grasp it, transport it, place it in the tray, and release.
+  - "Pick up the cold can and place it in the tray."
+  - "Move the chilled beverage can into the tray."
+  - "Grasp the cold drink can and put it inside the tray."
+  - "Take the cold can from the table and put it in the tray."
+
+  # Level 2: Thermal discrimination between visually similar cans
+  # The target is the cold can; the visually identical distractor is warm.
+  - "Pick up the colder can and place it in the tray."
+  - "Among the cans, select the cold one and place it in the tray."
+  - "Find the chilled can rather than the warm can and put it in the tray."
+  - "Identify the cold can by touch and move it into the tray."
+
+  # Level 3: Distractor-robust target selection
+  # Other objects include milk, a lemon, and wooden and metal cubes.
+  - "Find the cold can among the objects and put it in the tray."
+  - "Place the chilled beverage can in the tray, not the warm one."
+  - "Select the cold can from the objects on the table and place it inside the tray."
+  - "Use touch to identify the chilled can, then place it in the tray."
+
+# Thermal properties handed to gs.sensors.TemperatureGrid:
+# conductivity W/(m*K), density kg/m^3, specific_heat J/(kg*K), emissivity 0-1.
+# emissivity is forced to 0: the engine's per-voxel radiation term is ~1e4x (1m vs 1cm)
+
+material_properties:
+  aluminum: {conductivity: 205.0, density: 2700.0, specific_heat: 900.0, emissivity: 0.0}
+  iron: {conductivity: 80.0, density: 7870.0, specific_heat: 450.0, emissivity: 0.0}
+  balsa: {conductivity: 0.055, density: 160.0, specific_heat: 2900.0, emissivity: 0.0}
+  paperboard: {conductivity: 0.06, density: 700.0, specific_heat: 1300.0, emissivity: 0.0}
+  lemon: {conductivity: 0.50, density: 950.0, specific_heat: 3800.0, emissivity: 0.0}
+
+# One body per material
+material_list: [aluminum, aluminum, lemon, paperboard, aluminum, balsa, iron]
+
+# Measured bodies
+objects:
+  - shape: mesh                # can A: cold can, freezer..fridge
+    mesh_file: robosuite/models/assets/objects/meshes/can.obj
+    mesh_scale: 1.0
+    mesh_euler_deg: [0.0, 0.0, 0.0]
+    place_xy: [-0.10, -0.20]
+    radius_m: [0.0250, 0.0250]
+    height_m: [0.0800, 0.0800]
+    mass_kg: [0.35, 0.35]      # a full can; independent of the mesh volume, as always
+    temp_c: [-18.0, 4.0]       # cold, freezer..fridge
+    xy_jitter_m: 0.01
+    yaw_jitter_rad: 0.15
+  - shape: mesh                # can B: warm twin (distractor)
+    mesh_file: robosuite/models/assets/objects/meshes/can.obj
+    mesh_scale: 1.0
+    mesh_euler_deg: [0.0, 0.0, 0.0]
+    place_xy: [0.01, -0.20]
+    radius_m: [0.0250, 0.0250]
+    height_m: [0.0800, 0.0800]
+    mass_kg: [0.35, 0.35]
+    temp_c: [35.0, 40.0]
+    xy_jitter_m: 0.01
+    yaw_jitter_rad: 0.15
+  - shape: mesh                # lemon: ellipsoid via the non-uniform MJCF scale
+    mesh_file: robosuite/models/assets/objects/meshes/lemon.obj
+    mesh_scale: [1.5, 1.0, 1.0]
+    mesh_euler_deg: [0.0, 0.0, 0.0]
+    place_xy: [0.12, -0.20]
+    radius_m: [0.0338, 0.0338]
+    height_m: [0.0400, 0.0400]
+    mass_kg: [0.15, 0.15]
+    temp_c: [25.0, 25.0]       # ambient: this body is the control
+    xy_jitter_m: 0.01
+    yaw_jitter_rad: 0.15
+  - shape: mesh                # milk A: robosuite carton at its MJCF 0.9, warm
+    mesh_file: robosuite/models/assets/objects/meshes/milk.obj
+    mesh_scale: 0.9
+    mesh_euler_deg: [0.0, 0.0, 0.0]
+    place_xy: [-0.16, -0.04]
+    radius_m: [0.0199, 0.0199]
+    height_m: [0.1440, 0.1440]
+    mass_kg: [0.26, 0.26]
+    temp_c: [55.0, 60.0]
+    xy_jitter_m: 0.01
+    yaw_jitter_rad: 0.15
+  - shape: mesh                # can C: room temperature twin (distractor)
+    mesh_file: robosuite/models/assets/objects/meshes/can.obj
+    mesh_scale: 1.0
+    mesh_euler_deg: [0.0, 0.0, 0.0]
+    place_xy: [-0.04, -0.04]
+    radius_m: [0.0250, 0.0250]
+    height_m: [0.0800, 0.0800]
+    mass_kg: [0.35, 0.35]
+    temp_c: [20.0, 20.0]
+    xy_jitter_m: 0.01
+    yaw_jitter_rad: 0.15
+  - shape: cube                # wooden cube: balsa
+    place_xy: [0.08, -0.04]
+    side_m: [0.040, 0.040]
+    mass_kg: [0.045, 0.045]    # 0.045 kg / 64 cm^3 = 703 kg/m^3, an honest wood
+    temp_c: [60.0, 60.0]
+    color: [0.55, 0.35, 0.18]  # render-only: wood brown
+    xy_jitter_m: 0.01
+    yaw_jitter_rad: 0.15
+  - shape: cube                # metal cube: iron
+    place_xy: [0.20, -0.04]
+    side_m: [0.040, 0.040]
+    mass_kg: [0.504, 0.504]      # honest iron would be 0.504 kg
+    temp_c: [60.0, 60.0]
+    color: [0.72, 0.73, 0.76]  # render-only: bare metal grey
+    xy_jitter_m: 0.01
+    yaw_jitter_rad: 0.15
+min_object_gap_m: 0.02         # surface separation guard for the sampled slots
+
+# The scripted expert always picks object 0 (the cold can)
+target_index: 0
+
+# Delivery tray at the far edge: five `fixed` boxes
+tray:
+  enabled: true
+  place_xy: [0.0, 0.30]
+  inner_x_m: 0.17
+  inner_y_m: 0.17
+  rim_m: 0.035
+  wall_m: 0.008
+  floor_m: 0.008
+  fuse_m: 0.001
+  color: [0.35, 0.35, 0.38]
+
+robot:
+  urdf: urdf/panda_bullet/panda.urdf
+  merge_fixed_links: false
+  hand_link_name: panda_hand
+  finger_link_names: [panda_leftfinger, panda_rightfinger]
+  arm_joint_names: [panda_joint1, panda_joint2, panda_joint3, panda_joint4,
+                    panda_joint5, panda_joint6, panda_joint7]
+  finger_joint_names: [panda_finger_joint1, panda_finger_joint2]
+  tcp_offset: [0.0, 0.0, 0.105]   # grip center in the hand frame (see gate1 calibration)
+  open_finger_pos: 0.04
+  closed_finger_pos: 0.0
+  base_pos: [0.0, 0.0, 0.0]
+  base_quat: [1.0, 0.0, 0.0, 0.0]
+  init_qpos: [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785, 0.04, 0.04]
+  # PD gains / force limits (Genesis control_franka example, per dof).
+  arm_kp: [4500.0, 4500.0, 3500.0, 3500.0, 2000.0, 2000.0, 2000.0]
+  arm_kv: [450.0, 450.0, 350.0, 350.0, 200.0, 200.0, 200.0]
+  finger_kp: [100.0, 100.0]
+  finger_kv: [10.0, 10.0]
+  arm_force_min: [-87.0, -87.0, -87.0, -87.0, -12.0, -12.0, -12.0]
+  arm_force_max: [87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0]
+  finger_force_min: [-100.0, -100.0]
+  finger_force_max: [100.0, 100.0]
+
+# motivation control
+controller:
+  pos_scale_m: 0.05          # action a[0:3] * pos_scale -> TCP delta (m)
+  rot_scale_rad: 0.5         # action a[3:6] * rot_scale -> TCP rotvec delta
+  control_hz: 20.0
+  sim_dt: 0.005
+  decimation: 10
+  ik_damping: 0.1
+  ik_max_iters: 25
+  ik_max_samples: 4
+  finger_speed_m_per_s: 0.0  # 0 = unlimited (jump to the finger command)
+
+# expert: task contract only
+expert:
+  approach: place_in_tray            # the expert's final delivery action
+  temperature_judge_enabled: true    # decide the target from the fingertip trace
+  temperature_candidate: [0, 1, 4]      # bodies the judge may touch, random order per episode
+  temperature_judge_threshold_c: [null, 4.0]
+
+tactile:
+  # Two derived signals:
+  #   force     -> AT-VLA 6D resultant per finger: [Fn(3), Ft(3)], link frame
+  #   elastomer -> 2D marker displacement in the pad tangent plane, (P, 2)
+  modalities: [force, elastomer]
+
+temperature:
+  finger_grid: [1, 1, 1]
+  object_grid: [4, 4, 4]
+  ambient_temp_c: 21.0  # normal room temperature
+
+table:
+  pos: [0.4, 0.0, 0.0]     # xy = table center (z comes from height_m)
+  size: [0.6, 0.8, 0.04]
+  height_m: 0.4
+  color: [0.55, 0.38, 0.22]   # render-only; a mid-tone table so textured bodies read
+
+recording:
+  output_dir: datasets/thermal_recognition/pick_cold_can/hdf5
+  keep_failed: true
+  compression: gzip
+  compression_opts: 4
+  contact_burst: true
+  burst_pre_s: 0.05
+  burst_post_s: 0.25
+  burst_max_windows: 10
+
+cameras:
+  # Full-tabletop overview + wrist camera.
+  enabled: true
+  resolution: [512, 512]
+
+  agentview_pos: [0.38, -0.62, 0.82]
+  agentview_lookat: [0.40, 0.00, 0.43]
+  fov: 45.0
+  eye_in_hand: true
+  eye_in_hand_pos: [0.10, 0.0, 0.02]     # hand frame: out to the side of the flange
+  eye_in_hand_lookat: [0.0, 0.0, 0.10]   # the TCP, between the fingers
+  eye_in_hand_up: [0.0, 0.0, -1.0]       # image-up = world-up with the gripper down
+  eye_in_hand_fov: 60.0
+  near: 0.01                 # the default 0.1 would clip a wrist camera's fingers
+  far: 20.0
+
+max_episode_steps: 400
+success_criterion: place_in_tray   # at rest in the cavity, pads open, expert DONE
+tray_rest_tol_m: 0.005             # |body bottom - tray floor| at rest
+stable_steps: 10
+seed: 0

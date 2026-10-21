@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tempvla"
+name = "thermtacvla"
 version = "0.1.0"
 description = "Temperature + tactile VLA dataset generation on Genesis (Franka Panda + parallel gripper)"
 readme = "README.md"
@@ -13,6 +13,8 @@ dependencies = [
     "numpy>=1.26.4",
     "h5py>=3.10",
     "PyYAML>=6.0",
+    "scipy>=1.11",   # sim/tools/height_map.py（1.3 高度图合成，生成链路用到）
+    "Pillow>=10",    # sim/tools/gel_render.py + scripts/render_video.py（延迟 import）
 ]
 
 [project.optional-dependencies]
@@ -21,4 +23,9 @@ dependencies = [
 dev = ["pytest", "matplotlib"]
 
 [tool.setuptools.packages.find]
-include = ["tempvla*"]
+include = ["sim*"]
+
+[tool.setuptools.package-data]
+# Runtime assets (URDF + meshes + textures) travel with the package; the sim
+# resolves them from `sim/assets/` (see sim/assets/README.md).
+sim = ["assets/**/*"]

@@ -1,8 +1,8 @@
 #!/usr/bin/env python
-"""Render demos from a TemperatureVLA HDF5 file to MP4.
+"""Render demos from a ThermTacVLA HDF5 file to MP4.
 
-    python scripts/render_video.py data_cam/pick_hot_cylinder_aluminum.hdf5 --demo 0
-    python scripts/render_video.py data_lift/lift_object_copper.hdf5 --demo 0 3 --scale 3
+    python scripts/render_video.py datasets/v1.5/hdf5/pick_cold_can_aluminum_aluminum_lemon_paperboard_paperboard_balsa_iron.hdf5 --demo 0
+    # several demos / bigger panels: ... --demo 0 --demo 3 --scale 3
 
 Frames are read straight out of the file, so the video shows exactly what a
 dataset consumer sees (not a re-render, which would drift from the recorded
@@ -15,7 +15,11 @@ actually contain, synchronised to the same step:
   * one 4x3 |F| map per finger (``obs/tactile/force``, world-frame magnitude —
     rotation-invariant, so no per-link orientation is needed), values printed in
     the cells because a colour alone cannot be read off a still;
-  * a 4x4 fingertip temperature map per finger (``obs/temperature/fingertip_grid``);
+  * a fingertip temperature map per finger (``obs/temperature/fingertip_grid``):
+    a 4x4 strip map under the engine's default AABB box (docs §9-R26), or the
+    lumped ``(1,1,1)`` measured cell of format 1.5 (docs §9-R36) — then there is
+    no map to draw, so the panel is skipped and the header readout carries
+    **both** fingers' measured temperature;
   * the 4x4x4 object voxel grid (``obs/temperature/object_grid``) as four z
     slices, on a per-episode tight scale — for a good conductor the object is
     very nearly isothermal, and the printed range is what says so;
@@ -37,7 +41,10 @@ actually contain, synchronised to the same step:
     field is projected onto the pad normal in the **link frame**, using
     ``obs/link_pose`` to undo the world-frame recording when there is one (a file
     without it falls back to ``|disp|``, which is frame-independent but is not a
-    height field). This *shows* the recorded field — it adds no spatial detail
+    height field). A format-1.6 file records only the in-plane part of the marker
+    motion — ``(T, F*P, 2)`` in the pad tangent frame — so there the panel draws
+    the in-plane ``|disp|`` and no projection is involved. This *shows* the
+    recorded field — it adds no spatial detail
     the field does not have, so a 4x3 source reads as a soft dome while a 9x7 or
     16x16 marker grid reads as a real imprint. With ``--markers`` the lattice is
     overlaid: a dot per undeformed marker and a segment to where it moved — also
@@ -66,8 +73,8 @@ import numpy as np
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from tempvla.tools import tactile_field  # noqa: E402  (needs REPO on sys.path)
-from tempvla.tools.gel_render import (   # noqa: E402
+from sim.tools import tactile_field  # noqa: E402  (needs REPO on sys.path)
+from sim.tools.gel_render import (   # noqa: E402
     gel_field,
     gel_slope,
     gelsight_image,
@@ -130,7 +137,7 @@ def _field_image(values: np.ndarray, cell: int, stops, vmin: float, vmax: float)
 
 
 # The photometric model behind the gel panel (LED rig, height -> normals -> RGB)
-# and the grid geometry it needs live in tempvla/tools/gel_render.py, so any other
+# and the grid geometry it needs live in sim/tools/gel_render.py, so any other
 # viewer can draw the same picture; what stays here is panel *layout* arithmetic.
 
 
@@ -170,14 +177,23 @@ def _draw_marker_overlay(d, x0: int, y0: int, size: tuple[int, int], tan, disp: 
     The shading shows only the out-of-plane component; this is the part that shows
     the recorded *vector* field — what a marker tracker measures, and what makes the
     in-plane shear visible at all.
+
+    ``disp`` is either (rows, cols, 3) link-frame displacement, projected here onto
+    the pad tangent axes ``tan``, or (rows, cols, 2) pad-tangent displacement
+    (format 1.6) — already in the image frame, component 1 across the columns and
+    component 0 down the rows, so it needs no tangent basis.
     """
-    if mpp is None or tan is None or disp is None:
+    if mpp is None or disp is None or (disp.shape[-1] == 3 and tan is None):
         return
     w, h = int(size[0]), int(size[1])
     xs, ys = lattice_nodes((w, h), grid)
-    u_col, u_row = tan
-    px = xs + gain * (disp @ u_col) / mpp[0]      # image x = grid columns
-    py = ys + gain * (disp @ u_row) / mpp[1]      # image y = grid rows
+    if disp.shape[-1] == 2:
+        px = xs + gain * disp[..., 1] / mpp[0]      # image x = grid columns
+        py = ys + gain * disp[..., 0] / mpp[1]      # image y = grid rows
+    else:
+        u_col, u_row = tan
+        px = xs + gain * (disp @ u_col) / mpp[0]      # image x = grid columns
+        py = ys + gain * (disp @ u_row) / mpp[1]      # image y = grid rows
     for r in range(xs.shape[0]):
         for c in range(xs.shape[1]):
             sx, sy = x0 + int(xs[r, c]), y0 + int(ys[r, c])
@@ -289,6 +305,7 @@ def load_demo(path: Path, demo: str) -> dict:
             "gripper": obs["gripper_states"][:, 0].astype(np.float32) if "gripper_states" in obs else None,
             "object_temp": obs["temperature/object"][:, 0].astype(np.float32) if "temperature/object" in obs else None,
             "fingertip": None,
+            "fingertip_lumped": None,  # (T, F) measured cell when the grid is (1,1,1)
             "ee_pos": obs["ee_pos"][:].astype(np.float32) if "ee_pos" in obs else None,
             "contact_steps": [],
             # fields for the sensing band
@@ -298,7 +315,7 @@ def load_demo(path: Path, demo: str) -> dict:
             "prox_ts": None,        # (T, F) Σ|F| (proximity is on its own scale)
             "depth_ts": None,       # (T, F) max depth per finger, m
             "depth_grid": None,     # (T, F, R, C) probe penetration depth, m
-            "fingertip_grid": None,  # (T, F, 4, 4) C
+            "fingertip_grid": None,  # (T, F, rows, cols) C — the finger pad map
             "object_grid": None,    # (T, 4, 4, 4) C
             "finger_names": ["finger 0", "finger 1"],
             "grids": grids,         # modality -> (rows, cols), as recorded
@@ -309,14 +326,22 @@ def load_demo(path: Path, demo: str) -> dict:
             "gel_hmax": None,       # per-episode ceiling, so the imprint is comparable frame to frame
             "gel_cells": None,      # (rows, cols) of pad *cells* the drawn panel spans
             "gel_pos": None,        # per finger (P, 3) positions of the grid that field came from
-            "gel_disp": None,       # (T, F, R, C, 3) link-frame marker displacement, m
-            "gel_tan": None,        # per finger (u_col, u_row) — the image axes, in the link frame
+            "gel_disp": None,       # (T, F, R, C, 2|3) marker displacement, m; 2 = pad tangent
+            "gel_tan": None,        # per finger (u_col, u_row) — image axes of a 3-component field
         }
         if "temperature/fingertip_grid" in obs:
             ft = obs["temperature/fingertip_grid"][:].astype(np.float32)
             out["fingertip"] = ft.reshape(ft.shape[0], -1).max(axis=1)  # hottest taxel per step
-            if ft.ndim == 5 and ft.shape[-1] == 1:          # (T, fingers, H, W, 1) -> (T, fingers, H, W)
-                out["fingertip_grid"] = ft[..., 0]
+            # Format 1.5: the lumped (1,1,1) measured cell — one value per finger,
+            # no spatial axis to draw. Keep the per-finger pair for the header.
+            if int(np.prod(ft.shape[2:])) == 1:
+                out["fingertip_lumped"] = ft.reshape(ft.shape[0], ft.shape[1])
+            # (T, fingers, nx, ny, nz) -> (T, fingers, rows, cols): an AABB finger
+            # grid (docs §9-R26) has exactly two live spatial axes and one collapsed
+            # normal slab (nz=1), and keeps the recorded axis order.
+            live = [s for s in ft.shape[2:] if s > 1]
+            if ft.ndim == 5 and len(live) == 2:
+                out["fingertip_grid"] = ft.reshape(ft.shape[0], ft.shape[1], *live)
         if "temperature/object_grid" in obs:
             og = obs["temperature/object_grid"][:].astype(np.float32)
             out["object_grid"] = og if og.ndim == 4 else None
@@ -378,38 +403,50 @@ def load_demo(path: Path, demo: str) -> dict:
         # Marker field: the vector channel behind a height map, and the height
         # source itself when no map was recorded.
         if "tactile/elastomer" in obs:
-            # (T, F*P, 3) marker displacement, m — fingers concatenated along the probe
+            # (T, F*P, C) marker displacement, m — fingers concatenated along the probe
             # axis (same layout as the force channel), P = that grid's rows*cols.
+            # C=2 (format 1.6) is pad-tangent (u = rows, v = cols); C=3 is the older
+            # link/world-frame vector that still carries the out-of-plane part.
             E = obs["tactile/elastomer"][:].astype(np.float32)
             grid = grids.get("elastomer")
             n_p = grid[0] * grid[1] if grid else 0
-            if n_p and E.shape[1] % n_p == 0:
+            if n_p and E.shape[1] % n_p == 0 and E.shape[-1] in (2, 3):
                 nf = E.shape[1] // n_p
-                Ef = E.reshape(E.shape[0], nf, n_p, 3)
-                Eg = Ef.reshape(E.shape[0], nf, *grid, 3)   # per-marker, for the projection
-                # A gel frame is the *out-of-plane* deformation, and "out of plane" is
-                # the pad normal — not an axis of the link frame (on the Panda fingers
-                # it is -y), so the projection needs the stored normal *and* the link
-                # frame. World-frame recordings are rotated back with obs/link_pose,
-                # which makes that exact; a file predating link_pose has neither the
-                # pose nor (usually) an addressable normal, and there |disp| is the
-                # only frame-independent quantity left.
+                n_comp = int(E.shape[-1])
+                Ef = E.reshape(E.shape[0], nf, n_p, n_comp)
+                Eg = Ef.reshape(E.shape[0], nf, *grid, n_comp)   # per-marker, for the projection
                 pos, nrm = geom.get("elastomer", (None, None))
-                nrm_f = (np.stack([n.reshape(*grid, 3) for n in nrm])
-                         if nrm is not None and len(nrm) == nf else None)
-                if nrm_f is None:
-                    field, src = np.linalg.norm(Ef, axis=-1), "gel |disp| (no pad normal)"
-                elif not tactile_field.world_frame(f):
-                    field = (Eg * nrm_f[None]).sum(axis=-1)
-                    src = "marker disp·n  link frame (recorded)"
+                if n_comp == 2:
+                    # Format 1.6: displacement in the pad's tangent plane, (u = grid
+                    # rows, v = grid columns), out-of-plane dropped. There is no
+                    # height to project onto the normal, so the panel draws the
+                    # in-plane magnitude, and the marker overlay works on (u, v)
+                    # directly (see _draw_marker_overlay).
+                    field, src = np.linalg.norm(Ef, axis=-1), "marker |disp| pad tangent"
                     out["gel_disp"] = Eg.astype(np.float64)
-                elif "link_pose" not in obs:
-                    field, src = np.linalg.norm(Ef, axis=-1), "gel |disp|  world frame, no link_pose"
                 else:
-                    disp = tactile_field.read_markers(f, demo, "elastomer", frame="link")
-                    field = (disp * nrm_f[None]).sum(axis=-1)
-                    src = "marker disp·n  link frame via link_pose"
-                    out["gel_disp"] = disp
+                    # A gel frame is the *out-of-plane* deformation, and "out of plane" is
+                    # the pad normal — not an axis of the link frame (on the Panda fingers
+                    # it is -y), so the projection needs the stored normal *and* the link
+                    # frame. World-frame recordings are rotated back with obs/link_pose,
+                    # which makes that exact; a file predating link_pose has neither the
+                    # pose nor (usually) an addressable normal, and there |disp| is the
+                    # only frame-independent quantity left.
+                    nrm_f = (np.stack([n.reshape(*grid, 3) for n in nrm])
+                             if nrm is not None and len(nrm) == nf else None)
+                    if nrm_f is None:
+                        field, src = np.linalg.norm(Ef, axis=-1), "gel |disp| (no pad normal)"
+                    elif not tactile_field.world_frame(f):
+                        field = (Eg * nrm_f[None]).sum(axis=-1)
+                        src = "marker disp·n  link frame (recorded)"
+                        out["gel_disp"] = Eg.astype(np.float64)
+                    elif "link_pose" not in obs:
+                        field, src = np.linalg.norm(Ef, axis=-1), "gel |disp|  world frame, no link_pose"
+                    else:
+                        disp = tactile_field.read_markers(f, demo, "elastomer", frame="link")
+                        field = (disp * nrm_f[None]).sum(axis=-1)
+                        src = "marker disp·n  link frame via link_pose"
+                        out["gel_disp"] = disp
                 # Sign convention: the normal points out of the pad, so an
                 # indentation reads negative. Draw the deformation as positive
                 # height — a bulge and an equal dent differ only by hue order, and
@@ -424,13 +461,19 @@ def load_demo(path: Path, demo: str) -> dict:
                         out["gel_grid"] = field.reshape(E.shape[0], nf, *grid)
                         out["gel_src"] = f"{src} {grid[0]}x{grid[1]}"
                     out["gel_pos"] = pos
-                    if out["gel_disp"] is not None and pos is not None:
+                    if (n_comp == 3 and out["gel_disp"] is not None and pos is not None):
                         out["gel_tan"] = [pad_tangents(p, tuple(grid)) for p in pos]
         if out["gel_grid"] is None and out["depth_grid"] is not None:
             dg = out["depth_grid"]
             out["gel_grid"] = dg
             out["gel_src"] = f"depth ({dg.shape[2] * dg.shape[3]} probes)"
             out["gel_pos"] = geom.get("depth", (None, None))[0]
+            # The marker overlay tracks the marker lattice, and this panel is the
+            # coarse probe grid: a marker field kept alongside it (possible only
+            # when it was identically zero, so there is nothing to draw) must not
+            # be overlaid on the wrong lattice.
+            out["gel_disp"] = None
+            out["gel_tan"] = None
         if out["gel_grid"] is not None:
             out["gel_hmax"] = max(float(np.abs(out["gel_grid"]).max()), 1e-12)
             # Physical extent of the drawn panel, in pad *cells*: what the m/px and
@@ -509,6 +552,20 @@ def compose(demo: dict, path: Path, demo_name: str, scale: int, fps: float, stri
     # 4x3 — a per-taxel readout with a number in every cell only works coarse.
     FC_F = _panel_cell(fg.shape[2], F_CELL) if fg is not None else F_CELL
     FC_P = _panel_cell(pg.shape[2], F_CELL) if pg is not None else F_CELL
+    # Fingertip temperature panel: a finger grid denser than 4x4 shrinks its
+    # cells to the band's height (F_CELL is the tallest panel's base) instead of
+    # the 22 px a 4x4 AABB grid uses. A cell below FTG_NUM_PX cannot hold its
+    # printed number, and the map is read from the colour ramp alone.
+    FTG_NUM_PX = 14
+    if ftg is not None:
+        FTG_ROWS, FTG_COLS = int(ftg.shape[2]), int(ftg.shape[3])
+        FTG_CELL = T_CELL if FTG_ROWS <= 4 else _panel_cell(FTG_ROWS, F_CELL)
+    else:
+        FTG_ROWS = FTG_COLS = 0
+        FTG_CELL = T_CELL
+    FTG_GAP = 8
+    FTG_W = ftg.shape[1] * FTG_COLS * FTG_CELL + (ftg.shape[1] - 1) * FTG_GAP if ftg is not None else 0
+    FTG_H = FTG_ROWS * FTG_CELL
 
     def _first_nonzero(ts):
         if ts is None:
@@ -557,16 +614,21 @@ def compose(demo: dict, path: Path, demo_name: str, scale: int, fps: float, stri
     # the same treatment the shading gets.
     MARKER_TARGET_PX = 3.5
     marker_gain = 1.0
-    if markers and gg is not None and demo["gel_disp"] is not None and demo["gel_tan"] is not None:
+    if markers and gg is not None and demo["gel_disp"] is not None:
         need_px = []
         for k in range(min(gg.shape[1], demo["gel_disp"].shape[1])):
             mpp = _gel_mpp(demo, k, (GEL_W, GEL_H), gg.shape[2:])
             if mpp is None:
                 continue
-            u_col, u_row = demo["gel_tan"][k]
             dk = demo["gel_disp"][:, k]
-            need_px.append(float(max(np.abs(dk @ u_col).max() / mpp[0],
-                                     np.abs(dk @ u_row).max() / mpp[1])))
+            if dk.shape[-1] == 2:
+                # pad tangent: component 1 crosses image x, component 0 image y
+                need_px.append(float(max(np.abs(dk[..., 1]).max() / mpp[0],
+                                         np.abs(dk[..., 0]).max() / mpp[1])))
+            elif demo["gel_tan"] is not None:
+                u_col, u_row = demo["gel_tan"][k]
+                need_px.append(float(max(np.abs(dk @ u_col).max() / mpp[0],
+                                         np.abs(dk @ u_row).max() / mpp[1])))
         if need_px and max(need_px) > 0:
             marker_gain = min(1000.0, max(1.0, MARKER_TARGET_PX / max(need_px)))
 
@@ -594,7 +656,7 @@ def compose(demo: dict, path: Path, demo_name: str, scale: int, fps: float, stri
     x_prox = x_force + (_block_w(fg, FC_F) if fg is not None else 0)
     x_trace = x_prox + (_block_w(pg, FC_P) if pg is not None else 0) + (16 if trace else 0)
     x_temp = x_trace + (TRACE_W + 16 if trace else 0)
-    x_obj = x_temp + (2 * 4 * T_CELL + 8 if ftg is not None else 0) + (8 if ftg is not None and og is not None else 0)
+    x_obj = x_temp + (FTG_W if ftg is not None else 0) + (8 if ftg is not None and og is not None else 0)
     obj_title = (f"object (C)  {og_lo:.1f}..{og_hi:.1f}  span {og_hi - og_lo:.2f} (stretched)"
                  if og is not None else "")
     x_gel = int(x_obj + ((max(4 * (4 * O_CELL + 5), _scratch.textlength(obj_title, font=f_cap)) + 12)
@@ -615,7 +677,7 @@ def compose(demo: dict, path: Path, demo_name: str, scale: int, fps: float, stri
         band_right = max(band_right, x_force + fg.shape[1] * fg.shape[3] * FC_F,
                          x_force + _scratch.textlength("tactile |F| (N)", font=f_cap))
     if ftg is not None:
-        band_right = max(band_right, x_temp + 2 * 4 * T_CELL + 8,
+        band_right = max(band_right, x_temp + FTG_W,
                          x_temp + _scratch.textlength(f"fingertip temp (C)  {ft_lo:.0f}..{ft_hi:.0f}", font=f_cap))
     if og is not None:
         band_right = max(band_right, x_obj + 4 * (4 * O_CELL + 5),
@@ -671,7 +733,15 @@ def compose(demo: dict, path: Path, demo_name: str, scale: int, fps: float, stri
 
         x = pad
         x = field(x, "object", _fmt_temp(t_obj), HOT)
-        x = field(x, "fingertip", _fmt_temp(t_fin), HOT if (t_fin or 0) > 30 else COLD)
+        fl = demo["fingertip_lumped"]
+        if fl is not None:
+            # Format 1.5: one measured value per finger — print the pair, not
+            # the cross-finger max (the two fingers run 5-15 C apart, docs R33).
+            lv, rv = float(fl[t, 0]), float(fl[t, 1])
+            x = field(x, "fingertip L/R", f"{lv:5.1f} / {rv:5.1f} °C",
+                      HOT if max(lv, rv) > 30 else COLD)
+        else:
+            x = field(x, "fingertip", _fmt_temp(t_fin), HOT if (t_fin or 0) > 30 else COLD)
         x = field(x, "tcp z", "--" if z is None else f"{z:.3f} m", FG)
         d.text((x, 52), f"final phase: {final_phase}", font=f_small, fill=DIM)
 
@@ -726,16 +796,17 @@ def compose(demo: dict, path: Path, demo_name: str, scale: int, fps: float, stri
                        font=f_cap, fill=DIM)
                 for k in range(ftg.shape[1]):
                     vals = ftg[t, k]
-                    xk = x_temp + k * (4 * T_CELL + 8)
-                    img, rgb = _field_image(vals, T_CELL, RAMP_TEMP, ft_lo, ft_hi)
+                    xk = x_temp + k * (FTG_COLS * FTG_CELL + FTG_GAP)
+                    img, rgb = _field_image(vals, FTG_CELL, RAMP_TEMP, ft_lo, ft_hi)
                     canvas.paste(img, (xk, y_panel))
-                    _cell_numbers(d, xk, y_panel, vals, rgb, T_CELL, f_cell_t, "{:.0f}")
-                    d.rectangle([xk - 1, y_panel - 1, xk + 4 * T_CELL, y_panel + 4 * T_CELL],
+                    if FTG_CELL >= FTG_NUM_PX:
+                        _cell_numbers(d, xk, y_panel, vals, rgb, FTG_CELL, f_cell_t, "{:.0f}")
+                    d.rectangle([xk - 1, y_panel - 1, xk + FTG_COLS * FTG_CELL, y_panel + FTG_H],
                                 outline=(64, 64, 70))
                     # Same finger order as the tactile layout: build_finger_temperature_sensors
                     # walks cfg.robot.finger_link_names, which is what layouts/link_names records.
                     nm = demo["finger_names"][k] if k < len(demo["finger_names"]) else f"F{k}"
-                    d.text((xk, y_panel + 4 * T_CELL + 3), f"tip {nm}", font=f_cap, fill=DIM)
+                    d.text((xk, y_panel + FTG_H + 3), f"tip {nm}", font=f_cap, fill=DIM)
 
             if og is not None:
                 # The tight scale is deliberate — a metal object is very nearly
@@ -772,7 +843,11 @@ def compose(demo: dict, path: Path, demo_name: str, scale: int, fps: float, stri
                     d.rectangle([xk - 1, y_panel - 1, xk + GEL_W, y_panel + GEL_H],
                                 outline=(64, 64, 70))
                     nm = demo["finger_names"][k] if k < len(demo["finger_names"]) else f"F{k}"
-                    d.text((xk, y_panel + GEL_H + 3), f"{nm} max {1e3 * vals.max():.2f} mm",
+                    # Marker fields are µm-scale (docs §9-R25): "%.2f mm" would
+                    # round a 4.9 µm dome to 0.00, so switch units below 0.1 mm.
+                    peak = float(vals.max())
+                    peak_txt = f"{peak * 1e6:.1f} µm" if peak < 1e-4 else f"{peak * 1e3:.2f} mm"
+                    d.text((xk, y_panel + GEL_H + 3), f"{nm} max {peak_txt}",
                            font=f_cap, fill=DIM)
 
             if pg is not None:

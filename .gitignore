@@ -7,8 +7,12 @@ build/
 dist/
 .pytest_cache/
 
-# 生成数据集与输出（data/、data_cam/、data_lift/、将来的 data_gel/ 等都不入库）
+# 生成数据集与输出：datasets/ 下不入库——唯一例外 datasets/README.md（数据卡）；
+# data*/ 兜底覆盖将来的临时输出目录（data_smoke/ 等）
 data*/
+!datasets/
+datasets/*
+!datasets/README.md
 *.hdf5
 *.npz
 

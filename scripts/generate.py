@@ -1,13 +1,15 @@
 #!/usr/bin/env python
-"""Generate TemperatureVLA datasets: one HDF5 file per material.
+"""Generate ThermTacVLA datasets: one HDF5 file per job.
 
-    python scripts/generate.py --episodes 50 --out data/
-    python scripts/generate.py --material aluminum --episodes 5 --out /tmp/x   # smoke run
+    python scripts/generate.py --config sim/configs/thermal_recognition/pick_cold_can.yaml --episodes 50
+    python scripts/generate.py --config sim/configs/thermal_recognition/pick_cold_can.yaml \
+        --episodes 1 --no-cameras --out /tmp/x   # smoke run
 
-One scene is built per material (material thermal properties, object size and
-mass are frozen at build time — see docs/architecture.md §9), then N episodes
-are rolled out with per-episode pose/yaw/temperature randomization. Successful
-episodes go to <task>_<material>.hdf5, failures to <task>_<material>_failed.hdf5.
+One file per invocation: ``material_list`` gives one material per body. One
+scene is built per job (material thermal properties, object size and mass are
+frozen at build time — see docs/architecture.md §9), then N episodes are rolled
+out with per-episode pose/yaw/temperature randomization. Successful episodes go
+to <task>_<tag>.hdf5, failures to <task>_<tag>_failed.hdf5.
 
 Memory stays flat: one episode lives in memory at a time and is flushed to disk
 as soon as it finishes.
@@ -28,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from gate_common import Timer, load_config, meminfo  # noqa: E402
+from sim.expert.pipeline import PIPELINE, target_kind  # noqa: E402
 
 
 def gl_guard(cfg, *, allow_unsafe: bool) -> int | None:
@@ -39,7 +42,9 @@ def gl_guard(cfg, *, allow_unsafe: bool) -> int | None:
     fill 100 MB with unusable frames. ``LIBGL_ALWAYS_SOFTWARE=1`` uses llvmpipe
     and is correct. Non-raster renderers are not affected by this trap.
     """
-    if not cfg.cameras.enabled or str(cfg.cameras.renderer).lower() not in ("raster", "rasterizer"):
+    from sim.obs import RENDERER
+
+    if not cfg["cameras"]["enabled"] or str(RENDERER).lower() not in ("raster", "rasterizer"):
         return None
     if allow_unsafe or os.environ.get("LIBGL_ALWAYS_SOFTWARE") == "1":
         return None
@@ -52,26 +57,40 @@ def gl_guard(cfg, *, allow_unsafe: bool) -> int | None:
     return 2
 
 
-def run_material(cfg, material: str, args, index: int, total: int) -> dict:
-    """Build one scene and roll out ``args.episodes`` demos for one material."""
-    from tempvla.recording import (
+def run_job(cfg, args) -> dict:
+    """Build one scene and roll out ``args.episodes`` demos for one job.
+
+    The scene is ``material_list`` -- one entry per object: a file can hold
+    bodies of different materials and is named after all of them.
+    """
+    from sim.recording import (
         EpisodeRunner,
         HDF5Writer,
         build_env_args,
         build_problem_info,
         summarize_episode,
     )
-    from tempvla.scene import build_scene
+    from sim.scene import build_scene
 
+    materials = list(cfg["material_list"])
+    tag = "_".join(materials)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_file = out_dir / f"{cfg.task_id}_{material}.hdf5"
-    failed_file = out_dir / f"{cfg.task_id}_{material}_failed.hdf5" if cfg.recording.keep_failed else None
+    out_file = out_dir / f"{cfg['task_id']}_{tag}.hdf5"
+    failed_file = (
+        out_dir / f"{cfg['task_id']}_{tag}_failed.hdf5"
+        if cfg["recording"]["keep_failed"]
+        else None
+    )
 
-    print(f"\n=== [{index}/{total}] material={material} -> {out_file} ===")
-    scene_seed = cfg.seed + 1000 * (index + 1)
+    print(f"\n=== job={tag} -> {out_file} ===")
+    scene_seed = cfg["seed"] + 1000
     with Timer() as t_build:
-        bundle = build_scene(cfg, material=material, seed=scene_seed, show_viewer=args.viewer)
+        bundle = build_scene(
+            cfg,
+            seed=scene_seed,
+            show_viewer=args.viewer,
+        )
     print(f"  scene built in {t_build}: " + " | ".join(
         f"object_{i} {s.shape} r={s.radius_m:.4f} m h={s.height_m:.4f} m "
         f"m={s.mass_kg:.4f} kg rho={s.mass_kg / s.volume_m3:.1f} kg/m3"
@@ -81,19 +100,19 @@ def run_material(cfg, material: str, args, index: int, total: int) -> dict:
     runner = EpisodeRunner(bundle)
     writer = HDF5Writer(
         out_file,
-        task_id=cfg.task_id,
-        problem_info=build_problem_info(cfg, material),
+        task_id=cfg["task_id"],
+        problem_info=build_problem_info(cfg, materials, pipeline=PIPELINE),
         env_args=build_env_args(cfg, bundle=bundle),
         layouts=runner.file_layouts(),
         failed_path=failed_file,
-        compression=cfg.recording.compression,
-        compression_opts=cfg.recording.compression_opts,
+        compression=cfg["recording"]["compression"],
+        compression_opts=cfg["recording"]["compression_opts"],
     )
     runner.writer = writer
     runner.verbose = not args.quiet
 
     stats = {
-        "material": material,
+        "material": tag,
         "file": str(out_file),
         "episodes": 0,
         "success": 0,
@@ -107,7 +126,7 @@ def run_material(cfg, material: str, args, index: int, total: int) -> dict:
     t_start = time.perf_counter()
     try:
         for i in range(args.episodes):
-            episode_seed = cfg.seed + i
+            episode_seed = cfg["seed"] + i
             try:
                 with Timer() as t_ep:
                     res = runner.run_episode(episode_seed=episode_seed)
@@ -161,9 +180,8 @@ def run_material(cfg, material: str, args, index: int, total: int) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", default=None, help="task YAML (defaults to dataclass defaults)")
-    parser.add_argument("--material", action="append", default=None, help="repeatable; default all in config")
-    parser.add_argument("--episodes", type=int, default=50, help="episodes per material file")
+    parser.add_argument("--config", default=None, help="task YAML (default: sim/configs/thermal_recognition/pick_cold_can.yaml)")
+    parser.add_argument("--episodes", type=int, default=50, help="episodes in the output file")
     parser.add_argument("--seed", type=int, default=None, help="override cfg.seed (episode i uses seed+i)")
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--out", default=None, help="output directory (default: recording.output_dir from the config)")
@@ -186,110 +204,124 @@ def main() -> int:
 
     cfg = load_config(args.config)
     if args.cameras:
-        cfg.cameras.enabled = True
+        cfg["cameras"]["enabled"] = True
     if args.no_cameras:
-        cfg.cameras.enabled = False
-    if args.out is None and cfg.cameras.enabled and cfg.recording.output_dir == "data":
-        # Don't quietly overwrite the camera-less v1 dataset with a camera one.
-        args.out = "data_cam"
+        cfg["cameras"]["enabled"] = False
     guard = gl_guard(cfg, allow_unsafe=args.unsafe_gl)
     if guard is not None:
         return guard
     if args.out is None:
-        args.out = cfg.recording.output_dir
+        args.out = cfg["recording"]["output_dir"]
     if args.seed is not None:
-        cfg.seed = args.seed
+        cfg["seed"] = args.seed
     if args.max_steps:
-        cfg.max_episode_steps = args.max_steps
-    materials = args.material or list(cfg.materials)
-    unknown = [m for m in materials if m not in cfg.material_properties]
+        cfg["max_episode_steps"] = args.max_steps
+
+    materials = list(cfg["material_list"])
+    unknown = [m for m in materials if m not in cfg["material_properties"]]
     if unknown:
         print(f"ERROR: materials missing from material_properties: {unknown}")
-        print(f"known: {sorted(cfg.material_properties)}")
+        print(f"known: {sorted(cfg['material_properties'])}")
         return 2
-    # scene_seed = cfg.seed + 1000 * (index + 1) — the *position in this list*, not the
-    # material. Object size and mass are drawn from that seed at build time, so a subset
-    # run silently reuses the seeds of a full run's first materials: `--material copper`
-    # alone gives copper the object aluminium had (measured 2026-10-03 — the two files
-    # came out with identical geometry, trajectories and RGB, differing only in the
-    # thermal channels). Keep one dataset to one invocation.
-    subset = [m for m in materials if m not in cfg.materials]
-    scene_seeds = {
-        m: cfg.seed + 1000 * (i + 1) for i, m in enumerate(materials)
-    }
-    if len(materials) != len(cfg.materials):
-        print("WARNING: this is a subset run — scene seeds are assigned by position, so they")
-        print(f"  will differ from a full run's: {', '.join(f'{m}={s}' for m, s in scene_seeds.items())}")
-        print(f"  a full run of {list(cfg.materials)} would give "
-              + ", ".join(f"{m}={cfg.seed + 1000 * (i + 1)}" for i, m in enumerate(cfg.materials)))
-        if subset:
-            print(f"  (not in the config's materials list at all: {subset})")
+    tag = "_".join(materials)
+    # HDF5Writer opens with mode="w": an existing dataset is truncated, not merged.
+    # The output dir is version-scoped with no camera-suffix convention any more,
+    # so replacing files is allowed — but never silent.
+    out_dir = Path(args.out)
+    out_file = out_dir / f"{cfg['task_id']}_{tag}.hdf5"
+    if out_file.exists():
+        print(f"NOTE: existing file under {out_dir} will be REPLACED "
+              f"(truncate-and-write): {out_file.name}")
 
-    print("TemperatureVLA generation")
-    print(f"  task        : {cfg.task_id}")
-    print(f"  materials   : {', '.join(materials)}")
-    print(f"  scene seeds : {', '.join(f'{m}={s}' for m, s in scene_seeds.items())}")
-    print(f"  episodes    : {args.episodes} per material ({args.episodes * len(materials)} total)")
-    print(f"  control     : {cfg.controller.control_hz:.0f} Hz policy / {1 / cfg.controller.sim_dt:.0f} Hz sim "
-          f"(decimation {cfg.controller.decimation}) | max {cfg.max_episode_steps} steps")
-    objects = cfg.object_list()
-    print(f"  objects     : {len(objects)} ({', '.join(o.shape for o in objects)})"
-          + ("  | target sampled per episode" if len(objects) > 1 else ""))
+    scene_seed = cfg["seed"] + 1000
+    print("ThermTacVLA generation")
+    print(f"  task        : {cfg['task_id']}")
+    print(f"  file        : {tag}")
+    print(f"  scene seed  : {scene_seed}")
+    print(f"  episodes    : {args.episodes}")
+    print(f"  control     : {cfg['controller']['control_hz']:.0f} Hz policy / "
+          f"{1 / cfg['controller']['sim_dt']:.0f} Hz sim "
+          f"(decimation {cfg['controller']['decimation']}) | max {cfg['max_episode_steps']} steps")
+    objects = cfg["objects"]
+    print(f"  objects     : {len(objects)} ({', '.join(str(o['shape']) for o in objects)})"
+          f"  | target pinned to {cfg['target_index']}")
     for i, o in enumerate(objects):
-        print(f"    object_{i}   : xy +-{o.xy_jitter_m * 1000:.0f} mm | yaw +-{np.degrees(o.yaw_jitter_rad):.0f} deg "
-              f"| temp {o.temp_c[0]:.0f}-{o.temp_c[1]:.0f} C | place {tuple(o.place_xy)}")
-    if cfg.cameras.enabled:
-        w, h = cfg.cameras.resolution
-        cams = ["agentview"] + (["eye_in_hand"] if cfg.cameras.eye_in_hand else [])
-        print(f"  cameras     : {', '.join(cams)} @ {w}x{h} uint8 via {cfg.cameras.renderer} "
-              f"(rendered at policy rate, ~{cfg.controller.control_hz:.0f} Hz)")
+        own = f"{o['temp_c'][0]:.0f}-{o['temp_c'][1]:.0f} C"
+        print(f"    object_{i}   : xy +-{o['xy_jitter_m'] * 1000:.0f} mm | "
+              f"yaw +-{np.degrees(o['yaw_jitter_rad']):.0f} deg "
+              f"| temp {own} | place {tuple(o['place_xy'])}")
+    print("  materials   : " + ", ".join(materials))
+    expert = cfg["expert"]
+    if expert["temperature_judge_enabled"] and expert["approach"] == "place_in_tray":
+        lo, hi = expert["temperature_judge_threshold_c"]
+        lo_txt = "-inf" if lo is None else f"{lo:g}"
+        hi_txt = "+inf" if hi is None else f"{hi:g}"
+        kind = target_kind(expert["temperature_judge_threshold_c"])
+        print(
+            f"  expert      : PutInTrayExpert | temperature judge over bodies "
+            f"{list(expert['temperature_candidate'])} (random order) | {kind} target: tip in "
+            f"[{lo_txt}, {hi_txt}] C -> carry now; no tip heading there -> release -> next | "
+            f"all candidates judged, every match carried"
+        )
+    elif expert["approach"] == "place_in_tray":
+        print("  expert      : PutInTrayExpert | no judge (pinned target) -> carry to tray")
+    else:
+        print(f"  expert      : approach {expert['approach']!r}")
+    if PIPELINE.transit_clearance_m > 0:
+        print(f"  transit     : APPROACH rises to table + tallest body + "
+              f"{PIPELINE.transit_clearance_m:.2f} m before any lateral motion")
+    tray = cfg["tray"]
+    if tray["enabled"]:
+        print(f"  tray        : inner {tray['inner_x_m'] * 1000:.0f}x{tray['inner_y_m'] * 1000:.0f} mm, "
+              f"rim {tray['rim_m'] * 1000:.0f} mm, "
+              f"at table-relative {tuple(tray['place_xy'])} | success by {cfg['success_criterion']}")
+    cameras = cfg["cameras"]
+    if cameras["enabled"]:
+        from sim.obs import RENDERER
+
+        w, h = cameras["resolution"]
+        cams = ["agentview"] + (["eye_in_hand"] if cameras["eye_in_hand"] else [])
+        print(f"  cameras     : {', '.join(cams)} @ {w}x{h} uint8 via {RENDERER} "
+              f"(rendered at policy rate, ~{cfg['controller']['control_hz']:.0f} Hz)")
     else:
         print("  cameras     : off (set cameras.enabled=true to record RGB)")
     mem = meminfo()
     if mem:
         print(f"  memory      : {mem.get('MemAvailable', 0):.1f} GiB available of {mem.get('MemTotal', 0):.1f} GiB")
-    print(f"  output      : {Path(args.out).resolve()}")
+    print(f"  output      : {out_dir.resolve()}")
 
-    all_stats = []
-    for i, material in enumerate(materials):
-        all_stats.append(run_material(cfg, material, args, i, len(materials)))
+    stats = run_job(cfg, args)
 
     print("\n=== summary ===")
-    total_ep = sum(s["episodes"] for s in all_stats)
-    total_ok = sum(s["success"] for s in all_stats)
+    total_ep = stats["episodes"]
+    total_ok = stats["success"]
     print(f"episodes: {total_ok}/{total_ep} success ({100 * total_ok / max(total_ep, 1):.1f}%)")
-    print(f"{'material':<12} {'eps':>5} {'ok':>5} {'err':>4} {'steps':>6} {'events':>7} {'windows':>8} {'heat C':>7} {'MiB':>7}")
-    for s in all_stats:
-        print(
-            f"{s['material']:<12} {s['episodes']:>5} {s['success']:>5} {s['errors']:>4} "
-            f"{np.mean(s['steps']) if s['steps'] else 0:>6.0f} "
-            f"{np.mean(s['events']) if s['events'] else 0:>7.1f} "
-            f"{np.mean(s['windows']) if s['windows'] else 0:>8.1f} "
-            f"{np.mean(s['heat']) if s['heat'] else 0:>+7.3f} {s['file_mb']:>7.2f}"
-        )
+    print(f"{'material':<16} {'eps':>5} {'ok':>5} {'err':>4} {'steps':>6} {'events':>7} {'windows':>8} {'heat C':>7} {'MiB':>7}")
+    print(
+        f"{stats['material']:<16} {stats['episodes']:>5} {stats['success']:>5} {stats['errors']:>4} "
+        f"{np.mean(stats['steps']) if stats['steps'] else 0:>6.0f} "
+        f"{np.mean(stats['events']) if stats['events'] else 0:>7.1f} "
+        f"{np.mean(stats['windows']) if stats['windows'] else 0:>8.1f} "
+        f"{np.mean(stats['heat']) if stats['heat'] else 0:>+7.3f} {stats['file_mb']:>7.2f}"
+    )
 
     if not args.no_validate:
-        from tempvla.tools.validate import validate_file
+        from sim.tools.validate import validate_file
 
         print("\n=== validation ===")
-        ok = True
-        for s in all_stats:
-            path = Path(s["file"])
-            if not path.exists():
-                print(f"{path}: MISSING")
-                ok = False
-                continue
-            report = validate_file(path, strict_channels=True)
-            issues = len(report.issues)
-            print(f"{path.name}: {len(report.demos)} demos, {issues} issues")
-            for issue in report.issues[:10]:
-                print(f"    - {issue}")
-            ok &= report.ok
-        if not ok:
+        path = Path(stats["file"])
+        if not path.exists():
+            print(f"{path}: MISSING")
+            return 1
+        report = validate_file(path, strict_channels=True)
+        print(f"{path.name}: {len(report.demos)} demos, {len(report.issues)} issues")
+        for issue in report.issues[:10]:
+            print(f"    - {issue}")
+        if not report.ok:
             print("validation found issues (see above)")
             return 1
-    n_failed = sum(s["errors"] for s in all_stats)
-    return 1 if (n_failed or total_ok == 0) else 0
+    errors = stats["errors"]
+    return 1 if (errors or total_ok == 0) else 0
 
 
 if __name__ == "__main__":

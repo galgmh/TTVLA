@@ -1,7 +1,7 @@
 #!/usr/bin/env python
-"""CLI: validate one or more TemperatureVLA HDF5 files.
+"""CLI: validate one or more ThermTacVLA HDF5 files.
 
-    python scripts/validate_dataset.py data/pick_hot_cylinder_aluminum.hdf5
+    python scripts/validate_dataset.py datasets/v1.5/hdf5/pick_cold_can_*.hdf5
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tempvla.tools.validate import validate_file  # noqa: E402
+from sim.tools.validate import validate_file  # noqa: E402
 
 
 def main() -> int:

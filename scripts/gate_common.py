@@ -1,6 +1,6 @@
-"""Shared helpers for the gate scripts (gate0/gate1/gate2).
+"""Shared helpers for the remaining scripts (config loading, timing, memory).
 
-Kept dependency-free (stdlib + numpy) so a gate can report a broken engine
+Kept dependency-free (stdlib only) so a script can report a broken engine
 rather than crashing on its own import.
 """
 
@@ -9,47 +9,6 @@ from __future__ import annotations
 import time
 from pathlib import Path
 from typing import Any
-
-
-class Gate:
-    """Collects pass/fail/warn lines and prints them in a stable format."""
-
-    def __init__(self, title: str = ""):
-        self.title = title
-        self.failures: list[str] = []
-        self.warnings: list[str] = []
-        if title:
-            print(f"########## {title} ##########")
-
-    def ok(self, name: str, detail: str = "") -> None:
-        print(f"  [ ok ] {name}" + (f" — {detail}" if detail else ""))
-
-    def fail(self, name: str, detail: str = "") -> None:
-        self.failures.append(name)
-        print(f"  [FAIL] {name}" + (f" — {detail}" if detail else ""))
-
-    def warn(self, name: str, detail: str = "") -> None:
-        self.warnings.append(name)
-        print(f"  [warn] {name}" + (f" — {detail}" if detail else ""))
-
-    def info(self, text: str = "") -> None:
-        print(f"  {text}" if text else "")
-
-    def section(self, title: str) -> None:
-        print(f"\n=== {title} ===")
-
-    def check(self, name: str, condition: bool, detail: str = "") -> bool:
-        (self.ok if condition else self.fail)(name, detail)
-        return bool(condition)
-
-    def summary(self, next_step: str = "") -> int:
-        print(f"\n=== summary ===")
-        print(f"failures: {len(self.failures)}  warnings: {len(self.warnings)}")
-        for f in self.failures:
-            print(f"  FAIL {f}")
-        if not self.failures and next_step:
-            print(next_step)
-        return 1 if self.failures else 0
 
 
 def meminfo() -> dict[str, float]:
@@ -80,28 +39,27 @@ class Timer:
 
 
 def load_config(path: str | None, overrides: dict[str, Any] | None = None):
-    """TaskConfig from a YAML file, or the dataclass defaults.
+    """Task config dict loaded from a YAML file.
 
-    With no explicit path, configs/pick_hot_cylinder.yaml is used when present
-    (the dataclass defaults alone have no material thermal properties).
+    With no explicit path, the repo's single task config is used; there is no
+    built-in default because the YAML is the only source of task values.
     """
-    from tempvla.config import TaskConfig, load_task_config
+    from sim.config import load_task_config
 
     if path is None:
-        default = Path(__file__).resolve().parents[1] / "configs" / "pick_hot_cylinder.yaml"
+        default = (
+            Path(__file__).resolve().parents[1]
+            / "sim" / "configs" / "thermal_recognition" / "pick_cold_can.yaml"
+        )
         if default.is_file():
             path = str(default)
         else:
-            print("  [warn] no --config and configs/pick_hot_cylinder.yaml is missing; using dataclass defaults")
-    if path:
-        print(f"  config: {path}")
-    cfg = load_task_config(path) if path else TaskConfig()
+            raise FileNotFoundError(
+                "no --config and sim/configs/thermal_recognition/pick_cold_can.yaml "
+                "is missing; the task config must come from a YAML file"
+            )
+    print(f"  config: {path}")
+    cfg = load_task_config(path)
     for key, value in (overrides or {}).items():
-        setattr(cfg, key, value)
+        cfg[key] = value
     return cfg
-
-
-def fmt_floats(values, precision: int = 4) -> str:
-    import numpy as np
-
-    return str(np.round(np.asarray(values, dtype=float), precision).tolist())
