@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Render demos from a ThermTacVLA HDF5 file to MP4.
 
-    python scripts/render_video.py datasets/v1.5/hdf5/pick_cold_can_aluminum_aluminum_lemon_paperboard_paperboard_balsa_iron.hdf5 --demo 0
+    python scripts/render_video.py datasets/hdf5/pick_cold_can/pick_cold_can_aluminum_aluminum_lemon_paperboard_aluminum_balsa_iron.hdf5 --demo 0
     # several demos / bigger panels: ... --demo 0 --demo 3 --scale 3
 
 Frames are read straight out of the file, so the video shows exactly what a

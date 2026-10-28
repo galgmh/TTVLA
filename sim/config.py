@@ -24,6 +24,7 @@ _TOP_REQUIRED = frozenset(
         "material_properties",
         "material_list",
         "objects",
+        "temperature_groups",
         "min_object_gap_m",
         "target_index",
         "tray",
@@ -209,6 +210,88 @@ def _check_color(value: Any, where: str) -> None:
         _num(v, f"{where}[{i}]")
 
 
+# Fields that may differ between bodies whose temperature profiles are shuffled:
+# the profile itself, where the body is placed, and the per-episode pose jitter.
+_TEMPERATURE_IDENTITY_EXCLUDED = frozenset(
+    {"temp_c", "place_xy", "xy_jitter_m", "yaw_jitter_rad"}
+)
+
+
+def _freeze(value: Any) -> Any:
+    """Hashable, order-stable representation of a YAML value."""
+    if isinstance(value, dict):
+        return tuple(sorted((str(k), _freeze(v)) for k, v in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(v) for v in value)
+    return value
+
+
+def _object_identity(obj: dict[str, Any], material: str) -> tuple[Any, str]:
+    """Everything that makes two bodies the same object, minus per-episode fields."""
+    fields = tuple(
+        sorted(
+            (str(key), _freeze(value))
+            for key, value in obj.items()
+            if key not in _TEMPERATURE_IDENTITY_EXCLUDED
+        )
+    )
+    return fields, material
+
+
+def _validate_temperature_groups(cfg: dict[str, Any], err) -> None:
+    """Check the groups whose temperature profiles are permuted per episode.
+
+    Within one group the bodies must be interchangeable (same shape, material,
+    geometry, mass and render color); only `temp_c`, `place_xy` and the pose
+    jitter may differ. If the target's profile anchor is inside a group, every
+    member can become the episode target, so every member must be a temperature
+    judge candidate.
+    """
+    groups = cfg["temperature_groups"]
+    if not isinstance(groups, (list, tuple)):
+        err("temperature_groups must be a list of object-index groups")
+    objects = cfg["objects"]
+    materials = cfg["material_list"]
+    seen: set[int] = set()
+    for gi, group in enumerate(groups):
+        if not isinstance(group, (list, tuple)) or len(group) < 2:
+            err(f"temperature_groups[{gi}] must be a list of at least 2 object indices")
+        if any(not isinstance(i, int) or isinstance(i, bool) for i in group):
+            err(f"temperature_groups[{gi}] must contain only integer object indices")
+        if len(set(group)) != len(group):
+            err(f"temperature_groups[{gi}] must not repeat an object index")
+        if any(i < 0 or i >= len(objects) for i in group):
+            err(f"temperature_groups[{gi}] indices must be in [0, {len(objects)})")
+        overlap = seen.intersection(group)
+        if overlap:
+            err(
+                f"temperature_groups[{gi}] repeats object index(es) from another "
+                f"group: {sorted(overlap)}"
+            )
+        seen.update(group)
+        identity = _object_identity(objects[group[0]], materials[group[0]])
+        for index in group[1:]:
+            if _object_identity(objects[index], materials[index]) != identity:
+                err(
+                    f"temperature_groups[{gi}] must contain identical objects; "
+                    f"objects {group[0]} and {index} differ"
+                )
+
+    target = int(cfg["target_index"])
+    expert = cfg["expert"]
+    if expert["temperature_judge_enabled"]:
+        target_group = next((group for group in groups if target in group), None)
+        if target_group is not None:
+            candidates = {int(i) for i in expert["temperature_candidate"]}
+            missing = [int(i) for i in target_group if int(i) not in candidates]
+            if missing:
+                err(
+                    f"temperature_groups: target_index={target} is in group "
+                    f"{[int(i) for i in target_group]}, so every member must be in "
+                    f"expert.temperature_candidate; missing {missing}"
+                )
+
+
 def _validate(cfg: dict[str, Any], source: str) -> None:
     def err(message: str) -> None:
         raise ValueError(f"{source}: {message}")
@@ -392,6 +475,8 @@ def _validate(cfg: dict[str, Any], source: str) -> None:
         err("expert.temperature_judge_threshold_c needs at least one finite end")
     if lo is not None and hi is not None and lo > hi:
         err(f"expert.temperature_judge_threshold_c low must be <= high, got [{lo}, {hi}]")
+
+    _validate_temperature_groups(cfg, err)
 
     # --- tactile / temperature -------------------------------------------
     modalities = _str_list(cfg["tactile"]["modalities"], f"{source}: tactile.modalities")

@@ -16,6 +16,10 @@ cavity floor, pads open, held for ``stable_steps``.
     python experiment/eval_closed_loop.py --policy remote --episodes 20 \
         --remote-host 192.168.1.20 --remote-port 8000 --state-mode proprio16
 
+    # record one MP4 per episode (agentview | wrist) while it runs
+    python experiment/eval_closed_loop.py --policy remote --episodes 2 \
+        --remote-host 127.0.0.1 --video
+
 Two metrics are reported, and they answer different questions:
 
 * **task success**   -- the *target* body is in the tray (the cold can).
@@ -26,11 +30,12 @@ For the pure-vision baseline the second should be high and the first should be
 near the chance rate the scene allows (three visually identical cans). That gap
 is the baseline's whole point.
 
-``--permute-slots`` is a diagnostic, not the training distribution: it moves
-the bodies to a fresh permutation of the home slots at evaluation time. Use it
-to measure how much of a fixed-slot policy's score came from the target's
-position. See experiment/README.md for why the real fix is a generation-side
-change.
+Object slots are fixed, but the temperature profiles are permuted across each
+identical-body group in the training distribution, so the target's slot is
+already random. ``--permute-slots`` is a stronger diagnostic, not the training
+distribution: it moves every body to a fresh permutation of the home slots at
+evaluation time. Use it to measure how much of a policy's score came from the
+canonical layout. See experiment/README.md.
 """
 
 from __future__ import annotations
@@ -62,6 +67,11 @@ from sim.obs import ObsBuilder  # noqa: E402
 from sim.recording.meta import language_instruction  # noqa: E402
 from sim.scene import build_scene, sample_episode  # noqa: E402
 from sim.sensors.temperature import SENSOR_TIME_CONSTANT  # noqa: E402
+
+
+# cv2 fourcc "mp4v" as the little-endian int the CV_FOURCC macro produces, so
+# --video does not rely on cv2.VideoWriter_fourcc surviving an OpenCV major.
+_MP4V_FOURCC = ord("m") | (ord("p") << 8) | (ord("4") << 16) | (ord("v") << 24)
 
 
 # ------------------------------------------------------------------- scoring
@@ -110,11 +120,11 @@ def _placed(
 def _permute_slots(ep: dict[str, Any], rng: np.random.Generator) -> dict[str, Any]:
     """Give every body a fresh home slot (diagnostic only).
 
-    The slot *set* is unchanged, so the pairwise separation the generator
-    checked still holds; only who stands where changes. Ground-truth object
-    poses and the temperature sensor geometry are build-time, so this is a
-    vision-only diagnostic -- do not read the thermal channels' numbers as
-    physical under permutation.
+    The slot *set* is unchanged; only who stands where changes. TemperatureGrid
+    stores its AABB in the link frame and maps contact points through the live
+    link pose, so a rigid slot move does not invalidate an object's thermal
+    grid. This is still a diagnostic because it is not the training
+    distribution, not because the thermal channels are meaningless here.
     """
     out = dict(ep)
     slots = np.asarray(ep["slots"], dtype=np.float64)
@@ -216,6 +226,11 @@ def main() -> int:
         help="ask the server every N steps; 0 = execute the whole returned chunk",
     )
     ap.add_argument("--trace", action="store_true", help="write per-step trace.jsonl")
+    ap.add_argument(
+        "--video",
+        action="store_true",
+        help="record one mp4 per episode into <out>/videos (agentview | wrist)",
+    )
     args = ap.parse_args()
 
     cfg = load_task_config(args.config)
@@ -240,15 +255,34 @@ def main() -> int:
         out_dir = Path(args.out).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    video_dir = (out_dir / "videos") if args.video else None
+    video_fps = float(cfg["controller"]["control_hz"])
+    if video_dir is not None:
+        try:
+            import cv2
+        except ImportError:
+            print("ERROR: --video needs opencv-python in this environment")
+            return 2
+        video_dir.mkdir(parents=True, exist_ok=True)
+
     print(f"config: {args.config}")
     print(f"policy: {args.policy}  state: {args.state_mode}  episodes: {args.episodes}")
     print(f"scene seed: {scene_seed}  episode seeds: {args.seed0}..{args.seed0 + args.episodes - 1}")
     print(f"output: {out_dir}")
+    if video_dir is not None:
+        print(f"videos: {video_dir}  (one mp4 per episode, {video_fps:g} fps)")
     if not args.permute_slots:
-        print(
-            "note: slots are fixed per episode -- a vision-only policy can learn the "
-            "target's position; --permute-slots measures that shortcut"
-        )
+        if cfg["temperature_groups"]:
+            print(
+                "note: object slots are fixed, but temperature profiles are permuted "
+                "across each temperature group -- the target's slot is random; "
+                "--permute-slots additionally permutes every slot"
+            )
+        else:
+            print(
+                "note: slots are fixed per episode -- a vision-only policy can learn the "
+                "target's position; --permute-slots measures that shortcut"
+            )
 
     t_start = time.perf_counter()
     bundle = build_scene(cfg, seed=scene_seed, show_viewer=bool(args.viewer))
@@ -258,6 +292,7 @@ def main() -> int:
 
     records: list[dict[str, Any]] = []
     trace_fh = (out_dir / "trace.jsonl").open("w", encoding="utf-8") if args.trace else None
+    video = None
 
     try:
         for k in range(int(args.episodes)):
@@ -292,6 +327,9 @@ def main() -> int:
             min_tip = float("inf")
             last_grip = float("nan")
             steps = 0
+            video_path = None
+            if video_dir is not None:
+                video_path = video_dir / f"ep{k:02d}_seed{seed}.mp4"
 
             for step in range(max_steps):
                 obs = builder.build()
@@ -356,9 +394,45 @@ def main() -> int:
                         + "\n"
                     )
 
+                if video_path is not None:
+                    # The frame the policy saw this step, side by side; the
+                    # overlay carries the scalars a viewer would otherwise
+                    # have to read from the trace.
+                    panels = [np.asarray(obs["agentview_rgb"], dtype=np.uint8)]
+                    if "eye_in_hand_rgb" in obs:
+                        panels.append(np.asarray(obs["eye_in_hand_rgb"], dtype=np.uint8))
+                    frame = np.ascontiguousarray(np.concatenate(panels, axis=1))
+                    if video is None:
+                        h, w = frame.shape[:2]
+                        video = cv2.VideoWriter(
+                            str(video_path), _MP4V_FOURCC, video_fps, (w, h)
+                        )
+                        if not video.isOpened():
+                            raise SystemExit(
+                                f"ERROR: OpenCV could not open {video_path} for writing (mp4v)"
+                            )
+                    bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    label = f"ep {k}  seed {seed}  step {step}  grip {last_grip:+.2f}"
+                    if tip.size:
+                        label += "  tip " + "/".join(f"{v:.1f}" for v in tip)
+                    cv2.putText(
+                        bgr, label, (8, 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA,
+                    )
+                    if ok_target:
+                        cv2.putText(
+                            bgr, "target in tray", (8, 48),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv2.LINE_AA,
+                        )
+                    video.write(bgr)
+
                 if stable >= stable_needed:
                     success = True
                     break
+
+            if video is not None:
+                video.release()
+                video = None
 
             manipulation = any_stable >= stable_needed
             bodies = _bodies_in_tray(bundle, tol)
@@ -389,6 +463,8 @@ def main() -> int:
                 f"steps {steps}  tip min {tip_text}"
             )
     finally:
+        if video is not None:
+            video.release()
         if trace_fh is not None:
             trace_fh.close()
 

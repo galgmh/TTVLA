@@ -369,6 +369,11 @@ class EpisodeRunner:
             "objects_mass_kg": np.asarray([s.mass_kg for s in specs], dtype=np.float32),
             "episode_steps": int(steps),
         }
+        sources = ep.get("temperature_profile_sources")
+        if b.cfg["temperature_groups"] and sources is not None:
+            # body i was seeded from `temp_c` of body sources[i]; the actual
+            # temperatures are already in objects_temp_c.
+            attrs["temperature_profile_sources"] = np.asarray(sources, dtype=np.int32)
         attrs.update(self._temperature_judge_attrs())
         attrs.update(self._place_attrs())
         return attrs

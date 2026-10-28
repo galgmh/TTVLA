@@ -3,7 +3,7 @@
 
 Canonical data stays robomimic HDF5 (format ``tempvla-1.x``); what VLA
 training / validation / evaluation need on top are three small sidecar files
-(design + rationale: docs/architecture.md §9-R30, dataset card:
+(design + rationale: docs/architecture.md §9-R30 in git HEAD; dataset card:
 datasets/README.md):
 
     index.jsonl    one line per episode: file, demo, seed, split, plus every
@@ -22,7 +22,7 @@ Pure h5py/numpy/stdlib -- no genesis import, so a dataloader-side machine can
 run it too (same rule as sim/tools/).
 
 Usage (tempvla env):
-    python scripts/build_manifest.py datasets/v1.5/hdf5
+    python scripts/build_manifest.py datasets/hdf5/pick_cold_can
     python scripts/build_manifest.py <dir> --val-frac 0.1 --test-frac 0.1   # split fractions
 """
 

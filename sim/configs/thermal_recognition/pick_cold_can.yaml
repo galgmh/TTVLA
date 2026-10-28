@@ -40,7 +40,7 @@ material_list: [aluminum, aluminum, lemon, paperboard, aluminum, balsa, iron]
 
 # Measured bodies
 objects:
-  - shape: mesh                # can A: cold can, freezer..fridge
+  - shape: mesh                # can: cold profile (target anchor; role shuffled per episode)
     mesh_file: robosuite/models/assets/objects/meshes/can.obj
     mesh_scale: 1.0
     mesh_euler_deg: [0.0, 0.0, 0.0]
@@ -51,7 +51,7 @@ objects:
     temp_c: [-18.0, 4.0]       # cold, freezer..fridge
     xy_jitter_m: 0.01
     yaw_jitter_rad: 0.15
-  - shape: mesh                # can B: warm twin (distractor)
+  - shape: mesh                # can: warm profile (role shuffled per episode)
     mesh_file: robosuite/models/assets/objects/meshes/can.obj
     mesh_scale: 1.0
     mesh_euler_deg: [0.0, 0.0, 0.0]
@@ -84,7 +84,7 @@ objects:
     temp_c: [55.0, 60.0]
     xy_jitter_m: 0.01
     yaw_jitter_rad: 0.15
-  - shape: mesh                # can C: room temperature twin (distractor)
+  - shape: mesh                # can: room-temperature profile (role shuffled per episode)
     mesh_file: robosuite/models/assets/objects/meshes/can.obj
     mesh_scale: 1.0
     mesh_euler_deg: [0.0, 0.0, 0.0]
@@ -113,7 +113,16 @@ objects:
     yaw_jitter_rad: 0.15
 min_object_gap_m: 0.02         # surface separation guard for the sampled slots
 
-# The scripted expert always picks object 0 (the cold can)
+# Visually identical bodies whose `temp_c` profiles are permuted every episode.
+# Objects 0/1/4 are the three aluminum cans: each episode one gets the cold
+# profile, one the warm profile and one the room-temperature profile, so the
+# cold can's slot is not a fixed position. An empty list keeps the profiles
+# pinned to their own bodies (the legacy distribution).
+temperature_groups: [[0, 1, 4]]
+
+# Temperature-profile anchor: the body that receives object 0's `temp_c` range
+# is the episode's target. With the group above that body changes every episode;
+# with `temperature_groups: []` it is always object 0.
 target_index: 0
 
 # Delivery tray at the far edge: five `fixed` boxes

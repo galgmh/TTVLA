@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """CLI: validate one or more ThermTacVLA HDF5 files.
 
-    python scripts/validate_dataset.py datasets/v1.5/hdf5/pick_cold_can_*.hdf5
+    python scripts/validate_dataset.py datasets/hdf5/pick_cold_can/*.hdf5
 """
 
 from __future__ import annotations

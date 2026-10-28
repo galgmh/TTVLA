@@ -300,6 +300,15 @@ def build_env_args(cfg: TaskConfig, *, bundle: Any | None = None) -> dict[str, A
         # the config's; `resolved_*` are the values this file's scene froze at
         # build time (same sampling rule as the legacy object block).
         "objects": _objects_block(cfg, bundle),
+        # Temperature profiles are permuted within each group every episode; the
+        # per-demo attrs (objects_temp_c, temperature_profile_sources) hold the
+        # actual assignment.
+        "temperature_groups": [list(group) for group in cfg["temperature_groups"]],
+        "temperature_profile_note": (
+            "objects[i].temp_c is a profile, not a fixed body temperature. Profiles "
+            "are permuted within each temperature_groups entry per episode; the body "
+            "that receives target_index's profile is the target."
+        ),
         # `color` is render-only (it changes the RGB channels' appearance and
         # nothing else), so it is recorded for self-description but omitted when
         # null — runs made before the key existed stay byte-identical.
@@ -424,6 +433,9 @@ def build_problem_info(
         mats = given
     else:
         raise ValueError(f"{len(given)} materials for {len(objs)} objects: {given}")
+    groups = [list(group) for group in cfg["temperature_groups"]]
+    target = int(cfg["target_index"])
+    target_group = next((group for group in groups if target in group), None)
     templates = language_templates(cfg)
     instructions = [
         language_instruction(cfg, mats[i], str(o["shape"])) for i, o in enumerate(objs)
@@ -438,6 +450,9 @@ def build_problem_info(
             for i, o in enumerate(objs)
         )
     )
+    per_episode = ["object_xy_offset_m", "object_yaw_rad", "object_temperature_c"]
+    if target_group is not None:
+        per_episode += ["temperature_profile_assignment", "target_index"]
     info: dict[str, Any] = {
         "task_id": cfg["task_id"],
         "language_instruction": instructions[0],
@@ -480,16 +495,23 @@ def build_problem_info(
             }
             for i, o in enumerate(objs)
         ],
-        # Which object an episode targets, and who picks it. `target_index` is
-        # required, so every episode targets the same slot: no per-episode draw.
-        "target_selection": "pinned",
+        # Which object an episode targets, and who picks it. `target_index` is a
+        # profile anchor when it is inside a temperature group: the body that
+        # receives that profile is the episode target.
+        "target_selection": (
+            "temperature_profile_permutation" if target_group is not None else "pinned"
+        ),
+        "temperature_groups": groups,
+        "temperature_profile_note": (
+            "objects[i].temp_c is a temperature profile, not a fixed body temperature. "
+            "Within each temperature_groups entry the profiles are permuted per episode; "
+            "the body that receives object target_index's profile is the target. The "
+            "per-demo objects_temp_c and temperature_profile_sources attrs record the "
+            "actual seed for each episode."
+        ),
         "randomization": {
             "per_file": ["object_material", "object_count", "object_radius_m", "object_height_m", "object_mass_kg"],
-            "per_episode": [
-                "object_xy_offset_m",
-                "object_yaw_rad",
-                "object_temperature_c",
-            ],
+            "per_episode": per_episode,
             "object_xy_jitter_m": first["xy_jitter_m"],
             "object_yaw_jitter_rad": first["yaw_jitter_rad"],
             "objects_xy_jitter_m": [o["xy_jitter_m"] for o in objs],
@@ -543,7 +565,9 @@ def build_problem_info(
                 "so a judge error fails the episode. Per-demo attrs: "
                 "temperature_candidates, temperature_candidate_order, temperature_judge_* and "
                 "`temperature_judge` (JSON, one record per touch: body, per-finger "
-                "baseline/measured/delta/slope, reason, hold_s, verdict_is_target, committed)."
+                "baseline/measured/delta/slope, reason, hold_s, verdict_is_target, committed). "
+                "The target is the body that received the configured target profile in the "
+                "per-episode temperature-group permutation, so its slot is not fixed."
             ),
         }
     if cfg["tray"]["enabled"]:

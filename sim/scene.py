@@ -340,20 +340,50 @@ def _tray_clearance_m(cfg: TaskConfig, objs: list[dict[str, Any]]) -> float:
     return best
 
 
+def _temperature_profile_sources(
+    cfg: TaskConfig, rng: np.random.Generator
+) -> tuple[list[int], int]:
+    """Body -> temperature-profile source, plus the actual target body.
+
+    Every ``temperature_groups`` entry is a set of interchangeable bodies. One
+    permutation per group is drawn here and fixed for the episode, so the
+    cold/warm/room profiles swap roles without moving any body. ``source[i]``
+    is the object whose ``temp_c`` range body ``i`` is seeded from; the target
+    is the body that received the configured ``target_index``'s range. With no
+    groups this consumes no draws and returns the configured target.
+    """
+    n = len(cfg["objects"])
+    source = list(range(n))
+    for group in cfg["temperature_groups"]:
+        perm = rng.permutation(len(group))
+        for k, body in enumerate(group):
+            source[int(body)] = int(group[int(perm[k])])
+    target = next(i for i, src in enumerate(source) if src == int(cfg["target_index"]))
+    return source, target
+
+
 def sample_episode(cfg: TaskConfig, rng: np.random.Generator) -> dict[str, Any]:
     """Per-episode randomization, one row per object (``cfg["objects"]``).
 
     Returns ``xy_offsets (N,2)``, ``yaws (N,)``, ``temps_c (N,)``, ``slots
-    (N,2)`` and the pinned ``target_index`` the scripted expert will pick — the
-    language string and the legacy ``object_*`` attrs follow the target.
+    (N,2)``, the actual ``target_index`` and ``temperature_profile_sources
+    (N,)``. The target is the body that received the configured
+    ``target_index``'s temperature profile; with groups it changes per episode,
+    and the language string / ``object_*`` attrs follow it.
+
+    Pose jitter and yaw are drawn per object as before. Temperature profiles are
+    permuted within each ``temperature_groups`` entry: bodies exchange their
+    ``temp_c`` ranges, so identical bodies swap cold/warm/room roles without
+    moving. The group permutation is drawn once, before the pose loop, and is
+    fixed across gap retries. An empty group list consumes no permutation draw
+    and returns the configured target, so legacy seeds reproduce exactly.
 
     The per-object draw order is xy jitter (2), yaw (1), temperature (1), the
-    same stream every multi-object generation has used. ``target_index`` is a
-    required YAML value and consumes no draw, so a seed reproduces its episode
-    exactly.
+    same stream every multi-object generation has used.
     """
     objs = cfg["objects"]
     n = len(objs)
+    profile_sources, target_index = _temperature_profile_sources(cfg, rng)
     xy_offsets = np.zeros((n, 2), dtype=np.float64)
     yaws = np.zeros(n, dtype=np.float64)
     temps_c = np.zeros(n, dtype=np.float64)
@@ -361,7 +391,7 @@ def sample_episode(cfg: TaskConfig, rng: np.random.Generator) -> dict[str, Any]:
         for i, o in enumerate(objs):
             xy_offsets[i] = rng.uniform(-o["xy_jitter_m"], o["xy_jitter_m"], size=2)
             yaws[i] = float(rng.uniform(-o["yaw_jitter_rad"], o["yaw_jitter_rad"]))
-            temps_c[i] = float(rng.uniform(*o["temp_c"]))
+            temps_c[i] = float(rng.uniform(*objs[profile_sources[i]]["temp_c"]))
         gaps_ok = _min_surface_gap(objs, xy_offsets) >= cfg["min_object_gap_m"] and _tray_clearance_m(
             cfg, objs
         ) >= cfg["min_object_gap_m"]
@@ -378,7 +408,8 @@ def sample_episode(cfg: TaskConfig, rng: np.random.Generator) -> dict[str, Any]:
         "yaws": yaws,
         "temps_c": temps_c,
         "slots": home.copy(),
-        "target_index": int(cfg["target_index"]),
+        "target_index": int(target_index),
+        "temperature_profile_sources": np.asarray(profile_sources, dtype=np.int32),
     }
 
 

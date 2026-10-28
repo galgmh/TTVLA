@@ -285,7 +285,8 @@ uv run scripts/serve_policy.py policy:checkpoint --policy.config=pick_cold_can_p
 先 `ls` 看实际留下的 step 目录（20k 步时最后一个是 `19999`，中间档是
 `4999/9999/14999`），换 checkpoint 就换最后一段路径。训练时若设了
 `checkpoint_base_dir`（云上为 `/root/autodl-fs/openpi-checkpoints`），根目录就不是
-`~/openpi/checkpoints`，以 `ls` 到的实际路径为准。
+`~/openpi/checkpoints`，以 `ls` 到的实际路径为准；云上实测的命令与环境变量
+见 §9.6。
 
 评测机（只需客户端，不需要 openpi 的训练依赖）：
 
@@ -306,6 +307,9 @@ python experiment/eval_closed_loop.py --policy remote --episodes 20 --remote-hos
   指令、目标真值温度（**只进日志，不进策略**）、`bodies_in_tray` 等
 - `summary.json`：两个成功率、平均步数、seed 范围、是否 `--permute-slots`
 - `trace.jsonl`：加 `--trace` 时写逐步的指尖温度 / 夹爪 / TCP
+- `videos/`：加 `--video` 时每集一个 MP4（`ep<K>_seed<S>.mp4`，agentview |
+  wrist 左右拼接、策略帧率，左上角叠步数 / 夹爪 / 指尖温度）。云端容器没有
+  显示器，`--viewer` 开不出窗口，抽查策略行为就靠这个；需要 opencv-python
 
 两个成功率的定义：
 
@@ -319,24 +323,22 @@ python experiment/eval_closed_loop.py --policy remote --episodes 20 --remote-hos
 
 ### 5.3 位置捷径与 `--permute-slots`
 
-当前数据里每个 episode 的物体**槽位固定**（只有 ±1 cm、±0.15 rad 的抖动）。
-视觉策略完全可能背下"目标在 (x, y)"，从而在训练分布上刷出很高的任务成功率。
-正式报告前必须能量化这一点：
+当前数据里所有物体的槽位仍固定（只有 ±1 cm、±0.15 rad 的抖动），但三个外观
+相同的罐子每集把冷/温/室温三个温度档随机置换，`target_index` 跟随冷档，因此
+**target 的槽位在三个罐位之间随机**。视觉策略如果只看位置，无法区分哪个罐子是
+冷的；固定挑一个罐位的成功率上限约为 1/3。
 
-```bash
-python experiment/eval_closed_loop.py --policy remote --episodes 20 --permute-slots --remote-host 192.168.1.20 --remote-port 8000
-```
+`--permute-slots` 每集把 7 个物体的槽位整体随机重排（槽位集合不变）。它**只是
+诊断**，不是训练分布：用来测“策略是否依赖 canonical 布局”。温度网格的 AABB
+存在 link 系、接触点按实时 link pose 映射，刚体平移不会让物体系温度网格失效，
+所以置换后温度通道仍有物理意义；它仍不是训练分布，因为训练数据没有这种全布局
+置换。
 
-`--permute-slots` 每集把 7 个物体的槽位随机重排（槽位集合不变，最小间距
-约束仍成立）。它**只是诊断**，不是训练分布：物体温度网格是在建场景时按
-**世界系 AABB** 切出来的（见 `docs/architecture.md` §9-R21），大范围移动物体
-会让物体系温度网格失效，所以这个模式只用于纯视觉诊断，不要用它解读温度通道。
+要真正消除所有物体的布局先验，正确做法是**重新生成一份每集槽位随机化的数据集**
+（`sample_episode` 里加槽位采样）；那是另一项生成侧改动，不在当前温度档置换
+范围内。
 
-要真正消除捷径，正确做法是**重新生成一份每集槽位随机排列的数据集**
-（`sample_episode` 里加一次 permutation），那会改变训练分布，且温度档必须
-一起重算。这一步需要单独确认后再做（M9 全量生成需要明确同意）。
-
-在重排分布下，三种外观相同的罐子意味着**纯视觉任务成功率的上限约为 1/3**；
+在温度档置换分布下，三种外观相同的罐子意味着**纯视觉任务成功率的上限约为 1/3**；
 操作成功率仍应很高。这就是"视觉不够、需要触觉/温度"的核心证据。
 
 ### 5.4 checkpoint 选择与最终报告
@@ -388,6 +390,13 @@ seed 范围，以及是否重排槽位。
   `meta/episodes_stats.jsonl` 即可。`check_lerobot.py` 现在会先报出这两项。
 - **`--overwrite` 的安全性**：只删除目标目录下的 `data/ videos/ meta/`，
   并且拒绝把仓库根目录当 `--out`。
+- **`--video` 报 `needs opencv-python` / `OpenCV could not open ... mp4v`**：
+  评测环境缺 OpenCV 或没有可用的 mp4v 编码器；去掉 `--video`，评测本身不受影响。
+- **`numpy` 被降到 1.26 / `opencv-python requires numpy>=2`**：装 openpi-client
+  时没加 `--no-deps`；按 §9.3 重新装 openpi-client 并用 `--no-deps` 恢复 numpy 2.4.6。
+- **`ConnectionClosedError: sent 1011 ... keepalive ping timeout`**：远程策略的
+  首个推理触发 XLA 冷编译（1–3 分钟），服务端来不及回 websocket ping；按 §9.7
+  给客户端关掉 ping（`ping_interval=None, ping_timeout=None`）。
 
 ---
 
@@ -397,3 +406,161 @@ seed 范围，以及是否重排槽位。
 - OpenVLA-OFT 对照需要另一条 RLDS 导出路径（本目录未包含）；
 - 若决定消除位置捷径：改 `sample_episode` 的槽位分配 → 重新生成 →
   重新导出 → 重跑本 README 的全部检查。
+
+---
+
+## 9. 云端实操记录（AutoDL：环境 → 训练 → 服务 → 评测）
+
+2026-10 在 AutoDL 单卡 vGPU-32GB 上跑通的整条链路记录。§4/§5 里的示例路径
+（`~/openpi`、`~/datasets/...`）在云上换成了数据盘路径，以本节为准。
+
+### 9.1 机器与目录
+
+- 镜像 PyTorch 2.8.0 / Python 3.12 / CUDA 12.8（ubuntu22.04）；1×vGPU-32GB、
+  12 vCPU Xeon 8352V、62GB 内存、系统盘 30GB、数据盘 50GB、`/autodl-fs/data` 200GB。
+- 仓库都在数据盘：`/root/autodl-tmp/openpi`、`/root/autodl-tmp/TTVLA`；
+  checkpoint 在 `/autodl-fs/data/openpi-checkpoints/pick_cold_can_pi05_lora/trial1/`
+  （留下 `5000`、`9999` 两档）；`OPENPI_DATA_HOME=/root/autodl-tmp/openpi-cache`；
+  `PIP_CACHE_DIR=/autodl-fs/data/pip-cache`。
+- 两个进程同机：openpi 服务进程（JAX，约 13–14GB 显存）+ 评测进程
+  （Genesis/EGL，用剩下的约 12GB），只通过 `127.0.0.1:8000` 的 websocket 通信。
+- 容器重启过一次（容器 ID 会变），仓库从系统盘 `mv` 到数据盘；重启后按 §9.3
+  复查 editable 安装与 `.venv`。
+
+### 9.2 两套环境的分工
+
+| | conda `tempvla`（Python 3.11） | openpi `uv .venv` |
+|---|---|---|
+| 用途 | Genesis 场景、评测循环、HDF5/LeRobot 工具 | 训练、`serve_policy.py` |
+| 关键包 | torch 2.8.0+cu128、genesis-world 1.4.1、h5py/pyyaml/scipy/pillow、numpy 2.4.6、opencv 5.0.0 | JAX 全家桶（约 240 包），由 `uv.lock` 锁定 |
+| 与对方的关系 | 只装 openpi 的纯 Python 客户端 SDK（`openpi_client`），不装训练依赖 | 不 import TTVLA 的任何东西 |
+
+`uv .venv` 可丢弃，`uv.lock` 是真源；`tempvla` 是长期环境，不要往里直接
+`pip install` 大包（见 9.3 的 numpy 事故）。
+
+### 9.3 环境搭建（装了什么、踩过什么）
+
+评测侧（`tempvla`）：
+
+```bash
+pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+pip install genesis-world==1.4.1 h5py pyyaml scipy pillow
+pip install --no-deps -e /root/autodl-tmp/openpi/packages/openpi-client
+pip install msgpack websockets
+pip install --no-deps numpy==2.4.6
+apt-get install -y libegl1 libgl1 libglib2.0-0
+```
+
+- **torch 必须是 2.8+**：Genesis 1.4.1 对 `torch<2.8.0` 只警告不拦截，但
+  cu121 的 wheel 源最高 2.5.1、镜像又是 CUDA 12.8，所以从 cu128 源装
+  `torch==2.8.0`。`nvidia-cuda-nvrtc-cu12` 的版本冲突警告是装饰性的
+  （nvrtc 只用于 CUDA JIT，评测路径不加载），不要为此降级。
+- **openpi-client 必须 `--no-deps`**：它的元数据把 numpy 钉在 `<2.0.0`，
+  直接装会把 numpy 2.4.6 降到 1.26.4，踩坏 opencv-python 5.0.0（要求
+  numpy>=2）。跳过依赖后它真正的运行依赖只有 `msgpack`、`websockets`，
+  单独装；再把 numpy 用 `--no-deps` 装回 2.4.6。
+- **EGL 系统库**：headless 渲染要 `libegl1 libgl1 libglib2.0-0`，运行时
+  `export PYOPENGL_PLATFORM=egl`。
+- **editable 安装对路径敏感**：仓库 `mv` 到数据盘后 `openpi_client` 还指向
+  旧路径，重新 `--no-deps -e` 装一次；之后如果报 `ModuleNotFoundError:
+  msgpack`，就是跳过依赖的直接后果，补装即可。
+- **uv 删除并重建 `.venv` 是正常自愈**：容器重启/`mv` 后 venv 里的绝对路径
+  失效，uv 会按 `uv.lock` 从缓存秒级重建（缓存与 venv 不在同一文件系统时
+  提示 hardlink 回退，无害）。不要手工修 `.venv`。
+- 装完自检（应输出 `2.4.6 5.0.0 2.8.0+cu128 12.8 1.4.1`）：
+
+```bash
+python -c "import numpy, cv2, torch, genesis, yaml, h5py, scipy, PIL; print(numpy.__version__, cv2.__version__, torch.__version__, torch.version.cuda, genesis.__version__)"
+```
+
+### 9.4 训练（已在云端完成）
+
+训练配置（`PickColdCanDataConfig` + `pick_cold_can_pi05_lora`）见 §4，数据
+导出与校验见 §3。云上环境变量与入口：
+
+```bash
+cd /root/autodl-tmp/openpi
+export HF_LEROBOT_HOME=<local/ 的上一级目录，按实际放置位置>
+export OPENPI_DATA_HOME=/root/autodl-tmp/openpi-cache
+export PIP_CACHE_DIR=/autodl-fs/data/pip-cache
+uv run scripts/compute_norm_stats.py --config-name pick_cold_can_pi05_lora
+uv run scripts/train.py pick_cold_can_pi05_lora --exp-name=trial1 --overwrite
+```
+
+- checkpoint 写到 `/autodl-fs/data/openpi-checkpoints/pick_cold_can_pi05_lora/trial1/`
+  （`checkpoint_base_dir` 指到大盘），留下的档是 `5000` 和 `9999`；每档内部带
+  `assets/local/pick_cold_can_p16` 的 norm stats，服务时直接加载（训练/推理同源）。
+- 没有 wandb 就加 `--no-wandb-enabled`；显存不够先降 batch。
+
+### 9.5 训练数据格式对齐（TTVLA 导出 ↔ openpi）
+
+| 层面 | 不对等 | 解决 |
+|---|---|---|
+| 导出 → LeRobot | stats 硬性格式：每个 stat 必须是数组，`count` 为 `[n]`，图像 stats 为 `(3,1,1)` | `export_lerobot.py` 已修正；`check_lerobot.py` 全量核对（集数/帧数、列名、`task_index`、`timestamp`、视频、stats、splits），末行 `OK` 才通过 |
+| LeRobot → openpi loader | openpi 的 LIBERO 配置期望 `image`/`wrist_image`/`state`/`actions`，导出是 `observation.images.*`/`observation.state`/`action` | `PickColdCanDataConfig` 的 repack 映射 + `action_sequence_keys=("action",)`（完整代码见 §4） |
+| 动作语义 | LIBERO 路线默认再叠一次 delta 变换 | 我们的动作本来就是世界系 delta → `extra_delta_transform=False`，防止叠加两次 |
+| 状态/动作维度 | 16 维连续状态；模型内部 32 维槽 | `discrete_state_input=False`、`action_dim=32`；客户端只取前 7 维 |
+| 动作块长度 | 默认 horizon 50 接触后反应太慢 | `action_horizon=16`，评测端配合 `--remote-requery 1` 每步重问 |
+| 指令来源 | 指令不在输入列里 | `base_config=DataConfig(prompt_from_task=True)` |
+| LeRobot 版本 | 导出是 v2.1 布局，最新 LeRobot v3 读不了 | 用 openpi `pyproject.toml` 固定的 lerobot；不要升 |
+| 评测 → 服务端 | 服务端只认 openpi 内部键名 | `RemotePolicy` 的 payload 就是训练 repack 后的键：`observation/image`、`observation/wrist_image`、`observation/state`、`prompt`；返回 `(T,32)` 取前 7 维 |
+
+状态契约单一真源：导出与评测都调 `experiment/common.py` 的
+`assemble_state_from_obs`（`ee_pos(3)+ee_ori(3)+gripper(1)+joints(9)`），
+训练喂的 16 维与评测拼的 16 维逐位一致；真值温度不在 state 里。
+
+### 9.6 策略服务
+
+```bash
+cd /root/autodl-tmp/openpi
+export OPENPI_DATA_HOME=/root/autodl-tmp/openpi-cache
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.6 uv run scripts/serve_policy.py policy:checkpoint --policy.config=pick_cold_can_pi05_lora --policy.dir=/autodl-fs/data/openpi-checkpoints/pick_cold_can_pi05_lora/trial1/5000
+```
+
+- 恢复 6.3GiB 参数约 22 秒，从 checkpoint 资产加载 norm stats，监听 `0.0.0.0:8000`。
+- `XLA_PYTHON_CLIENT_MEM_FRACTION=0.6` ≈ 19GB 上限，实际 13–14GB，给 Genesis
+  留约 12GB；评测 OOM 时降到 0.5。
+- 换 checkpoint：Ctrl-C → 改最后一段路径 → 重启（norm stats 逐档不同）。
+- 确认在听：`ss -ltn | grep 8000`。
+
+### 9.7 评测（含 keepalive 修复与录制）
+
+```bash
+cd /root/autodl-tmp/TTVLA
+conda activate tempvla
+export PYOPENGL_PLATFORM=egl
+python experiment/eval_closed_loop.py --policy zero --episodes 1 --out experiment/runs/smoke_zero
+python experiment/eval_closed_loop.py --policy expert --episodes 2 --out experiment/runs/smoke_expert --video
+python experiment/eval_closed_loop.py --policy remote --episodes 20 --seed0 1000 --state-mode proprio16 --out experiment/runs/sel_5000
+```
+
+- **第一次远程推理必现的 keepalive 断连**：首个 `infer` 触发 π0.5 的 XLA
+  冷编译（1–3 分钟），服务端 handler 线程被占住、回不了客户端的 20 秒 ping →
+  `1011 keepalive ping timeout`。修复只改客户端一行（editable 安装立即生效）：
+  在 `websocket_client_policy.py` 的 `connect(...)` 调用里加
+  `ping_interval=None, ping_timeout=None`；编译结果在服务进程内缓存，第二次
+  推理起恢复快。openpi 重新 clone 后要重新打这个补丁。
+- **顺序不能跳**：`zero` 看循环健康 → `expert` 2 集验证云端物理/评分与生成器
+  一致（必须 2/2）→ 再烧远程的 20 集。远程首集开头 1–3 分钟没有输出是编译，
+  不是卡死。
+- **可视化**：云端无显示器，`--viewer` 开不出窗口；`--video` 每集录一个 MP4
+  （`<out>/videos/ep<K>_seed<S>.mp4`，agentview | wrist 拼接），`--trace` 写
+  逐步数值轨迹。
+
+### 9.8 训练/评测一致性备忘
+
+- 训练用了全量 50 集（导出里的 val/test split 也在训练里）；held-out 只有评测
+  的新种子（`--seed0 1000` 选点、`--seed0 2000` 最终），报告必须写明。
+- 场景 seed = `cfg.seed+1000`，每集 seed = `seed0+k`；成功判定与 runner 一致
+  （去掉 expert phase 条件）。
+- 选点用固定种子段，最终报告换一段没参与选择的种子，避免选择偏差（§5.4）。
+
+### 9.9 云端待办清单
+
+1. 确认客户端补丁在：`grep -n "ping_interval=None" /root/autodl-tmp/openpi/packages/openpi-client/src/openpi_client/websocket_client_policy.py`
+2. 确认服务在听：`ss -ltn | grep 8000`
+3. 同步 `experiment/eval_closed_loop.py`（含 `--video`）到云端
+4. `expert` 冒烟 2 集（带 `--video`）必须 2/2
+5. `sel_5000` → 换 `9999` 重复 → 按 task success 选（打平选 9999）
+6. 赢家跑最终 held-out（`--seed0 2000 --episodes 20`），再跑 `--permute-slots`
+7. 出 baseline 报告（task/manipulation、平均步数、seed 段、permute 标记、全量训练说明）

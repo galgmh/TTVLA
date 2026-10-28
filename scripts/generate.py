@@ -7,7 +7,7 @@
 
 One file per invocation: ``material_list`` gives one material per body. One
 scene is built per job (material thermal properties, object size and mass are
-frozen at build time — see docs/architecture.md §9), then N episodes are rolled
+frozen at build time — see docs/architecture.md §9 in git HEAD), then N episodes are rolled
 out with per-episode pose/yaw/temperature randomization. Successful episodes go
 to <task>_<tag>.hdf5, failures to <task>_<tag>_failed.hdf5.
 
@@ -244,12 +244,17 @@ def main() -> int:
           f"(decimation {cfg['controller']['decimation']}) | max {cfg['max_episode_steps']} steps")
     objects = cfg["objects"]
     print(f"  objects     : {len(objects)} ({', '.join(str(o['shape']) for o in objects)})"
-          f"  | target pinned to {cfg['target_index']}")
+          f"  | target profile anchor object {cfg['target_index']}")
     for i, o in enumerate(objects):
         own = f"{o['temp_c'][0]:.0f}-{o['temp_c'][1]:.0f} C"
         print(f"    object_{i}   : xy +-{o['xy_jitter_m'] * 1000:.0f} mm | "
               f"yaw +-{np.degrees(o['yaw_jitter_rad']):.0f} deg "
-              f"| temp {own} | place {tuple(o['place_xy'])}")
+              f"| temp profile {own} | place {tuple(o['place_xy'])}")
+    if cfg["temperature_groups"]:
+        print(
+            f"  temp groups : {cfg['temperature_groups']} -> profiles permuted per "
+            f"episode; target is the body that receives object {cfg['target_index']}'s profile"
+        )
     print("  materials   : " + ", ".join(materials))
     expert = cfg["expert"]
     if expert["temperature_judge_enabled"] and expert["approach"] == "place_in_tray":

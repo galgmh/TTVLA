@@ -1,6 +1,6 @@
 # sim/ simulation environment generation
 
-用于生成VLA训练测评数据集，所有可执行入口都在 [scripts/](../scripts/)
+用于生成VLA训练测评仿真数据集，所有可执行入口都在 [scripts/](../scripts/)
 
 ```
 sim/
@@ -9,7 +9,8 @@ sim/
 │   └── robosuite/               robosuite_tabletop.yaml 用的 can/lemon/milk + 贴图
 ├── configs/                     定义具体任务
 |   └── thermal_recognition      冷热物体识别
-|       └── pick_cold_can.yaml      抓取冷饮（当前唯一任务）
+|       ├── pick_cold_can.yaml      抓取冷饮罐
+|       └── pick_lemon.yaml         抓取柠檬（一个柠檬 + 两个罐子 + 两盒牛奶；不判温）
 ├── config.py                    任务配置：YAML → 严格校验的嵌套 dict（无 dataclass）
 ├── scene.py                     场景构建
 ├── expert/                      专家管线
@@ -75,7 +76,7 @@ sim/tools/validate.py                  scripts/validate_dataset.py 包 CLI；纯
 
 | 文件 | 行数 | 职责 |
 |---|---|---|
-| `config.py` | 575 | 任务配置：一个 YAML 端到端描述一个任务（机器人/桌子/物体/传感器/热学/随机化/成功判据/记录）；`load_task_config` 返回**普通嵌套 dict**（无 dataclass、无默认值），加载时逐节严格校验键集合与类型，未知/缺失键直接报错，全库直接 `cfg["section"]["key"]` 取值。YAML 只保留任务级选择（`tactile.modalities`、`temperature` 三键）；其余参数是 `sensors/tactile.py` / `sensors/temperature.py` 与 `obs.py` 的模块常量 |
+| `config.py` | 575 | 任务配置：一个 YAML 端到端描述一个任务（机器人/桌子/物体/传感器/热学/随机化/成功判据/记录）；`load_task_config` 返回**普通嵌套 dict**（无 dataclass、无默认值），加载时逐节严格校验键集合与类型，未知/缺失键直接报错，全库直接 `cfg["section"]["key"]` 取值。顶层 `temperature_groups` 指定每集置换 `temp_c` 温度档的同外观物体组（空列表 = 旧固定分布）。YAML 只保留任务级选择（`tactile.modalities`、`temperature` 三键）；其余参数是 `sensors/tactile.py` / `sensors/temperature.py` 与 `obs.py` 的模块常量 |
 | `scene.py` | 1269 | 场景构建（机器人/桌子/物体/传感器注册）+ 每回合 reset/播种；**build 期 vs 回合期的契约都在这** |
 | `obs.py` | 283 | 观测组装：本体状态/位姿 + `tactile/*`（1.6：6D 合力 / 2D marker）+ `contact/*` + `temperature/*` + 双相机；burst payload；**相机渲染后端常量 `RENDERER`（唯一源，不是 YAML 键）** |
 | `gripper.py` | 353 | 夹爪几何的**独立第二推导**（无 Genesis/torch）：指垫面/闭合轴/marker 格；等价性曾由 `scripts/probe_gripper_model.py` 断言（<1e-6 m），该脚本已于 2026-10-20 清理时删除（§9-R46） |
