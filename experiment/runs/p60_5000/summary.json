@@ -1,0 +1,19 @@
+{
+  "config": "sim/configs/thermal_recognition/pick_cold_can.yaml",
+  "policy": "remote",
+  "state_mode": "full30",
+  "episodes": 20,
+  "task_success": 8,
+  "task_success_rate": 0.4,
+  "manipulation_success": 8,
+  "manipulation_success_rate": 0.4,
+  "mean_steps": 309.8,
+  "seed0": 1000,
+  "scene_seed": 1000,
+  "permute_slots": false,
+  "wall_time_s": 3220.3374131573364,
+  "definition": {
+    "task_success": "the targeted body is at rest in the tray, pads open",
+    "manipulation_success": "any body is at rest in the tray, pads open"
+  }
+}

@@ -7,6 +7,7 @@ data config pointing at the directory. Nothing here imports Genesis: h5py,
 numpy, Pillow, imageio and pyarrow are enough.
 
     python experiment/export_lerobot.py DATASET.hdf5 --out datasets/lerobot/pick_cold_can_p16
+    python experiment/export_lerobot.py A.hdf5 B.hdf5 --out datasets/lerobot/pick_can_lemon_p16
 
 Contract (see experiment/common.py for the exact index layout):
 
@@ -21,6 +22,10 @@ thermal rungs use ``touch28`` / ``full30``; those names mirror
 ``sim/configs/.../pick_cold_can.yaml``'s measured fingertip channel and never
 read the scene's ground-truth object temperature.
 
+Multiple HDF5 inputs are merged, in argument order, into one dataset; they must
+share fps, cameras and the state/action contract (the same task family). Episode
+indices and the global frame index are renumbered over the merged sequence.
+
 Splits are contiguous over the exported episodes (train, then val, then test);
 they are written to ``meta/info.json`` under ``splits``.
 """
@@ -28,6 +33,7 @@ they are written to ``meta/info.json`` under ``splits``.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import shutil
 import sys
@@ -314,10 +320,11 @@ def _split_ranges(n: int, val_frac: float, test_frac: float) -> dict[str, str]:
 
 
 def export(args: argparse.Namespace) -> int:
-    src = Path(args.hdf5).expanduser()
-    if not src.is_file():
-        print(f"ERROR: {src} not found")
-        return 2
+    srcs = [Path(p).expanduser() for p in args.hdf5]
+    for src in srcs:
+        if not src.is_file():
+            print(f"ERROR: {src} not found")
+            return 2
     out = Path(args.out).expanduser()
     if out.resolve() == REPO.resolve():
         print("ERROR: refusing to export over the repository root; pass a dataset directory")
@@ -341,25 +348,48 @@ def export(args: argparse.Namespace) -> int:
     _need("PIL", "Pillow")
     _need("imageio", "imageio imageio-ffmpeg")
 
-    with h5py.File(src, "r") as f:
-        if "data" not in f:
-            print(f"ERROR: {src} has no 'data' group (not a tempvla file?)")
-            return 2
-        format_version = _decode_attr(f.attrs.get("format_version", "unknown"))
-        fps = float(args.fps) if args.fps is not None else _read_fps(f)
+    with contextlib.ExitStack() as stack:
+        files = [stack.enter_context(h5py.File(src, "r")) for src in srcs]
 
-        demos = sorted(f["data"].keys(), key=lambda k: int(k.split("_")[1]))
-        plans: list[tuple[str, str, int]] = []
-        for demo in demos:
-            g = f["data"][demo]
-            success = bool(g.attrs.get("success", False))
-            if not success and not args.include_failed:
-                continue
-            instruction = _attr_str(g.attrs, "language_instruction")
-            length = int(g["actions"].shape[0])
-            if length <= 0:
-                continue
-            plans.append((demo, instruction, length))
+        formats: list[str] = []
+        fps_list: list[float] = []
+        for src, f in zip(srcs, files):
+            if "data" not in f:
+                print(f"ERROR: {src} has no 'data' group (not a tempvla file?)")
+                return 2
+            formats.append(_decode_attr(f.attrs.get("format_version", "unknown")))
+            fps_list.append(float(args.fps) if args.fps is not None else _read_fps(f))
+        if len(set(formats)) > 1:
+            print(
+                "ERROR: source format versions differ: "
+                + ", ".join(f"{src.name}={fmt}" for src, fmt in zip(srcs, formats))
+            )
+            return 2
+        if len(set(fps_list)) > 1:
+            print(
+                "ERROR: source control rates differ: "
+                + ", ".join(f"{src.name}={fps:g}" for src, fps in zip(srcs, fps_list))
+                + "; pass --fps to override"
+            )
+            return 2
+        format_version = formats[0]
+        fps = fps_list[0]
+
+        plans: list[tuple[int, str, str, int]] = []
+        for fi, f in enumerate(files):
+            demos = sorted(f["data"].keys(), key=lambda k: int(k.split("_")[1]))
+            for demo in demos:
+                g = f["data"][demo]
+                success = bool(g.attrs.get("success", False))
+                if not success and not args.include_failed:
+                    continue
+                instruction = _attr_str(g.attrs, "language_instruction")
+                length = int(g["actions"].shape[0])
+                if length <= 0:
+                    continue
+                plans.append((fi, demo, instruction, length))
+                if args.limit is not None and len(plans) >= args.limit:
+                    break
             if args.limit is not None and len(plans) >= args.limit:
                 break
 
@@ -367,13 +397,13 @@ def export(args: argparse.Namespace) -> int:
             print("ERROR: no exportable episodes (all failed? try --include-failed)")
             return 2
 
-        # Tasks are deduplicated in first-appearance order.
+        # Tasks are deduplicated in first-appearance order, across all sources.
         task_index: dict[str, int] = {}
-        for _, instruction, _ in plans:
+        for _, _, instruction, _ in plans:
             task_index.setdefault(instruction, len(task_index))
 
         # One image size for the whole dataset.
-        first_obs = f["data"][plans[0][0]]["obs"]
+        first_obs = files[plans[0][0]]["data"][plans[0][1]]["obs"]
         present = [(key, channel) for key, channel in CAMERAS if channel in first_obs]
         if not present:
             print("ERROR: the file has no RGB channels; regenerate with cameras enabled")
@@ -384,11 +414,23 @@ def export(args: argparse.Namespace) -> int:
             print(f"ERROR: --image-size must be even for yuv420p (got {size})")
             return 2
 
-        print(
-            f"export: {src.name}  format {format_version}  "
-            f"{len(plans)} episodes  fps {fps:g}  {size}x{size}  state {args.state_mode} "
-            f"({state_dim(args.state_mode)}D)"
-        )
+        if len(srcs) == 1:
+            print(
+                f"export: {srcs[0].name}  format {format_version}  "
+                f"{len(plans)} episodes  fps {fps:g}  {size}x{size}  state {args.state_mode} "
+                f"({state_dim(args.state_mode)}D)"
+            )
+        else:
+            print(
+                f"export: {len(srcs)} sources -> {out.name}  format {format_version}  "
+                f"{len(plans)} episodes  fps {fps:g}  {size}x{size}  state {args.state_mode} "
+                f"({state_dim(args.state_mode)}D)"
+            )
+            counts = [sum(1 for plan in plans if plan[0] == fi) for fi in range(len(srcs))]
+            print(
+                "        per source: "
+                + ", ".join(f"{src.name}={n}" for src, n in zip(srcs, counts))
+            )
         print(f"        cameras: {', '.join(k for k, _ in present)}")
 
         splits = _split_ranges(len(plans), args.val_frac, args.test_frac)
@@ -403,13 +445,26 @@ def export(args: argparse.Namespace) -> int:
         episodes_stats: list[dict[str, Any]] = []
         index0 = 0
 
-        for episode_index, (demo, instruction, length) in enumerate(plans):
-            g = f["data"][demo]
+        for episode_index, (fi, demo, instruction, length) in enumerate(plans):
+            g = files[fi]["data"][demo]
             obs = g["obs"]
+            label = demo if len(srcs) == 1 else f"{srcs[fi].stem}/{demo}"
             for _key, channel in present:
                 if channel not in obs:
-                    print(f"ERROR: {demo} has no obs/{channel}; every episode must match")
+                    print(f"ERROR: {label} has no obs/{channel}; every episode must match")
                     return 2
+            missing = [
+                key
+                for key in ("ee_pos", "ee_ori", "gripper_states", "joint_states")
+                if key not in obs
+            ]
+            if args.state_mode == "full30" and "temperature/fingertip_grid" not in obs:
+                missing.append("temperature/fingertip_grid")
+            if args.state_mode in ("touch28", "full30") and "tactile/force" not in obs:
+                missing.append("tactile/force")
+            if missing:
+                print(f"ERROR: {label} is missing obs/{', obs/'.join(missing)}")
+                return 2
 
             state = assemble_state_arrays(
                 obs["ee_pos"][:],
@@ -431,12 +486,12 @@ def export(args: argparse.Namespace) -> int:
             action = np.asarray(g["actions"][:], dtype=np.float32)
             if action.shape[0] != state.shape[0]:
                 print(
-                    f"ERROR: {demo}: actions {action.shape[0]} != observations "
+                    f"ERROR: {label}: actions {action.shape[0]} != observations "
                     f"{state.shape[0]}"
                 )
                 return 2
             if action.shape[1] < ACTION_DIM:
-                print(f"ERROR: {demo}: actions have {action.shape[1]} dims, need {ACTION_DIM}")
+                print(f"ERROR: {label}: actions have {action.shape[1]} dims, need {ACTION_DIM}")
                 return 2
             action = action[:, :ACTION_DIM]
 
@@ -507,7 +562,7 @@ def export(args: argparse.Namespace) -> int:
                 }
             )
             print(
-                f"  [{episode_index + 1}/{len(plans)}] {demo}  T={length:4d}  "
+                f"  [{episode_index + 1}/{len(plans)}] {label}  T={length:4d}  "
                 f"{instruction}"
             )
             index0 += length
@@ -580,7 +635,12 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("hdf5", type=Path, help="format-1.6 file written by scripts/generate.py")
+    ap.add_argument(
+        "hdf5",
+        type=Path,
+        nargs="+",
+        help="one or more format-1.6 files written by scripts/generate.py (merged in order)",
+    )
     ap.add_argument("--out", type=Path, required=True, help="LeRobot dataset directory")
     ap.add_argument(
         "--state-mode",
@@ -597,7 +657,9 @@ def main() -> int:
     ap.add_argument("--fps", type=float, default=None, help="default: env_args.sim.control_hz")
     ap.add_argument("--val-frac", type=float, default=0.08, help="episode fraction (default 0.08)")
     ap.add_argument("--test-frac", type=float, default=0.04, help="episode fraction (default 0.04)")
-    ap.add_argument("--limit", type=int, default=None, help="export at most N episodes")
+    ap.add_argument(
+        "--limit", type=int, default=None, help="export at most N episodes in total"
+    )
     ap.add_argument(
         "--include-failed",
         action="store_true",

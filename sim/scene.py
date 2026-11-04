@@ -60,7 +60,6 @@ ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 
 # sampling
 
-
 @dataclass
 class ObjectSpec:
     """One object's frozen geometry/mass (sampled once per scene build).
