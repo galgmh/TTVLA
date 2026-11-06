@@ -30,7 +30,11 @@ orientation, so that frame coincides with the world frame):
 
 The action that leaves this script is still the world-frame 7-dim delta above
 (the dataset/expert contract); the key intent is rotated into the world frame
-with the base orientation before it is sent. Note the default viewer camera
+with the base orientation before it is sent. Translation keys hold the gripper
+orientation: the script keeps an absolute orientation reference and folds the
+corrective rotation into ``a[3:6]``, so moving the TCP does not slowly tilt the
+gripper (DeltaPoseController otherwise re-anchors its orientation target on the
+measured pose every step). Note the default viewer camera
 looks along +y, so +x (Up) reads as "toward the image right" on screen; orbit
 the view for a top-down reading, the keys do not depend on it.
 
@@ -531,8 +535,8 @@ def main() -> int:
         side = int(args.cam_res)
         cfg["cameras"]["resolution"] = [side, side]
 
-    from sim.expert.actions import DeltaPoseController
-    from sim.rotations import quat_to_matrix
+    from sim.expert.actions import DeltaPoseController, tcp_pose
+    from sim.rotations import quat_apply_delta, quat_error_rotvec, quat_to_matrix
     from sim.scene import build_scene, sample_episode
     from sim.sensors.temperature import SENSOR_TIME_CONSTANT, read_temperature
 
@@ -586,6 +590,7 @@ def main() -> int:
     sim_dt = float(cfg["controller"]["sim_dt"])
     decimation = int(cfg["controller"]["decimation"])
     control_hz = float(cfg["controller"]["control_hz"])
+    rot_scale = float(cfg["controller"]["rot_scale_rad"])
     status_every = max(1, int(round(control_hz)))
     preview_every = max(1, int(round(control_hz / max(float(args.preview_hz), 0.1))))
 
@@ -638,6 +643,8 @@ def main() -> int:
     action = np.zeros(7, dtype=np.float64)
     last_info = None
     issued = False
+    # Absolute orientation reference for the hold below; re-synced on reset.
+    orient_ref = tcp_pose(bundle)[1].copy()
     if preview is not None:
         preview.update()  # show the first frames right away
     print(
@@ -665,6 +672,7 @@ def main() -> int:
                 grip_closed = False
                 action = np.zeros(7, dtype=np.float64)
                 last_info = None
+                orient_ref = tcp_pose(bundle)[1].copy()
                 print("\n[reset]")
                 continue
             grip_before = grip_closed
@@ -673,6 +681,22 @@ def main() -> int:
 
             action = _action_from_keys(codes, plugin.snapshot(), grip_closed, base_rot)
             grip_changed = grip_closed != grip_before
+            # Orientation hold. DeltaPoseController re-anchors its orientation
+            # target on the *measured* quat every step (sim/expert/actions.py),
+            # so the PD tracking lag the wrist picks up while translating would
+            # be adopted as the new reference: a horizontal move leaves the
+            # gripper tilted, and each further move adds more. Keep an absolute
+            # reference instead -- integrate the rotation keys into it and send
+            # the controller the error back to it as a plain delta action (the
+            # action stream is still a world-frame 7-dim delta).
+            rot_keys = bool(np.any(action[3:6] != 0.0))
+            moving = bool(np.any(action[:3] != 0.0) or rot_keys)
+            if rot_keys:
+                orient_ref = quat_apply_delta(orient_ref, action[3:6] * rot_scale)
+            if moving:
+                action[3:6] = np.clip(
+                    quat_error_rotvec(orient_ref, tcp_pose(bundle)[1]) / rot_scale, -1.0, 1.0
+                )
             # DeltaPoseController re-anchors every command on the *measured* TCP
             # (its anti-windup design, see sim/expert/actions.py). With a zero
             # action that setpoint is exactly the pose gravity has already sagged
@@ -680,7 +704,7 @@ def main() -> int:
             # accumulate: an idle arm slowly droops. A zero action therefore
             # re-issues the frozen joint command instead of re-solving IK;
             # re-anchoring resumes on the next commanded motion.
-            if np.any(action[:6] != 0.0) or grip_changed:
+            if moving or grip_changed:
                 last_info = controller.step(action)
                 issued = True
             else:
