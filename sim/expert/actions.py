@@ -69,6 +69,8 @@ class DeltaPoseController:
         self.target_pos = np.zeros(3)
         self.target_quat = np.array([1.0, 0.0, 0.0, 0.0])
         self.finger_target = float(bundle.cfg["robot"]["open_finger_pos"])
+        # Last commanded arm joint vector, kept for DeltaPoseController.hold().
+        self._last_q_cmd: np.ndarray | None = None
         self.reset()
 
     # ------------------------------------------------------------------ control
@@ -77,6 +79,7 @@ class DeltaPoseController:
         """Sync setpoints to the actual pose (call after scene.reset())."""
         self.target_pos, self.target_quat = tcp_pose(self.bundle)
         self.finger_target = float(self.bundle.cfg["robot"]["open_finger_pos"])
+        self._last_q_cmd = None
         self._command_fingers(self.finger_target)
 
     def step(self, action: np.ndarray) -> ActionInfo:
@@ -111,6 +114,7 @@ class DeltaPoseController:
         err = _np(err).reshape(-1)[:6]
 
         q_cmd = q_full[self.bundle.arm_dofs]
+        self._last_q_cmd = q_cmd
         self.robot.control_dofs_position(q_cmd, self.bundle.arm_dofs)
 
         grip = 0.5 * (a[6] + 1.0)
@@ -125,6 +129,20 @@ class DeltaPoseController:
             finger_target_m=self.finger_target,
             clipped=clipped,
         )
+
+    def hold(self) -> None:
+        """Re-issue the last arm joint command without running IK.
+
+        Interactive teleop uses this for a zero action. ``step()`` re-anchors
+        its IK target on the *measured* TCP, so calling it with a zero action
+        would feed the gravity-sagged pose back as the new target and the arm
+        would creep downward. ``hold()`` keeps the last commanded joint vector
+        (and the finger target) alive instead, with no new solve. It is a no-op
+        for the scripted expert, which never calls it.
+        """
+        if self._last_q_cmd is not None:
+            self.robot.control_dofs_position(self._last_q_cmd, self.bundle.arm_dofs)
+        self._command_fingers(self.finger_target)
 
     def _slew(self, current: float, commanded: float) -> float:
         """Rate-limit the finger setpoint to `finger_speed_m_per_s` (0 = off).
