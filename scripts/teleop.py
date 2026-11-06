@@ -57,6 +57,16 @@ does not display camera images anyway. Preview resolution defaults to
 dataset-exact view. ``--no-preview`` turns the window off, ``--no-cameras``
 skips building the cameras entirely.
 
+Grip strength: the fingers are position-controlled (YAML ``finger_kp`` = 100
+N/m), so the squeeze force at contact is ``kp * (closed target - finger
+position)`` -- not the ``finger_force_max`` limit, which is never reached. That
+gives only ~1.9-2.5 N per pad at these objects (the 0.5 kg iron cube cannot be
+lifted at all). ``--grip-kp`` overrides the finger stiffness for this run only
+(400 -> ~8-10 N per pad at these objects); the task YAML, the scripted expert
+and any recorded dataset keep their own value. kp lives in the solver's
+dyn_info, which ``scene.reset()`` does not touch, so one application after
+build survives every episode reset.
+
 Recording is intentionally not wired here: this version is for validating the
 interactive stack. The next step is a ``TeleopExpert`` behind
 ``EpisodeRunner.run_episode`` plus an ``episode_done`` key, which reuses the
@@ -66,6 +76,7 @@ existing HDF5 / event / burst recording unchanged.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import threading
 import time
@@ -266,6 +277,13 @@ class _CameraPreview:
     """
 
     def __init__(self, bundle, names: tuple[str, ...] = ("agentview", "eye_in_hand")):
+        # WSLg exposes both a Wayland socket and X11, but the Qt bundled inside
+        # the opencv-python wheel ships only the xcb platform plugin
+        # (cv2/qt/plugins/platforms/libqxcb.so). If Qt picks Wayland, window
+        # creation aborts with a platform-plugin error; pin xcb whenever an X
+        # display exists (the Genesis viewer itself needs X11 anyway).
+        if os.environ.get("DISPLAY") and not os.environ.get("QT_QPA_PLATFORM"):
+            os.environ["QT_QPA_PLATFORM"] = "xcb"
         import cv2
 
         self._cv2 = cv2
@@ -314,10 +332,14 @@ class _CameraPreview:
             if not self._shown:
                 cv2.namedWindow(self._title, cv2.WINDOW_AUTOSIZE)
                 self._shown = True
+                print(f"camera preview window opened ({grid.shape[1]}x{grid.shape[0]}, "
+                      f"OpenCV {cv2.__version__})")
             cv2.imshow(self._title, grid)
             cv2.waitKey(1)  # pump the HighGUI event loop on this (main) thread
-        except cv2.error as exc:  # e.g. the user closed the preview window
-            print(f"camera preview stopped ({exc})")
+        except Exception as exc:  # noqa: BLE001 - a broken preview must not kill teleop
+            print(f"camera preview stopped ({type(exc).__name__}: {exc})")
+            if any(word in str(exc).lower() for word in ("plugin", "display", "qt")):
+                print("  hint: WSLg GUI problem -- try running with QT_QPA_PLATFORM=xcb")
             self._closed = True
 
     def close(self) -> None:
@@ -427,6 +449,15 @@ def main() -> int:
         default=1.0,
         help="viewer realtime factor (1.0 = wall clock; lower is slower)",
     )
+    parser.add_argument(
+        "--grip-kp",
+        type=float,
+        default=0.0,
+        help="finger PD stiffness in N/m per finger for THIS run only (0 = keep "
+        "the YAML value, 100). The fingers are position-controlled, so the "
+        "squeeze force is kp x (closed target - finger position): 100 gives "
+        "~1.9-2.5 N per pad here, 400 gives ~8-10 N. Nothing is recorded.",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -470,6 +501,21 @@ def main() -> int:
     # left) and z (up) as the robot is mounted. Identity in this task, but read
     # from the config so the key mapping follows the robot if the base moves.
     base_rot = quat_to_matrix(np.asarray(cfg["robot"]["base_quat"], dtype=np.float64))
+
+    if args.grip_kp > 0.0:
+        # Teleop-only squeeze-force override, see the module docstring. The
+        # finger PD gains live in the solver's dyn_info (act_gain/act_bias);
+        # scene.reset() rewrites only the DOF state and ctrl mode, so applying
+        # it once after build survives every episode reset.
+        stiffness = float(args.grip_kp)
+        bundle.robot.set_dofs_kp(
+            np.full(len(bundle.finger_dofs), stiffness, dtype=np.float32),
+            bundle.finger_dofs,
+        )
+        print(
+            f"grip stiffness: {stiffness:g} N/m per finger "
+            f"(YAML {float(cfg['robot']['finger_kp'][0]):g}); teleop-only override"
+        )
 
     controller = DeltaPoseController(bundle)
     rng = np.random.default_rng(
