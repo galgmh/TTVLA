@@ -76,6 +76,7 @@ existing HDF5 / event / burst recording unchanged.
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import os
 import sys
 import threading
@@ -297,7 +298,12 @@ class _CameraPreview:
         if self._closed:
             return
         cv2 = self._cv2
+        first = not self._shown
+        if first:
+            print("camera preview: rendering the task cameras ...", flush=True)
         frames = self._bundle.render_cameras()
+        if first:
+            print(f"camera preview: frames rendered ({', '.join(sorted(frames))})", flush=True)
         tiles = []
         for name in self._names:
             frame = frames.get(name)
@@ -330,10 +336,11 @@ class _CameraPreview:
         grid = np.hstack(tiles)
         try:
             if not self._shown:
+                print("camera preview: opening the OpenCV window ...", flush=True)
                 cv2.namedWindow(self._title, cv2.WINDOW_AUTOSIZE)
                 self._shown = True
                 print(f"camera preview window opened ({grid.shape[1]}x{grid.shape[0]}, "
-                      f"OpenCV {cv2.__version__})")
+                      f"OpenCV {cv2.__version__})", flush=True)
             cv2.imshow(self._title, grid)
             cv2.waitKey(1)  # pump the HighGUI event loop on this (main) thread
         except Exception as exc:  # noqa: BLE001 - a broken preview must not kill teleop
@@ -568,6 +575,7 @@ def main() -> int:
         controller.reset()
         return True
 
+    print("resetting the episode ...", flush=True)
     if not reset_episode():
         print("viewer closed before the first step")
         return 0
@@ -577,7 +585,12 @@ def main() -> int:
     last_info = None
     issued = False
     if preview is not None:
+        # If this first camera render stalls (the offscreen request is handled
+        # on the viewer thread), dump every thread's Python stack after 15 s so
+        # the stall point is visible; cancelled once the first frame is up.
+        faulthandler.dump_traceback_later(15, repeat=True)
         preview.update()  # show the window (and its first frames) right away
+        faulthandler.cancel_dump_traceback_later()
     print(
         "teleop ready (arm base frame: x toward the table, y arm-left, z up)\n"
         "  Up/Down = +-x (toward/away from the table), "
