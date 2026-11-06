@@ -51,11 +51,15 @@ camera ``agentview`` and the wrist camera ``eye_in_hand`` -- at ``--preview-hz``
 ``eye_in_hand_rgb``, so the preview shows the recorder's view. It is a second
 window rather than an overlay because Genesis 1.4.1 has no in-viewer camera
 panel: its ImGui overlay requires ``imgui_bundle`` (not installed here) and
-does not display camera images anyway. Preview resolution defaults to
-256x256 because every preview frame is a full raster render (llvmpipe here);
-``--cam-res 0`` keeps the YAML resolution (512) and ``--cam-res 512`` is the
-dataset-exact view. ``--no-preview`` turns the window off, ``--no-cameras``
-skips building the cameras entirely.
+does not display camera images anyway. The window itself runs in a small child
+process: creating a Qt window in this process while the Genesis viewer thread
+renders deadlocks inside Qt's platform-plugin init on WSLg (observed as
+``cv2.namedWindow`` never returning), so frames are composited here and piped
+to a child that owns the window. Preview resolution defaults to 256x256 because
+every preview frame is a full raster render (llvmpipe here); ``--cam-res 0``
+keeps the YAML resolution (512) and ``--cam-res 512`` is the dataset-exact
+view. ``--no-preview`` turns the window off, ``--no-cameras`` skips building
+the cameras entirely.
 
 Grip strength: the fingers are position-controlled (YAML ``finger_kp`` = 100
 N/m), so the squeeze force at contact is ``kp * (closed target - finger
@@ -76,8 +80,9 @@ existing HDF5 / event / burst recording unchanged.
 from __future__ import annotations
 
 import argparse
-import faulthandler
 import os
+import struct
+import subprocess
 import sys
 import threading
 import time
@@ -263,47 +268,94 @@ def _action_from_keys(
 # ----------------------------------------------------------------- preview
 
 
+# The preview window lives in a CHILD process on purpose. Creating a Qt window
+# (cv2.namedWindow) in this process while the Genesis viewer thread renders
+# deadlocks inside Qt's platform-plugin init on WSLg -- observed as
+# namedWindow() never returning while the viewer thread stayed healthy. A child
+# process gets its own X connection and toolkit state, so the two GUIs cannot
+# block each other. Frames travel over stdin: ``<II`` height, width (uint32,
+# little-endian) followed by raw BGR bytes.
+_DISPLAY_CHILD = r"""
+import struct
+import sys
+
+import cv2
+import numpy as np
+
+title = sys.argv[1]
+while True:
+    head = sys.stdin.buffer.read(8)
+    if len(head) < 8:
+        break
+    height, width = struct.unpack("<II", head)
+    size = height * width * 3
+    data = sys.stdin.buffer.read(size)
+    if len(data) < size:
+        break
+    image = np.frombuffer(data, dtype=np.uint8).reshape(height, width, 3)
+    cv2.imshow(title, image)
+    cv2.waitKey(1)
+    try:
+        if cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) < 1:
+            break  # user closed the preview window
+    except cv2.error:
+        break
+cv2.destroyAllWindows()
+"""
+
+
 class _CameraPreview:
-    """Live agentview / eye_in_hand preview in one OpenCV window.
+    """Live agentview / eye_in_hand preview in a separate OpenCV process.
 
     Frames come from ``SceneBundle.render_cameras()`` -- the same path the
     dataset recorder uses -- so this shows the recorder's view, not a
-    viewer-side re-render. cv2 HighGUI must be pumped on the main thread
-    (``waitKey``), and the teleop loop is the main thread, so ``update()`` is
-    called from there; the Genesis viewer keeps running on its own thread.
+    viewer-side re-render. The grid is composited here (cv2 is used as a plain
+    image library; no GUI in this process) and piped to a child that owns the
+    window; see the comment above ``_DISPLAY_CHILD`` for why.
 
-    Clicking this window takes keyboard focus away from the Genesis window.
-    The key plugin clears held keys on FocusOut, so no key sticks; click the
-    Genesis window again to keep flying.
+    Clicking the preview window takes keyboard focus away from the Genesis
+    window. The key plugin clears held keys on FocusOut, so no key sticks;
+    click the Genesis window again to keep flying.
     """
 
     def __init__(self, bundle, names: tuple[str, ...] = ("agentview", "eye_in_hand")):
-        # WSLg exposes both a Wayland socket and X11, but the Qt bundled inside
-        # the opencv-python wheel ships only the xcb platform plugin
-        # (cv2/qt/plugins/platforms/libqxcb.so). If Qt picks Wayland, window
-        # creation aborts with a platform-plugin error; pin xcb whenever an X
-        # display exists (the Genesis viewer itself needs X11 anyway).
-        if os.environ.get("DISPLAY") and not os.environ.get("QT_QPA_PLATFORM"):
-            os.environ["QT_QPA_PLATFORM"] = "xcb"
         import cv2
 
         self._cv2 = cv2
         self._bundle = bundle
         self._names = names
         self._title = "teleop cameras: agentview | eye_in_hand"
-        self._shown = False
         self._closed = False
+        self._proc = None
+        self._announced = False
+        self._spawn_display()
+
+    def _spawn_display(self) -> None:
+        # WSLg exposes both a Wayland socket and X11, but the Qt bundled inside
+        # the opencv-python wheel ships only the xcb platform plugin
+        # (cv2/qt/plugins/platforms/libqxcb.so). If Qt picks Wayland, window
+        # creation aborts with a platform-plugin error; pin xcb whenever an X
+        # display exists (the Genesis viewer itself needs X11 anyway).
+        env = dict(os.environ)
+        if env.get("DISPLAY") and not env.get("QT_QPA_PLATFORM"):
+            env["QT_QPA_PLATFORM"] = "xcb"
+        try:
+            self._proc = subprocess.Popen(
+                [sys.executable, "-c", _DISPLAY_CHILD, self._title],
+                stdin=subprocess.PIPE,
+                env=env,
+            )
+        except OSError as exc:  # a broken preview must not kill teleop
+            print(f"camera preview disabled (cannot start the display process: {exc})")
+            self._closed = True
+            return
+        print("camera preview: window process started", flush=True)
 
     def update(self) -> None:
-        if self._closed:
+        if self._closed or self._proc is None:
             return
         cv2 = self._cv2
-        first = not self._shown
-        if first:
-            print("camera preview: rendering the task cameras ...", flush=True)
         frames = self._bundle.render_cameras()
-        if first:
-            print(f"camera preview: frames rendered ({', '.join(sorted(frames))})", flush=True)
         tiles = []
         for name in self._names:
             frame = frames.get(name)
@@ -333,31 +385,34 @@ class _CameraPreview:
                 else cv2.resize(tile, (tile.shape[1], height), interpolation=cv2.INTER_NEAREST)
                 for tile in tiles
             ]
-        grid = np.hstack(tiles)
+        grid = np.ascontiguousarray(np.hstack(tiles), dtype=np.uint8)
         try:
-            if not self._shown:
-                print("camera preview: opening the OpenCV window ...", flush=True)
-                cv2.namedWindow(self._title, cv2.WINDOW_AUTOSIZE)
-                self._shown = True
-                print(f"camera preview window opened ({grid.shape[1]}x{grid.shape[0]}, "
-                      f"OpenCV {cv2.__version__})", flush=True)
-            cv2.imshow(self._title, grid)
-            cv2.waitKey(1)  # pump the HighGUI event loop on this (main) thread
-        except Exception as exc:  # noqa: BLE001 - a broken preview must not kill teleop
-            print(f"camera preview stopped ({type(exc).__name__}: {exc})")
-            if any(word in str(exc).lower() for word in ("plugin", "display", "qt")):
-                print("  hint: WSLg GUI problem -- try running with QT_QPA_PLATFORM=xcb")
+            stdin = self._proc.stdin
+            stdin.write(struct.pack("<II", *grid.shape[:2]))
+            stdin.write(grid.tobytes())
+            stdin.flush()
+        except (BrokenPipeError, OSError) as exc:  # preview window closed / child gone
+            print(f"camera preview stopped ({exc})")
             self._closed = True
+            return
+        if not self._announced:
+            print(f"camera preview: {grid.shape[1]}x{grid.shape[0]} frames streaming", flush=True)
+            self._announced = True
 
     def close(self) -> None:
-        if self._shown and not self._closed:
-            try:
-                self._cv2.destroyWindow(self._title)
-                self._cv2.waitKey(1)
-            except Exception:  # noqa: BLE001 - closing a dead window is harmless
-                pass
-        self._shown = False
+        proc, self._proc = self._proc, None
         self._closed = True
+        if proc is None:
+            return
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()  # EOF -> the child closes the window and exits
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
 
 
 # -------------------------------------------------------------------- status
@@ -575,7 +630,6 @@ def main() -> int:
         controller.reset()
         return True
 
-    print("resetting the episode ...", flush=True)
     if not reset_episode():
         print("viewer closed before the first step")
         return 0
@@ -585,12 +639,7 @@ def main() -> int:
     last_info = None
     issued = False
     if preview is not None:
-        # If this first camera render stalls (the offscreen request is handled
-        # on the viewer thread), dump every thread's Python stack after 15 s so
-        # the stall point is visible; cancelled once the first frame is up.
-        faulthandler.dump_traceback_later(15, repeat=True)
-        preview.update()  # show the window (and its first frames) right away
-        faulthandler.cancel_dump_traceback_later()
+        preview.update()  # show the first frames right away
     print(
         "teleop ready (arm base frame: x toward the table, y arm-left, z up)\n"
         "  Up/Down = +-x (toward/away from the table), "
