@@ -216,6 +216,16 @@ def main() -> int:
         help="diagnostic: permute the home slots per episode (vision-only)",
     )
     ap.add_argument("--open-tol", type=float, default=float(PIPELINE.release_open_tol))
+    ap.add_argument(
+        "--binary-gripper",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="eval-only 2-class gripper: threshold a[6] to open/close before "
+        "the controller, so the finger target is only open_finger_pos or "
+        "closed_finger_pos and never an interpolated value; "
+        "--no-binary-gripper restores the continuous mapping. The dataset, "
+        "the state contract and the trained policy are unchanged",
+    )
     ap.add_argument("--policy-seed", type=int, default=0, help="RandomPolicy seed")
     ap.add_argument("--remote-host", default="127.0.0.1")
     ap.add_argument("--remote-port", type=int, default=8000)
@@ -342,14 +352,24 @@ def main() -> int:
                 if tip.size:
                     min_tip = min(min_tip, float(tip.min()))
 
-                action = _policy_action(
+                raw_action = _policy_action(
                     policy,
                     obs,
                     state_mode=args.state_mode,
                     instruction=instruction,
                     step=step,
                 )
-                controller.step(action)
+                action = raw_action
+                if args.binary_gripper:
+                    # 2-class gripper (eval only). a[6] > 0 is the close class,
+                    # <= 0 the open class; the controller's grip = 0.5*(a6+1)
+                    # is then exactly 1 or 0, so the finger setpoint is
+                    # closed_finger_pos or open_finger_pos, never the
+                    # interpolated midpoint. Dataset, state width and the
+                    # trained policy are untouched.
+                    action = np.array(raw_action, dtype=np.float64, copy=True)
+                    action[6] = 1.0 if raw_action[6] > 0.0 else -1.0
+                action_info = controller.step(action)
                 for _ in range(decimation):
                     bundle.step()
                 steps = step + 1
@@ -381,11 +401,46 @@ def main() -> int:
                                 "episode": k,
                                 "seed": seed,
                                 "step": step,
+                                "binary_gripper": bool(args.binary_gripper),
                                 "gripper": last_grip,
                                 "fingertip_c": [float(v) for v in tip],
                                 "ee_pos": [
                                     float(v)
                                     for v in np.asarray(obs["ee_pos"], dtype=np.float64).reshape(-1)[:3]
+                                ],
+                                # Diagnostics: the policy's raw command, the
+                                # finger setpoint the controller derived from it,
+                                # the IK residual, and the orientation/gripper
+                                # state the policy was reacting to. Without these
+                                # a "gripper did not close" video cannot be told
+                                # apart from a half-closed command, a blocked pad,
+                                # or an IK miss.
+                                "action": [
+                                    float(v)
+                                    for v in np.asarray(raw_action, dtype=np.float64).reshape(-1)[:7]
+                                ],
+                                # The value the controller actually consumed.
+                                # With --binary-gripper (default) only [6]
+                                # differs from "action": it is exactly ±1.
+                                "action_effective": [
+                                    float(v)
+                                    for v in np.asarray(action, dtype=np.float64).reshape(-1)[:7]
+                                ],
+                                "finger_target_m": float(action_info.finger_target_m),
+                                "ik_pos_err_m": float(action_info.ik_pos_err_m),
+                                "ik_rot_err_rad": float(action_info.ik_rot_err_rad),
+                                "clipped": bool(action_info.clipped),
+                                "cmd_pos": [
+                                    float(v)
+                                    for v in np.asarray(controller.target_pos, dtype=np.float64).reshape(-1)[:3]
+                                ],
+                                "ee_ori": [
+                                    float(v)
+                                    for v in np.asarray(obs["ee_ori"], dtype=np.float64).reshape(-1)[:3]
+                                ],
+                                "finger_q": [
+                                    float(v)
+                                    for v in np.asarray(obs["joint_states"], dtype=np.float64).reshape(-1)[7:9]
                                 ],
                                 "target_in_tray": bool(ok_target),
                                 "any_in_tray": bool(ok_any),

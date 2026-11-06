@@ -299,6 +299,13 @@ python experiment/eval_closed_loop.py --policy remote --episodes 20 --remote-hos
 默认：长动作块会锁死接触后的反应。只做纯视觉 baseline 时可以放宽，
 例如 `--remote-requery 8`，但为了各档可比，建议统一用 1。
 
+**夹爪 2 分类（eval 端）**：默认把策略的连续 `a[6]` 在送进控制器前阈值成
+开/合两档（`a[6] > 0` 合，否则开）；控制器因此只产生
+`open_finger_pos` / `closed_finger_pos` 两个指目标，不会出现中间值。
+数据集、16 维 `state`（仍含连续 `finger_q`）和已训练的策略都不变；
+`--no-binary-gripper` 恢复连续映射做对照。trace 的 `action` 仍是策略原始输出，
+`action_effective` 是实际送进控制器的值。
+
 ### 5.2 输出与指标
 
 每次运行写一个目录（默认 `experiment/runs/<policy>_<state>_<时间戳>/`）：
