@@ -15,7 +15,9 @@ Keys:
     Left/Right     TCP -x / +x (screen left/right)
     Up/Down        TCP +y / -y (screen away/toward the camera)
     PageUp/Down    TCP +z / -z
-    J / K          yaw - / + (world z)
+    J / K          rotate about world z (yaw) - / +
+    Y / U          rotate about world x (tilt toward / away from the camera)
+    N / M          rotate about world y (tilt right / left on screen)
     Shift (hold)   slow mode (0.25x)
     Space          toggle gripper open/closed
     Backspace      reset episode (re-sample object poses and temperatures)
@@ -63,6 +65,10 @@ def _key_codes() -> dict[str, int]:
         "PAGEDOWN",
         "J",
         "K",
+        "Y",
+        "U",
+        "N",
+        "M",
         "LSHIFT",
         "RSHIFT",
         "SPACE",
@@ -169,9 +175,9 @@ def _action_from_keys(codes: dict[str, int], pressed: set[int], closed: bool) ->
             (held("RIGHT") - held("LEFT")) * trans,
             (held("UP") - held("DOWN")) * trans,
             (held("PAGEUP") - held("PAGEDOWN")) * trans,
-            0.0,
-            0.0,
-            (held("K") - held("J")) * rot,
+            (held("U") - held("Y")) * rot,  # world x
+            (held("M") - held("N")) * rot,  # world y
+            (held("K") - held("J")) * rot,  # world z
             1.0 if closed else -1.0,
         ],
         dtype=np.float64,
@@ -183,8 +189,12 @@ def _action_from_keys(codes: dict[str, int], pressed: set[int], closed: bool) ->
 
 def _print_status(bundle, controller, step: int, cfg: dict, read_temperature) -> None:
     from sim.expert.actions import tcp_pose
+    from sim.rotations import quat_to_matrix
 
-    pos, _ = tcp_pose(bundle)
+    pos, quat = tcp_pose(bundle)
+    # Hand z axis (flange -> grip center): where the fingers point, so a tilt is
+    # visible on the HUD even when the viewer is orbited.
+    axis = quat_to_matrix(quat)[:, 2]
     temps = read_temperature(bundle.temperatures)
     tips = []
     for handle in bundle.temperatures:
@@ -196,6 +206,7 @@ def _print_status(bundle, controller, step: int, cfg: dict, read_temperature) ->
     print(
         f"\r[{step / hz:6.1f}s] "
         f"tcp=({pos[0]:+.3f},{pos[1]:+.3f},{pos[2]:+.3f}) "
+        f"dir=({axis[0]:+.2f},{axis[1]:+.2f},{axis[2]:+.2f}) "
         f"grip={controller.finger_target:.3f} tip={tip_text} C",
         end="",
         flush=True,
@@ -307,9 +318,9 @@ def main() -> int:
     grip_closed = False
     print(
         "teleop ready: click the window once for keyboard focus, then\n"
-        "  arrows move in x/y, PageUp/PageDown in z, J/K yaw, "
-        "hold Shift for 0.25x speed\n"
-        "  Space toggles the gripper, Backspace re-samples the episode, Q quits"
+        "  arrows move in x/y, PageUp/PageDown in z; "
+        "Y/U tilt about x, N/M about y, J/K yaw\n"
+        "  hold Shift for 0.25x speed | Space grip, Backspace reset, Q quit"
     )
     try:
         while True:
@@ -322,11 +333,21 @@ def main() -> int:
                 grip_closed = False
                 print("\n[reset]")
                 continue
+            grip_before = grip_closed
             if plugin.take_grip_toggle():
                 grip_closed = not grip_closed
 
             action = _action_from_keys(codes, plugin.snapshot(), grip_closed)
-            controller.step(action)
+            # DeltaPoseController re-anchors every command on the *measured* TCP
+            # (its anti-windup design, see sim/expert/actions.py). With a zero
+            # action that setpoint is exactly the pose gravity has already sagged
+            # the arm into, so the PD deflection would be re-anchored away and
+            # accumulate: an idle arm slowly droops. While no motion key is held
+            # (and the gripper did not just toggle) leave the last commanded joint
+            # targets in place — the PD then holds them with only the static
+            # deflection. Re-anchoring resumes on the next commanded motion.
+            if np.any(action[:6] != 0.0) or grip_closed != grip_before:
+                controller.step(action)
             if not step_sim(decimation):
                 break
             step += 1
