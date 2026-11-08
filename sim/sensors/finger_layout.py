@@ -1,37 +1,29 @@
-"""Procedurally derive tactile probe layouts on a parallel gripper's fingers.
+"""在平行夹爪指尖上程序化推导触觉探针布局。
 
-The Panda URDF ships the finger geometry as collision **meshes** (the wrist
-links use boxes). Rather than hard-coding pad offsets, we parse the URDF at
-runtime and synthesize a probe grid on the face that looks at the other finger
-(the grasping surface). Probe frames are expressed in the finger link frame,
-which is what Genesis' probe-based tactile sensors expect.
+Panda 的 URDF 把指尖几何写成碰撞**网格**（腕部 link 是 box）。与其把垫面
+偏移写死，不如运行时解析 URDF，在"朝向另一根手指"的那个面上合成探针网格。
+探针坐标表达在手指 link 坐标系里——这正是 Genesis 基于探针的触觉传感器
+所期望的。
 
-A whole-finger AABB is the wrong pad model: the Panda finger mesh has a raised
-flat pad only near the tip (z ~ 0.036..0.054 in the link frame) while the base
-and waist are recessed by 2.5..15 mm. Probe rows placed on the AABB face would
-float in front of the real surface and close the gripper early with inflated
-depth readings. So for mesh collisions we take the mesh **vertices**, select
-the pad slab (points within ``pad_tol_m`` of the innermost surface,
-``d = v @ inner``), and snap each probe to the local surface height of its own
-tangential neighborhood. ``pad_tol_m`` must stay below the recess depth or the
-slab merges with the rest of the finger: on the Panda the extracted pad face
-is identical for any slab of 0.5..2 mm (28 vertices, 17.4 x 17.5 mm), so the
-default 1.5 mm sits in the middle of the stable window.
+整指 AABB 是错误的垫面模型：Panda 指尖网格只在靠近指尖处（link 坐标
+z ≈ 0.036..0.054）有一块凸起的平面垫，根部与腰部凹进去 2.5..15 mm。放在
+AABB 面上的探针会悬在真实表面之前，夹爪提前闭合且深度读数虚高。因此对
+网格碰撞我们取网格**顶点**，选出垫面那一层（到最内侧表面的距离在
+``pad_tol_m`` 以内的点，``d = v @ inner``），再把每个探针吸附到它自己的
+切向邻域内的局部表面高度。``pad_tol_m`` 必须小于凹陷深度，否则这一层会
+和手指其他部分连成一片：在 Panda 上 0.5..2 mm 的任何厚度都得到同一张垫面
+（28 个顶点，17.4 x 17.5 mm），默认 1.5 mm 落在稳定窗口中间。
 
-The closure axis comes from the two collision-shape centers in the shared
-parent (hand) frame — NOT from the joint origins, which coincide on mimic
-grippers like the Panda's (both finger joints share ``xyz="0 0 0.0584"``), and
-NOT from the pad-face centers, whose 0.2 mm separation on a closed gripper is
-noise. When no collision geometry is available we fall back to the
-joint-origin difference.
+闭合轴取自共享父坐标系（手）里两个碰撞形状中心之差——不能用关节原点
+（Panda 这类 mimic 夹爪的两指关节原点重合，都是 ``xyz="0 0 0.0584"``），
+也不能用垫面中心（夹爪闭合时两者只差 0.2 mm，是噪声）。没有碰撞几何时
+回落到关节原点。
 
-Pure XML + numpy: this module imports without Genesis so layouts can be
-inspected and unit-tested independently.
+纯 XML + numpy：本模块不导入 Genesis，布局可以独立检查和单元测试。
 """
 
 from __future__ import annotations
 
-import json
 import math
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -39,32 +31,25 @@ from pathlib import Path
 
 import numpy as np
 
-_AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
-
 
 @dataclass
 class FingerLayout:
-    """Probe grid for one finger link, in the link's local frame."""
+    """单个指尖 link 的探针网格（link 局部坐标系）。"""
 
     link_name: str
     probe_local_pos: np.ndarray  # (P, 3) float32
-    probe_local_normal: np.ndarray  # (P, 3) float32, unit vectors
-    pad_box_origin: np.ndarray  # (3,) pad-face center (link frame)
-    pad_box_size: np.ndarray  # (3,) pad-face extents; 0 along the inner axis
-    inner_dir: np.ndarray  # (3,) unit vector pointing toward the other finger
-
-    @property
-    def num_probes(self) -> int:
-        return int(self.probe_local_pos.shape[0])
+    probe_local_normal: np.ndarray  # (P, 3) float32，单位向量
+    pad_box_origin: np.ndarray  # (3,) 垫面中心（link 系）
+    pad_box_size: np.ndarray  # (3,) 垫面范围；沿内侧轴为 0
+    inner_dir: np.ndarray  # (3,) 指向另一根手指的单位向量
 
     @property
     def pad_face_area_m2(self) -> float:
-        """Area of the pad face (m^2): the product of the non-zero extents.
+        """垫面面积（m²）：非零两个方向尺度的乘积。
 
-        ``pad_box_size`` is zero along the inner (contact-normal) axis, so this
-        is the grasping face's own area — 305.949 mm^2 on the Panda. Used as the
-        single contact area the pad-face policy splits over a finger's contact
-        points (docs §9-R37).
+        ``pad_box_size`` 沿内侧（接触法向）轴为 0，所以这就是抓取面自身的
+        面积——Panda 上 305.949 mm²。pad_face 面积策略把它当作手指所有
+        接触点分摊的那一块接触面积。
         """
         size = np.abs(np.asarray(self.pad_box_size, dtype=np.float64))
         return float(np.prod(size[size > 0.0]))
@@ -77,7 +62,7 @@ def _parse_vec(text: str | None, default: tuple[float, ...]) -> np.ndarray:
 
 
 def rpy_to_matrix(rpy: np.ndarray) -> np.ndarray:
-    """URDF fixed-axis convention: R = Rz(yaw) @ Ry(pitch) @ Rx(roll)."""
+    """URDF 固定轴约定：R = Rz(yaw) @ Ry(pitch) @ Rx(roll)。"""
     r, p, y = (float(v) for v in rpy)
     cr, sr = math.cos(r), math.sin(r)
     cp, sp = math.cos(p), math.sin(p)
@@ -96,13 +81,12 @@ class _Box:
 
 
 def parse_link_boxes(urdf_path: str | Path, links: set[str] | None = None) -> dict[str, list[_Box]]:
-    """Map link name -> list of collision shapes (origin/size/rpy in link frame).
+    """link 名 -> 碰撞形状列表（link 系下的 origin/size/rpy）。
 
-    ``<box>`` collisions are read directly; ``<mesh>`` collisions (.obj) are
-    reduced to their axis-aligned bounding box in the link frame (collision
-    origin applied). ``derive_finger_layout`` prefers the raw vertices from
-    ``parse_link_meshes`` — this AABB view is the coarse fallback.
-    ``links`` optionally restricts parsing (large URDFs).
+    ``<box>`` 碰撞直接读取；``<mesh>`` 碰撞（.obj）退化为 link 系下的轴对齐
+    包围盒（已施加碰撞 origin）。``derive_finger_layout`` 优先用
+    ``parse_link_meshes`` 的原始顶点，这个 AABB 视图只是粗兜底。``links``
+    可限制解析范围（大 URDF）。
     """
     root = ET.parse(urdf_path).getroot()
     out: dict[str, list[_Box]] = {}
@@ -132,7 +116,7 @@ def parse_link_boxes(urdf_path: str | Path, links: set[str] | None = None) -> di
 
 
 def _resolve_mesh_path(urdf_path: str | Path, filename: str) -> Path | None:
-    """Resolve a URDF mesh reference (``package://`` or relative) to a file."""
+    """把 URDF 的网格引用（``package://`` 或相对路径）解析成文件。"""
     if not filename:
         return None
     if filename.startswith("package://"):
@@ -149,19 +133,19 @@ def _resolve_mesh_path(urdf_path: str | Path, filename: str) -> Path | None:
 
 
 def _obj_vertices(path: Path, scale: np.ndarray) -> np.ndarray:
-    """(N, 3) vertices of a Wavefront .obj (``v`` lines only; pure numpy)."""
+    """Wavefront .obj 的 (N,3) 顶点（只读 ``v`` 行；纯 numpy）。"""
     rows = []
     for line in path.read_text(errors="ignore").splitlines():
         parts = line.split()
         if parts and parts[0] == "v" and len(parts) >= 4:
             rows.append([float(x) for x in parts[1:4]])
     if not rows:
-        raise ValueError(f"No vertices found in mesh {path}")
+        raise ValueError(f"网格 {path} 没有顶点")
     return np.asarray(rows, dtype=np.float64) * scale
 
 
 def _mesh_vertices(urdf_path: str | Path, mesh_el, xyz: np.ndarray, rpy: np.ndarray) -> np.ndarray | None:
-    """Mesh collision vertices in the link frame (collision origin applied), or None."""
+    """link 系下的碰撞网格顶点（已施加碰撞 origin）；不可用返回 None。"""
     path = _resolve_mesh_path(urdf_path, mesh_el.get("filename") or "")
     if path is None or path.suffix.lower() != ".obj":
         return None
@@ -170,10 +154,10 @@ def _mesh_vertices(urdf_path: str | Path, mesh_el, xyz: np.ndarray, rpy: np.ndar
 
 
 def parse_link_meshes(urdf_path: str | Path, links: set[str] | None = None) -> dict[str, np.ndarray]:
-    """Map link name -> concatenated collision-mesh vertices (.obj, link frame).
+    """link 名 -> 拼接后的碰撞网格顶点（.obj，link 系）。
 
-    These are the raw points the pad-slab extraction needs; ``parse_link_boxes``
-    keeps the coarser AABB view for callers that only need an extent.
+    这些是垫面分层所需的原始点；``parse_link_boxes`` 保留较粗的 AABB 视图，
+    给只需要尺度的调用者。
     """
     root = ET.parse(urdf_path).getroot()
     out: dict[str, np.ndarray] = {}
@@ -206,7 +190,7 @@ class _Joint:
 
 
 def parse_child_joints(urdf_path: str | Path) -> dict[str, _Joint]:
-    """Map child link name -> its parent joint (origin pose in the parent frame)."""
+    """子 link 名 -> 它的父关节（origin 在父坐标系里）。"""
     root = ET.parse(urdf_path).getroot()
     out: dict[str, _Joint] = {}
     for joint in root.findall("joint"):
@@ -225,7 +209,7 @@ def parse_child_joints(urdf_path: str | Path) -> dict[str, _Joint]:
 
 
 def _union_box(boxes: list[_Box]) -> tuple[np.ndarray, np.ndarray]:
-    """Axis-aligned union (link frame) of possibly rotated boxes."""
+    """若干可能旋转过的 box 在 link 系下的轴对齐并集。"""
     lo = np.full(3, np.inf)
     hi = np.full(3, -np.inf)
     for box in boxes:
@@ -241,9 +225,10 @@ def _union_box(boxes: list[_Box]) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _snap_to_axis(vec: np.ndarray, *, tol: float = 0.9) -> np.ndarray:
+    """把近似轴向的向量吸附到坐标轴。"""
     axis = int(np.argmax(np.abs(vec)))
     if abs(vec[axis]) < tol:
-        raise ValueError(f"Inner direction {vec} is not axis-aligned; pass inner_dir_override in link frame.")
+        raise ValueError(f"内侧方向 {vec} 不是轴向的；请在 link 系里传 inner_dir_override")
     out = np.zeros(3)
     out[axis] = math.copysign(1.0, vec[axis])
     return out
@@ -251,12 +236,11 @@ def _snap_to_axis(vec: np.ndarray, *, tol: float = 0.9) -> np.ndarray:
 
 @dataclass
 class _PadFace:
-    """Grasping face of one finger in its link frame.
+    """一根手指的抓取面（link 系）。
 
-    ``center``/``size`` describe the pad plane (``size`` is 0 along the inner
-    axis); ``slab`` holds the pad's own mesh vertices (the per-probe surface
-    lookup searches only these, so a probe can never snap onto the recessed
-    finger body); it is None for box collisions, whose face is flat.
+    ``center`` / ``size`` 描述垫面平面（``size`` 沿内侧轴为 0）；``slab``
+    保存垫面自己的网格顶点（逐探针的表面查找只在这些点里搜，因此探针不会
+    吸附到凹陷的手指主体上）；box 碰撞时为 None，面是平的。
     """
 
     center: np.ndarray
@@ -269,32 +253,32 @@ class _PadFace:
 def _closure_direction(
     center_a: np.ndarray, center_b: np.ndarray, joint_a: _Joint, joint_b: _Joint
 ) -> tuple[np.ndarray | None, str]:
-    """Unit vector a -> b in the parent frame, plus where it came from.
+    """父坐标系下 a -> b 的单位向量，以及它的来源。
 
-    ``center_*`` must be collision-shape centers (well separated), never pad
-    face centers (near-coplanar once the gripper is closed).
+    ``center_*`` 必须是碰撞形状中心（相距足够远），绝不能用垫面中心（夹爪
+    闭合时几乎共面）。
     """
     d = np.asarray(center_b, dtype=np.float64) - np.asarray(center_a, dtype=np.float64)
     if np.linalg.norm(d) > 1e-6:
-        return d / np.linalg.norm(d), "collision centers"
+        return d / np.linalg.norm(d), "碰撞中心"
     d = np.asarray(joint_b.xyz, dtype=np.float64) - np.asarray(joint_a.xyz, dtype=np.float64)
     if np.linalg.norm(d) > 1e-6:
-        return d / np.linalg.norm(d), "joint origins (fallback)"
-    return None, "none"
+        return d / np.linalg.norm(d), "关节原点（兜底）"
+    return None, "无"
 
 
 def _pad_face(geo: tuple, inner: np.ndarray, pad_tol_m: float) -> _PadFace:
-    """Pad plane of one finger along ``inner`` (link frame).
+    """沿 ``inner`` 方向的垫面平面（link 系）。
 
-    ``geo`` is ``("box", origin, size)`` or ``("mesh", verts)``. For meshes the
-    pad slab is the set of vertices within ``pad_tol_m`` of the innermost
-    surface; its tangential extent is the pad, not the whole finger.
+    ``geo`` 是 ``("box", origin, size)`` 或 ``("mesh", verts)``。网格碰撞下
+    垫面层 = 到最内侧表面距离在 ``pad_tol_m`` 以内的顶点；它的切向范围就是
+    垫子，而不是整根手指。
     """
     axis = int(np.argmax(np.abs(inner)))
     if abs(inner[axis]) < 0.99:
         raise ValueError(
-            f"Pad face math needs an axis-aligned inner direction in the link frame; got {inner}. "
-            "Snap it to an axis or fix inner_dir_override."
+            f"垫面计算要求内侧方向在 link 系里是轴向的；得到 {inner}。"
+            "请吸附到坐标轴或修正 inner_dir_override。"
         )
     tangents = [a for a in range(3) if a != axis]
     if geo[0] == "box":
@@ -311,7 +295,7 @@ def _pad_face(geo: tuple, inner: np.ndarray, pad_tol_m: float) -> _PadFace:
     slab = verts[d >= d_max - pad_tol_m]
     lo = slab[:, tangents].min(axis=0)
     hi = slab[:, tangents].max(axis=0)
-    center = np.zeros(3)  # bbox center: vertex density must not bias the grid
+    center = np.zeros(3)  # 用包围盒中心，避免顶点密度把网格拉偏
     center[tangents] = 0.5 * (lo + hi)
     center[axis] = d_max * inner[axis]
     size = np.zeros(3)
@@ -320,12 +304,11 @@ def _pad_face(geo: tuple, inner: np.ndarray, pad_tol_m: float) -> _PadFace:
 
 
 def _local_surface_d(face: _PadFace, inner: np.ndarray, uv: np.ndarray) -> np.ndarray:
-    """Surface height (``v @ inner``) under each probe's tangential position.
+    """每个探针切向位置下方的表面高度（``v @ inner``）。
 
-    Uses the nearest pad-slab vertex in the tangent plane; a flat pad (the
-    Panda's) gives ``d_max`` everywhere, a curved one follows the surface.
-    Slab membership bounds the result to ``[d_max - pad_tol_m, d_max]``, so a
-    probe can never be placed behind the pad plane. Box faces are flat.
+    用切平面上最近的垫面顶点；平垫（Panda 就是）处处等于 ``d_max``，曲面
+    则跟随表面。层的归属把结果限制在 ``[d_max - pad_tol_m, d_max]``，探针
+    永远不会被放到垫面之后。box 面是平的。
     """
     if face.slab is None:
         return np.full(uv.shape[0], face.d_max)
@@ -350,26 +333,21 @@ def derive_finger_layout(
     inner_dir_override: dict[str, tuple[float, float, float]] | None = None,
     info: dict | None = None,
 ) -> list[FingerLayout]:
-    """Build a probe grid on the inward face of each finger's pad.
+    """在每根手指垫面的内侧面上生成探针网格。
 
-    Parameters
-    ----------
-    finger_link_names : (left_link, right_link)
-        Links that face each other. The closure axis is derived from the two
-        collision-shape centers in the shared parent (hand) frame; if no
-        collision geometry is available it falls back to the finger joint
-        origins.
-    probe_grid : (n_along_length, n_along_width)
-        Probe counts on the pad face; length = longer tangent extent.
-    probe_offset_m : probes float this far off the surface (contact onset
-        happens slightly before mesh penetration).
-    margin_frac : fraction of each pad extent left free at the borders.
-    pad_tol_m : pad-slab thickness for mesh collisions (module docstring).
-    box_override / inner_dir_override : optional per-link calibration escape
-        hatches if the URDF geometry is unusable (set at Gate 1 if needed).
-    info : optional dict filled with ``closure_source``, the hand-frame
-        collision and pad-face centers, the pad axes and the pad-slab thickness
-        (diagnostics for Gate 1).
+    参数
+    ----
+    finger_link_names : (左指 link, 右指 link)
+        彼此相对的两个 link。闭合轴由共享父节点（手）坐标系里两个碰撞形状
+        中心之差得到；没有碰撞几何时回落到指关节原点。
+    probe_grid : (沿长度, 沿宽度)
+        垫面上的探针数；长度 = 较长的切向尺度。
+    probe_offset_m : 探针悬浮在表面之外这么远（接触略早于网格穿透发生）。
+    margin_frac : 每个垫面边沿留空的占比。
+    pad_tol_m : 网格碰撞的垫面层厚度（见模块 docstring）。
+    box_override / inner_dir_override : URDF 几何不可用时的逐 link 校准逃生口。
+    info : 可选字典，填入 ``closure_source``、手坐标系下的碰撞中心与垫面
+        中心、垫面轴、垫面层厚度（用于自检）。
     """
     names = tuple(finger_link_names)
     meshes_by_link = parse_link_meshes(urdf_path, links=set(names))
@@ -379,7 +357,7 @@ def derive_finger_layout(
     ja, jb = (joints.get(name) for name in names)
     if ja is None or jb is None:
         missing = [n for n, j in zip(names, (ja, jb)) if j is None]
-        raise ValueError(f"Finger links not found as URDF joint children: {missing}")
+        raise ValueError(f"手指 link 不是 URDF 的关节子节点：{missing}")
 
     geo: dict[str, tuple] = {}
     for name in names:
@@ -392,26 +370,22 @@ def derive_finger_layout(
             origin, size = _union_box(boxes_by_link[name])
             geo[name] = ("box", origin, size)
         else:
-            raise ValueError(
-                f"No usable collision geometry for {name!r} (box or .obj mesh); pass box_override."
-            )
+            raise ValueError(f"{name!r} 没有可用的碰撞几何（box 或 .obj 网格）；请传 box_override")
 
     def _link_inner(name: str, joint: _Joint, inner_hand: np.ndarray) -> np.ndarray:
         if inner_dir_override and name in inner_dir_override:
             v = np.asarray(inner_dir_override[name], dtype=np.float64)
             return v / np.linalg.norm(v)
-        rot = rpy_to_matrix(joint.rpy)  # link frame -> parent frame
+        rot = rpy_to_matrix(joint.rpy)  # link 系 -> 父系
         return _snap_to_axis(rot.T @ inner_hand)
 
     def _hand_center(name: str, joint: _Joint, faces_: dict[str, _PadFace]) -> np.ndarray:
         return joint.xyz + rpy_to_matrix(joint.rpy) @ faces_[name].center
 
-    # Closure axis from the two collision-shape centers in the parent (hand)
-    # frame. Pad *face* centers must NOT be used here: on a closed gripper the
-    # pads are nearly coplanar (Panda: y = -0.0001 vs +0.0001), so their
-    # difference is 0.2 mm of noise whose sign points at whichever pad plane
-    # happens to sit higher — i.e. away from the other finger. The collision
-    # centers are 26 mm apart on the Panda and always well-posed.
+    # 闭合轴取自父（手）坐标系下两个碰撞形状中心之差。这里绝不能用垫面
+    # *中心*：夹爪闭合时两个垫面几乎共面（Panda：y = -0.0001 vs +0.0001），
+    # 它们之差只有 0.2 mm 的噪声，符号取决于哪个垫面刚好更高——也就是可能
+    # 指向远离另一根手指的方向。碰撞中心在 Panda 上相距 26 mm，永远良态。
     centers_hand = {}
     for name, joint in zip(names, (ja, jb)):
         kind, *rest = geo[name]
@@ -419,10 +393,7 @@ def derive_finger_layout(
         centers_hand[name] = joint.xyz + rpy_to_matrix(joint.rpy) @ c
     axis_ab, closure_source = _closure_direction(centers_hand[names[0]], centers_hand[names[1]], ja, jb)
     if axis_ab is None:
-        raise ValueError(
-            "Cannot derive the closure axis: collision centers and finger joint origins coincide. "
-            "Pass box_override/inner_dir_override."
-        )
+        raise ValueError("无法推导闭合轴：碰撞中心与指关节原点都重合。请传 box_override/inner_dir_override。")
     inner_hand = {names[0]: axis_ab, names[1]: -axis_ab}
     inner_link = {n: _link_inner(n, j, inner_hand[n]) for n, j in zip(names, (ja, jb))}
     faces = {n: _pad_face(geo[n], inner_link[n], pad_tol_m) for n in names}
@@ -442,7 +413,7 @@ def derive_finger_layout(
         face = faces[name]
 
         tangents = [a for a in range(3) if a != face.axis]
-        # length = longer tangent extent.
+        # 长度轴 = 较长的切向尺度。
         tangents.sort(key=lambda a: face.size[a], reverse=True)
         extents = [face.size[a] for a in tangents]
         counts = [probe_grid[0], probe_grid[1]]
@@ -455,10 +426,10 @@ def derive_finger_layout(
                 coord_lists.append(np.zeros(1))
             else:
                 coord_lists.append(np.linspace(-usable / 2.0, usable / 2.0, n))
-        # grid order: first tangent (length) outer loop, second (width) inner.
+        # 网格顺序：第一个切向（长度）为外层循环，第二个（宽度）为内层。
         c_len, c_wid = np.meshgrid(coord_lists[0], coord_lists[1], indexing="ij")
         offsets = np.stack([c_len.ravel(), c_wid.ravel()], axis=1)  # (P, 2)
-        uv = offsets + face.center[tangents]  # absolute tangent coords on the pad
+        uv = offsets + face.center[tangents]  # 垫面上的绝对切向坐标
 
         d_surface = _local_surface_d(face, inner, uv)
         pos = np.tile(face.center, (offsets.shape[0], 1))
@@ -479,81 +450,11 @@ def derive_finger_layout(
     return layouts
 
 
-def _pack_layouts(layouts: list[FingerLayout]) -> tuple[dict, dict]:
-    """One grid's layouts -> (datasets, attrs) for a `layouts/` group."""
-    pos = np.concatenate([lay.probe_local_pos for lay in layouts], axis=0)
-    normal = np.concatenate([lay.probe_local_normal for lay in layouts], axis=0)
-    link_index = np.concatenate(
-        [np.full(lay.num_probes, i, dtype=np.int32) for i, lay in enumerate(layouts)], axis=0
-    )
-    datasets = {
-        "probe_local_pos": pos,
-        "probe_local_normal": normal,
-        "probe_link_index": link_index,
-        "link_names": np.asarray([lay.link_name for lay in layouts]),
-    }
-    return datasets, {"n_probes_total": int(pos.shape[0]), "n_links": len(layouts)}
-
-
-def grid_tag(grid: tuple[int, int]) -> str:
-    """Group name for one probe grid, e.g. (16, 16) -> 'g16x16'."""
-    return f"g{int(grid[0])}x{int(grid[1])}"
-
-
-def layouts_to_hdf5(layouts: list[FingerLayout], *, attrs: dict | None = None) -> dict:
-    """Pack a single grid's layouts (datasets at the root of `layouts/`)."""
-    datasets, auto = _pack_layouts(layouts)
-    return {"attrs": {**auto, **(attrs or {})}, **datasets}
-
-
-def layouts_to_hdf5_multi(
-    groups: dict[tuple[int, int], list[FingerLayout]],
-    *,
-    default_grid: tuple[int, int],
-    modality_grids: dict[str, tuple[int, int]],
-    attrs: dict | None = None,
-) -> dict:
-    """Pack per-grid layouts, keeping the default grid at the root as an alias.
-
-    Layout (docs §5.2)::
-
-        layouts/                      attrs: n_probes_total, n_links, probe_grid,
-        layouts/probe_local_pos ...          modality_grids, world_frame, ...
-        layouts/grids/<tag>/          attrs: probe_grid, modalities
-        layouts/grids/<tag>/probe_local_pos ...
-
-    The root datasets stay *the default modality's grid* so a reader that knows
-    nothing about `modality_grids` still sees exactly the rows it always did;
-    the authority on any channel's shape is `modality_grids`.
-    """
-    datasets, auto = _pack_layouts(groups[default_grid])
-    mapping = {m: grid_tag(g) for m, g in modality_grids.items()}
-    return {
-        "attrs": {
-            **auto,
-            "probe_grid": np.asarray(default_grid, dtype=np.int32),
-            "modality_grids": json.dumps(mapping),
-            **(attrs or {}),
-        },
-        **datasets,
-        "grids": {
-            grid_tag(g): {
-                "attrs": {
-                    "probe_grid": np.asarray(g, dtype=np.int32),
-                    "modalities": np.asarray(sorted(m for m, gm in modality_grids.items() if gm == g)),
-                },
-                **_pack_layouts(lays)[0],
-            }
-            for g, lays in groups.items()
-        },
-    }
-
-
-def summarize(layouts: list[FingerLayout]) -> str:
-    lines = []
-    for lay in layouts:
-        lines.append(
-            f"{lay.link_name}: {lay.num_probes} probes | pad face {np.round(lay.pad_box_origin, 4).tolist()} "
-            f"| extents {np.round(lay.pad_box_size, 4).tolist()} | inner dir {lay.inner_dir.tolist()}"
-        )
-    return "\n".join(lines)
+__all__ = [
+    "FingerLayout",
+    "derive_finger_layout",
+    "parse_child_joints",
+    "parse_link_boxes",
+    "parse_link_meshes",
+    "rpy_to_matrix",
+]

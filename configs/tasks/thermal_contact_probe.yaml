@@ -1,0 +1,135 @@
+# ThermalContact-v1 的仿真任务：单区域受控触碰。
+#
+# 机器人从上方接近预抓取位，再沿 tool_dir 下降到接触点，用指位反馈把法向力
+# 稳定到目标值，保持一段时间后张开、退回。控制器不判断温度——温度只被记录。
+task_id: thermal_contact_probe
+seed: 0
+object: configs/objects/cup_4link.yaml
+sensor: configs/sensors/fingertip.yaml
+
+robot:
+  urdf: assets/robot/panda_bullet/panda.urdf
+  merge_fixed_links: false
+  hand_link_name: panda_hand
+  finger_link_names: [panda_leftfinger, panda_rightfinger]
+  arm_joint_names: [panda_joint1, panda_joint2, panda_joint3, panda_joint4,
+                    panda_joint5, panda_joint6, panda_joint7]
+  finger_joint_names: [panda_finger_joint1, panda_finger_joint2]
+  tcp_offset: [0.0, 0.0, 0.105]
+  open_finger_pos: 0.04
+  closed_finger_pos: 0.0
+  base_pos: [0.0, 0.0, 0.0]
+  base_quat: [1.0, 0.0, 0.0, 0.0]
+  # 标准 ready pose 抬高 11.5 cm：TCP 的 x/y 和朝向不变，但肘部保留约
+  # 1.17 rad 行程，侧面水平姿态与手柄的直线接近都可达。
+  init_qpos: [0.0, -0.666, 0.0, -1.974, 0.0, 1.308, 0.785, 0.04, 0.04]
+  arm_kp: [4500.0, 4500.0, 3500.0, 3500.0, 2000.0, 2000.0, 2000.0]
+  arm_kv: [450.0, 450.0, 350.0, 350.0, 200.0, 200.0, 200.0]
+  # 指 PD 刚度决定“指位超出接触点多少 -> 多大法向力”：5000 N/m 下，
+  # 0.4 mm 的过压约产生 2 N。力闭环只改指位目标，不改刚度。
+  finger_kp: [5000.0, 5000.0]
+  finger_kv: [40.0, 40.0]
+  arm_force_min: [-87.0, -87.0, -87.0, -87.0, -12.0, -12.0, -12.0]
+  arm_force_max: [87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0]
+  finger_force_min: [-25.0, -25.0]
+  finger_force_max: [25.0, 25.0]
+
+controller:
+  pos_scale_m: 0.05
+  rot_scale_rad: 0.5
+  control_hz: 20.0
+  sim_dt: 0.005
+  decimation: 10
+  ik_damping: 0.1
+  ik_max_iters: 40
+  # 只用当前状态做 IK 初值：多采样会跳到别的解支（腕部拧转），
+  # 关节指令突变会让手臂甩出去。
+  ik_max_samples: 1
+  ik_max_step_rad: 0.15
+  # 指令位姿的推进限速：位置 12 cm/s、姿态 1.2 rad/s。
+  pos_speed_m_per_s: 0.12
+  rot_speed_rad_per_s: 1.2
+  finger_speed_m_per_s: 0.2
+
+table:
+  pos: [0.4, 0.0, 0.0]
+  size: [0.6, 1.2, 0.04]
+  height_m: 0.4
+  color: [0.55, 0.38, 0.22]
+
+# 抬升平台：杯底离桌面 60 mm，否则手掌前缘太低会撞到杯口。
+# 70 mm 见方、与杯体轴线同轴（杯体轴线相对槽位 +17.5 mm）。
+platform:
+  size_xy: [0.07, 0.07]
+  height_m: 0.06
+  material: platform
+  color: [0.78, 0.12, 0.10]
+
+# 探测区域：位姿在杯子的“作者坐标系”里（原点=杯底中心，+z 沿杯轴，手柄在 -x）。
+# tool_dir 是手 z 轴（手指指向的接近方向），finger_dir 是手 y 轴（两指闭合方向）。
+# xy_jitter_m 作用于 pos 的两个水平分量，z_jitter_m 作用于竖直分量；抖动幅度
+# 保证指尖接触面不跨过相邻热区的分界。
+regions:
+  lower:
+    # 杯壁下三分之一，从 +y 侧水平进入；指尖覆盖杯 z 0.008..0.029。
+    pos: [0.0, 0.0, 0.020]
+    tool_dir: [-1.0, 0.0, 0.0]
+    finger_dir: [0.0, -1.0, 0.0]
+    pre_dist: 0.06
+    xy_jitter_m: 0.002
+    z_jitter_m: 0.0015
+  middle:
+    # 中三分之一，同样水平进入；指尖覆盖杯 z 0.044..0.066。
+    pos: [0.0, 0.0, 0.055]
+    tool_dir: [-1.0, 0.0, 0.0]
+    finger_dir: [0.0, -1.0, 0.0]
+    pre_dist: 0.06
+    xy_jitter_m: 0.002
+    z_jitter_m: 0.0015
+  upper:
+    # 上三分之一，从上往下；z=0.088 时指尖覆盖 0.077..0.099，完全落在
+    # 上段 0.0733..0.110 内。
+    pos: [0.0, 0.0, 0.088]
+    tool_dir: [0.0, 0.0, -1.0]
+    finger_dir: [0.0, -1.0, 0.0]
+    pre_dist: 0.08
+    xy_jitter_m: 0.002
+    z_jitter_m: 0.001
+  handle:
+    # 手柄外侧竖条：世界 -y 方向、离轴 57 mm、高 56 mm。
+    pos: [-0.057, 0.0, 0.056]
+    tool_dir: [1.0, 0.0, 0.0]
+    finger_dir: [0.0, 1.0, 0.0]
+    pre_dist: 0.07
+    xy_jitter_m: 0.0008
+    z_jitter_m: 0.0008
+
+# 混杂接触测试集专用：跨 middle/upper 分界（z≈0.0733），两指的接触垫面
+# 同时压在两个热 link 上。只用于 test_mixed_contact，不进入训练集。
+# 必须从侧面水平进入：顶端下压时掌前板在 TCP 上方约 39 mm，而该高度的
+# TCP 只比杯口低 37 mm，掌板会先压到杯口内缘（实测 1.7–2.2 N 的外来接触）。
+mixed_probe:
+  pos: [0.0, 0.0, 0.0733]
+  tool_dir: [-1.0, 0.0, 0.0]
+  finger_dir: [0.0, -1.0, 0.0]
+  pre_dist: 0.06
+  xy_jitter_m: 0.0005
+  z_jitter_m: 0.0003
+
+timing:
+  contact_s: 0.50       # 稳定接触的保持时长
+  post_contact_s: 0.20  # 离开接触后继续记录的时长
+
+contact:
+  nominal_force_n: 2.0
+  force_multipliers: [0.7, 1.0, 1.3]
+  force_band_n: 0.35
+  seek_timeout_s: 8.0
+  close_step_m: 0.0003      # 寻接触时每个策略步闭合 0.3 mm（指位）
+  gain_m_per_n: 0.00015     # 力误差 -> 指位修正（m/N）
+  brief_hold_s: [0.08, 0.18]  # “短暂接触”质量档的保持时长
+  # “接触失败”档：只闭合这么多（每根手指）就放弃，记录为 no_contact。
+  # 稳定档从张开位到杯壁的闭合量约 10 mm（手柄约 34 mm），指尖垫面与
+  # 杯壁还留 3 mm 以上余量——抖动最大 4 mm，所以这个预算碰不到杯子。
+  fail_retreat_m: [0.002, 0.005]
+  sample_every_sim_steps: 2  # 100 Hz（sim_dt 5 ms）

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "thermtacvla"
 version = "0.1.0"
-description = "Temperature + tactile VLA dataset generation on Genesis (Franka Panda + parallel gripper)"
+description = "ThermalContact-v1: single-region thermal contact dataset generation on Genesis"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 dependencies = [
@@ -13,19 +13,13 @@ dependencies = [
     "numpy>=1.26.4",
     "h5py>=3.10",
     "PyYAML>=6.0",
-    "scipy>=1.11",   # sim/tools/height_map.py（1.3 高度图合成，生成链路用到）
-    "Pillow>=10",    # sim/tools/gel_render.py + scripts/render_video.py（延迟 import）
+    "scipy>=1.11",   # AABB 旋转、四元数换算
 ]
 
 [project.optional-dependencies]
-# torch must be installed separately with the CUDA index (see README):
+# torch 需按 CUDA 版本单独安装（见 README）：
 #   pip install torch --index-url https://download.pytorch.org/whl/cu128
-dev = ["pytest", "matplotlib"]
+dev = ["matplotlib"]
 
 [tool.setuptools.packages.find]
-include = ["sim*"]
-
-[tool.setuptools.package-data]
-# Runtime assets (URDF + meshes + textures) travel with the package; the sim
-# resolves them from `sim/assets/` (see sim/assets/README.md).
-sim = ["assets/**/*"]
+include = ["sim*", "data*", "models*", "training*"]

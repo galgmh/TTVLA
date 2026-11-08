@@ -1,25 +1,25 @@
-"""Small compatibility fixes for the pinned Genesis sensor implementation.
+"""针对固定版本 Genesis 传感器实现的两个小补丁。
 
-``install_sensor_reset_fix`` is copied from tactile-genesis/dexterous-hands/src/sensor_compat.py
+``install_sensor_reset_fix`` 抄自 tactile-genesis/dexterous-hands 的同名补丁。
 
-``install_contact_area_policy`` is this repo's own addition: 
-it rewrites the contact areas the engine's contact-heat kernel consumes.
+``install_contact_area_policy`` 是本仓库自己的补充：改写引擎接触传热核所
+消费的接触面积。
 """
 
 from functools import wraps
 
 import torch
 
-# Pristine engine kernel, captured on the first install.
+# 引擎原始核函数，首次安装时捕获。
 _ENGINE_CONTACT_AREA_KERNEL = None
 
 
 def install_sensor_reset_fix():
-    """Reset indexed drift rows in-place; tensor advanced indexing returns a copy.
+    """就地清零指定环境的漂移行——张量高级索引返回的是副本。
 
-    Genesis SimpleSensor.reset uses `_cur_random_walk[envs_idx].fill_(0)`.
-    For a tensor/list of environment indices that leaves the original state
-    unchanged. Preserve the upstream reset chain and explicitly assign the rows.
+    Genesis 的 ``SimpleSensor.reset`` 用 ``_cur_random_walk[envs_idx].fill_(0)``：
+    当 ``envs_idx`` 是张量/列表时，实际改的是副本，原状态不变。保留上游的
+    reset 链，再显式对行赋值。
     """
     from genesis.engine.sensors.base_sensor import SimpleSensor
 
@@ -37,18 +37,17 @@ def install_sensor_reset_fix():
 
 
 def _as_torch(value):
-    """
-    quadrants Tensor (collider state) -> torch view; torch tensors pass through.
-    """
+    """quadrants 张量（碰撞器状态）-> torch 视图；torch 张量原样返回。"""
     if torch.is_tensor(value):
         return value
     return value.to_torch(copy=None)
 
 
 def _rewrite_finger_contact_areas(contact_area, collider_state, finger_faces):
-    """
-    A_i = A_face / sqrt(n_i) for every contact touching a finger link, in place.
-    (sum(A_i^2) = A_face^2 holds for any contact)
+    """对每个触及指尖 link 的接触，就地改写 A_i = A_face / sqrt(n_i)。
+
+    这样 sum(A_i²) = A_face² 在任何接触点数下都成立：2 点/3 点接触阶段的
+    接触热流不再差 24 倍，等价于一整块垫面面积的接触。
     """
     n_rows, n_envs = contact_area.shape
     if n_rows == 0 or n_envs == 0:
@@ -64,8 +63,8 @@ def _rewrite_finger_contact_areas(contact_area, collider_state, finger_faces):
         return
 
     device = contact_area.device
-    # Clamp the copy(to(int64) allocates); the collider state itself is never written.
-    # Slots past n_contacts hold uninitialised sort indices.
+    # 拷贝后再 to(int64)（会分配内存）；碰撞器状态本身从不写入。
+    # 超过 n_contacts 的槽位存放的是未初始化的排序下标。
     phys = sort_idx[:rows].to(torch.int64).clamp_(0, n_slots - 1)
     envs = torch.arange(n_envs, device=device)
     la = link_a[phys, envs]
@@ -80,14 +79,16 @@ def _rewrite_finger_contact_areas(contact_area, collider_state, finger_faces):
 
 
 def install_contact_area_policy(finger_faces=None):
-    """Route finger contact areas through the pad-face split.
+    """让指尖接触面积走 pad-face 分摊策略。
 
-    Parameters
+    参数
+    ----
     finger_faces : mapping[int, float] | None
-        Global link index -> pad face area (m^2) for every finger link.
+        全局 link 下标 -> 垫面面积（m²），每根指尖 link 一项。传 None 则
+        恢复引擎原始行为。
 
-    Idempotent: the pristine engine kernel is captured on the first call and
-    every later call swaps a single wrapper in or out.
+    幂等：首次调用捕获引擎原始核函数，之后每次调用只是换上/换下同一个
+    包装。
     """
     from genesis.engine.sensors import temperature as _temperature
 
@@ -102,7 +103,7 @@ def install_contact_area_policy(finger_faces=None):
 
     faces = {int(k): float(v) for k, v in finger_faces.items()}
     if any(a <= 0.0 for a in faces.values()):
-        raise ValueError(f"pad face areas must be positive, got {faces}")
+        raise ValueError(f"垫面面积必须为正，实际 {faces}")
 
     @wraps(original)
     def contact_areas(contact_area, scratch, dyn_state, collider_state, eps):

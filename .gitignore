@@ -7,18 +7,17 @@ build/
 dist/
 .pytest_cache/
 
-# 生成数据集与输出：datasets/ 下不入库——唯一例外 datasets/README.md（数据卡）；
-# data*/ 兜底覆盖将来的临时输出目录（data_smoke/ 等）
-data*/
-!datasets/
+# 数据集与运行输出不入库（data/ 是代码包，只有生成物被忽略）
 datasets/*
 !datasets/README.md
+data/manifests/*.jsonl
+!data/manifests/.gitkeep
 *.hdf5
 *.npz
-
-# 视频默认不入库（生成物 / 一次性实验产物）；
-# docs/figures/ 的交付视频例外——docs/status.md 直接引用它们
+*.pt
+*.pth
 *.mp4
-!docs/figures/*.mp4
 
+# 一次性曲线 / 检查输出
+temp/
 logs/

@@ -1,284 +1,178 @@
-"""Policy-rate observation assembly + sim-rate burst payload.
+"""观测读取：策略观测（模型输入）与特权观测（标签/审计用）。
 
-Channels (nested keys map to the HDF5 groups under obs/):
+两类观测严格分开：
 
-    ee_pos (3,) / ee_ori (3,) / gripper_states (1,) / joint_states (9,)
-    link_pose (F,7)     world pos + wxyz quat per finger, in layouts order
-    object_pose (N,7)   world pos + wxyz quat per object (format 1.2)
-    tactile/force       (F,6) AT-VLA 6D resultant per finger, link frame:
-                        [Fn(3), Ft(3)] (normal + tangential, compression > 0)
-    tactile/elastomer   (F*P,2) 2D marker displacement in the pad tangent
-                        plane, finger-major (format 1.6)
-    contact/link_contact (F,1) bool, contact/link_force (F,3) — the link sensors
-                        report (n_envs,1), so the bool channel keeps a trailing
-                        singleton axis rather than the (F,) this line used to
-                        claim; the force channel is reshaped to 3 and does not
-    temperature/{fingertip_grid, object_grid, objects_grid, link_temps, object}
-                        object_grid/object = the *targeted* object, unchanged;
-                        objects_grid (N, *object_grid) covers every object
-    agentview_rgb (H,W,3) uint8, eye_in_hand_rgb (H,W,3) uint8
+* ``get_policy_observation`` 只读指尖温度、指尖接触力、夹爪开口、指位，
+  以及由凝胶标记场估计的接触面积——这是编码器唯一允许看到的信号；
+* ``get_privileged_observation`` 读真实 link 温度与“哪根手指碰到哪个热区”
+  的接触归属，只进数据文件，绝不进模型输入。
 
-The derived tactile channels are expressed in the finger/link frame (format
-1.6): ``link_pose`` carries the world pose so a consumer can rotate them if it
-needs to. Row counts are per modality — the coarse force grid and the dense
-16x16 marker grid are distinct derivations over the same pad (docs §5.2).
-Temperature channels are
-read from the measured branch by default (``RECORD_GROUND_TRUTH = False`` in
-:mod:`sim.sensors.temperature`, format 1.5, docs §9-R36): ``fingertip_grid`` is
-one lumped measured cell per finger with the official RC/noise/quantization in
-it. The two RGB channels exist only when ``cameras.enabled`` (v2 increment,
-Gate 3 §8) and are flat under ``obs/`` to match the LIBERO layout.
+``contact_mask`` 是逐帧的真实接触判定（接触力传感器或法向力超过阈值）；
+``contact_link_mask`` 是 [2,4] 的“手指-热区”布尔表，用于校验选集纯度。
 """
 
 from __future__ import annotations
 
-from typing import Any
-
 import numpy as np
 
-from sim.expert.actions import tcp_pose
-from sim.rotations import quat_to_matrix, quat_to_rotvec
-from sim.scene import SceneBundle
-from sim.sensors.tactile import (
-    FEATURES_PER_PROBE,
-    TEMPORAL_REDUCTION,
-    WORLD_FRAME,
-    force_6d,
-    grid_for,
-    marker_2d,
-    read_all as read_tactile_all,
-)
-from sim.sensors.temperature import read_link_temperatures, read_temperature
+from sim.control.actions import tcp_pose
+from sim.rotations import quat_rotate
+from sim.sensors.tactile import read_all
+from sim.thermal.link_temperature import read_region_temperatures
 
-# ------------------------------------------------------------------ constants
-#
-# The camera rendering backend is a portability choice, not a task choice, so
-# the YAML does not expose it. ``raster`` is the validated default (Gate 3/4):
-# offscreen EGL on any headless Linux box, llvmpipe under WSL2. ``batch`` =
-# Madrona, one draw call for all cameras — faster where a Vulkan loader + NVIDIA
-# ICD exist, but it aborts ``scene.build()`` on WSL2 (docs §9-R3). ``raytrace``
-# needs OptiX. A script that needs another backend overrides this constant
-# before ``build_scene()``.
-RENDERER = "raster"
-
-VECTOR_MODALITIES = frozenset({"force", "force_torque", "elastomer", "proximity"})
+# 判定“有接触”的法向力阈值（N）。
+CONTACT_FORCE_EPS_N = 0.05
+# 凝胶标记被压缩到这个法向位移（m）才算接触点。实测（2.0 N 级接触）：
+# 无接触时标记位移严格为 0，接触后最大压缩约 13 µm；取 5 µm（约峰值的
+# 40%）让面积随接触力单调变化，又不至于把整个垫面都算成接触。
+CONTACT_DISPLACEMENT_M = 5.0e-6
 
 
-def _np(value: Any) -> np.ndarray:
-    return np.asarray(value.detach().cpu() if hasattr(value, "detach") else value, dtype=np.float64)
+def _numpy(tensor) -> np.ndarray:
+    return np.asarray(tensor.detach().cpu(), dtype=np.float64)
 
 
-class ObsBuilder:
-    """Reads one full observation (policy rate) or a fast burst payload (sim rate)."""
+def finger_poses(bundle) -> tuple[np.ndarray, np.ndarray]:
+    """两根手指 link 的世界位姿 (pos (2,3), wxyz quat (2,4))。"""
+    pos = []
+    quat = []
+    for name in bundle.finger_link_names:
+        link = bundle.robot.get_link(name)
+        pos.append(_numpy(link.get_pos()).reshape(-1)[:3])
+        quat.append(_numpy(link.get_quat()).reshape(-1)[:4])
+    return np.stack(pos), np.stack(quat)
 
-    def __init__(self, bundle: SceneBundle):
-        self.bundle = bundle
-        from sim.sensors.temperature import RECORD_GROUND_TRUTH
 
-        self.gt = RECORD_GROUND_TRUTH
+def _elastomer_handles(bundle) -> list:
+    return [h for h in bundle.tactile if h.modality == "elastomer"]
 
-    def _env0(self, arr: np.ndarray) -> np.ndarray:
-        return arr[0] if self.bundle.n_envs == 1 and arr.ndim >= 1 and arr.shape[0] == 1 else arr
 
-    # ------------------------------------------------------------------ proprio
+def contact_area(bundle) -> np.ndarray:
+    """由凝胶标记场估计的接触面积 (2,)，单位 m²。
 
-    def proprio(self) -> dict[str, np.ndarray]:
-        pos, quat = tcp_pose(self.bundle)
-        joint = self.bundle.joint_state()
-        r = self.bundle.cfg["robot"]
-        finger_mean = float(np.mean(joint[len(self.bundle.arm_dofs) :]))
-        span = max(r["open_finger_pos"] - r["closed_finger_pos"], 1e-6)
-        grip = 1.0 - 2.0 * (finger_mean - r["closed_finger_pos"]) / span
-        return {
-            "ee_pos": pos.astype(np.float32),
-            "ee_ori": quat_to_rotvec(quat).astype(np.float32),
-            "gripper_states": np.array([grip], dtype=np.float32),
-            "joint_states": joint.astype(np.float32),
-        }
+    每个标记的位移投影到“指向另一根手指”的垫面法向；法向压缩量超过
+    ``CONTACT_DISPLACEMENT_M`` 的标记判定为接触点，面积 = 接触点数 /
+    总点数 × 垫面面积。这是模型可用的面积信号（不是真实接触几何）。
+    """
+    handles = _elastomer_handles(bundle)
+    if not handles:
+        return np.zeros(2, dtype=np.float64)
+    data = read_all(handles, temporal_reduction="median")
+    areas = np.zeros(2, dtype=np.float64)
+    for i, handle in enumerate(handles):
+        disp = _numpy(data[handle.name])
+        disp = disp.reshape(-1, 3)
+        layout = bundle.tactile_layouts["elastomer"][i]
+        normal = np.asarray(layout.inner_dir, dtype=np.float64)
+        compression = np.abs(disp @ normal)
+        hit = float(np.mean(compression > CONTACT_DISPLACEMENT_M))
+        areas[i] = hit * float(layout.pad_face_area_m2)
+    return areas
 
-    # ------------------------------------------------------------------ tactile
 
-    def tactile(
-        self, *, mode: str | None = None, modalities: tuple[str, ...] | None = None
-    ) -> dict[str, np.ndarray]:
-        """Derived tactile arrays, one entry per modality (format 1.6).
+def get_policy_observation(bundle) -> dict[str, np.ndarray]:
+    """策略观测（编码器输入的唯一来源）。"""
+    from sim.sensors.temperature import read_temperature
 
-        ``force``     -> ``(n_fingers, 6)``: per-finger sum of the 12 probe
-                         forces, decomposed as ``[Fn(3), Ft(3)]`` along the pad
-                         normal (AT-VLA 6D force).
-        ``elastomer`` -> ``(n_fingers*P, 2)``: each marker's displacement
-                         projected onto the pad tangent plane, finger-major.
+    temp_data = read_temperature(bundle.temperatures)
+    # 指尖网格是 (1,1,1)：每个 handle 取唯一的测量值。
+    temp = np.asarray(
+        [_numpy(temp_data[h.name]).reshape(-1)[0] for h in bundle.temperatures], dtype=np.float64
+    )
 
-        Row blocks follow ``bundle.tactile_layouts[m]`` (finger order), so a
-        channel's row count is its *own* grid's — the force grid is 12/finger,
-        the marker grid 256/finger (docs §5.2). ``modalities`` narrows which
-        sensors are read at all, not just which are returned: the 200 Hz burst
-        path must not pay for a modality it discards.
-        """
-        modalities_cfg = tuple(self.bundle.cfg["tactile"]["modalities"])
-        wanted = [m for m in modalities_cfg if modalities is None or m in modalities]
-        handles = [h for h in self.bundle.tactile if h.modality in set(wanted)]
-        raw = read_tactile_all(handles, temporal_reduction=mode or TEMPORAL_REDUCTION)
-        out: dict[str, np.ndarray] = {}
-        for modality in wanted:
-            parts = []
-            for lay in self.bundle.tactile_layouts[modality]:
-                arr = self._env0(_np(raw[f"tactile_{modality}_{lay.link_name}"]))
-                # Strict reshape: a wrong element count must raise here, not
-                # silently regroup (the old `-1` did exactly that whenever the
-                # count happened to be 2P).
-                arr = arr.reshape(lay.num_probes, FEATURES_PER_PROBE[modality])
-                if modality == "force":
-                    # One 6D resultant per finger, not one row per probe.
-                    parts.append(force_6d(arr, lay.inner_dir)[None, :])
-                    continue
-                if modality == "elastomer":
-                    # Project onto the pad tangent plane; the normal component
-                    # is intentionally dropped (format 1.6 stores 2D markers).
-                    parts.append(
-                        marker_2d(arr, lay.probe_local_pos, lay.inner_dir, grid_for(modality))
-                    )
-                    continue
-                if modality in VECTOR_MODALITIES:
-                    if WORLD_FRAME:
-                        quat = _np(self.bundle.robot.get_link(lay.link_name).get_quat()).reshape(-1)[:4]
-                        arr = arr @ quat_to_matrix(quat).T
-                elif arr.shape[-1] == 1:
-                    arr = arr.reshape(-1)
-                parts.append(arr)
-            out[modality] = np.concatenate(parts, axis=0).astype(np.float32)
-        return out
+    data = read_all(bundle.link_contacts, temporal_reduction="last")
+    normal = np.zeros(2, dtype=np.float64)
+    touching = np.zeros(2, dtype=bool)
+    force_link = np.zeros((2, 3), dtype=np.float64)
+    inner = [np.asarray(lay.inner_dir, dtype=np.float64) for lay in bundle.layouts]
+    for i, name in enumerate(bundle.finger_link_names):
+        fname = f"tactile_link_force_{name}"
+        if fname in data:
+            force_link[i] = _numpy(data[fname]).reshape(3)
+        normal[i] = max(0.0, -float(force_link[i] @ inner[i]))
+        bname = f"tactile_link_bool_{name}"
+        if bname in data:
+            touching[i] = bool(_numpy(data[bname]).reshape(-1)[0] > 0.5)
 
-    def link_pose(self) -> np.ndarray:
-        """``(n_fingers, 7)`` f32: world position + wxyz quaternion per finger.
+    _, quat = finger_poses(bundle)
+    force_world = np.stack([quat_rotate(quat[i], force_link[i]) for i in range(2)])
+    eef_pos, eef_quat = tcp_pose(bundle)
 
-        Format 1.6 records tactile signals in the finger/link frame; this pose
-        is the reference a consumer uses to rotate them to world:
-        ``p_world = R(q) @ p_link + pos``. Rows follow ``bundle.layouts`` order,
-        i.e. the finger order every tactile channel is concatenated in, and are
-        read from the same simulator state as the tactile arrays.
-        """
-        rows = []
-        for lay in self.bundle.layouts:
-            link = self.bundle.robot.get_link(lay.link_name)
-            pos = _np(link.get_pos()).reshape(-1)[:3]
-            quat = _np(link.get_quat()).reshape(-1)[:4]
-            rows.append(np.concatenate([pos, quat]))
-        return np.stack(rows).astype(np.float32)
+    return {
+        "fingertip_temp": temp,
+        "contact_force_world": force_world,
+        "contact_normal_force": normal,
+        "contact_mask": (touching | (normal > CONTACT_FORCE_EPS_N)).astype(bool),
+        "gripper_width": np.asarray(bundle.gripper_width(), dtype=np.float64),
+        "finger_joint_position": bundle.finger_positions(),
+        "eef_pose": np.concatenate([eef_pos, eef_quat]),
+        "contact_area": contact_area(bundle),
+    }
 
-    def object_pose(self) -> np.ndarray:
-        """``(n_objects, 7)`` f32: world position + wxyz quaternion per object.
 
-        Same encoding and same simulator state as ``link_pose``, so a consumer can
-        place every body of a multi-object scene (format 1.2). Row order is
-        ``bundle.objects`` = ``cfg["objects"]``.
-        """
-        return self.bundle.object_poses()
+def contact_link_mask(bundle) -> tuple[np.ndarray, bool]:
+    """手指-热区接触归属 (2,4) 与“是否只有一根手指碰到杯子其它部位”。
 
-    def contact(self) -> dict[str, np.ndarray]:
-        raw = read_tactile_all(self.bundle.link_contacts, temporal_reduction="last")
-        bools, forces = [], []
-        for link_name in self.bundle.finger_link_names:
-            bools.append(self._env0(_np(raw[f"tactile_link_bool_{link_name}"])).reshape(-1))
-            forces.append(self._env0(_np(raw[f"tactile_link_force_{link_name}"])).reshape(3))
-        return {
-            "link_contact": np.stack(bools).astype(bool),
-            "link_force": np.stack(forces).astype(np.float32),
-        }
+    返回 ``(mask, foreign)``：``mask[f, r]`` 表示手指 f 与热区 r 的 link 有
+    接触；``foreign`` 表示机器人上除两根手指以外的 link（手、腕、臂）碰到了
+    杯子——这种集不能当纯接触样本。
+    """
+    mask = np.zeros((2, 4), dtype=bool)
+    foreign = False
+    contacts = bundle.cup.get_contacts()
+    if not contacts:
+        return mask, foreign
 
-    # -------------------------------------------------------------- temperature
+    def _flatten(key: str) -> np.ndarray:
+        if key not in contacts:
+            return np.zeros(0, dtype=np.int64)
+        return _numpy(contacts[key]).reshape(-1)
 
-    def temperature(self, *, ground_truth: bool | None = None) -> dict[str, np.ndarray]:
-        """Temperature channels; ``ground_truth`` defaults to ``RECORD_GROUND_TRUTH``.
+    link_a = _flatten("link_a").astype(np.int64)
+    link_b = _flatten("link_b").astype(np.int64)
+    if link_a.size != link_b.size:
+        raise ValueError(f"接触表的 link_a/link_b 长度不一致：{link_a.size} vs {link_b.size}")
+    finger_idx = np.asarray([int(bundle.robot.get_link(n).idx) for n in bundle.finger_link_names])
+    robot_idx = {int(link.idx) for link in bundle.robot.links}
 
-        Format 1.5 (docs §9-R36): the default is the *measured* channel.
-        ``fingertip_grid`` is the lumped (T, n_fingers, 1, 1, 1) measured cell
-        per finger — the official RC / noise / quantization live in it — while
-        the object grids carry no non-idealities, so their ``read()`` equals
-        the raw field.
-        """
-        gt = self.gt if ground_truth is None else ground_truth
-        raw = read_temperature(self.bundle.temperatures, ground_truth=gt)
-        finger_grids = [
-            self._env0(_np(raw[f"temperature_finger_{lay.link_name}"])) for lay in self.bundle.layouts
-        ]
-        object_grids = [
-            self._env0(_np(raw[f"temperature_object_{i}"])) for i in range(len(self.bundle.objects))
-        ]
-        objects_grid = np.stack(object_grids)
-        # `object_grid` / `object` keep their single-object meaning: the object
-        # this episode is acting on (format 1.2 adds `objects_grid` for the rest).
-        target_grid = object_grids[self.bundle.target_index]
-        out = {
-            "fingertip_grid": np.stack(finger_grids).astype(np.float32),
-            "object_grid": target_grid.astype(np.float32),
-            "objects_grid": objects_grid.astype(np.float32),
-            "object": np.array([float(target_grid.mean())], dtype=np.float32),
-        }
-        link_temps = read_link_temperatures(self.bundle.temperatures[-1])
-        if link_temps is not None:
-            out["link_temps"] = self._env0(_np(link_temps)).astype(np.float32)
-        return out
+    for a, b in zip(link_a, link_b):
+        region = bundle.regions.region_of_link(int(a))
+        other = int(b)
+        if region < 0:
+            region = bundle.regions.region_of_link(int(b))
+            other = int(a)
+        if region < 0:
+            continue
+        if other in robot_idx:
+            hits = np.where(finger_idx == other)[0]
+            if hits.size == 1:
+                mask[int(hits[0]), region] = True
+            else:
+                foreign = True
+        # 平台/桌面等非机器人接触不参与纯接触判定。
+    return mask, foreign
 
-    # ------------------------------------------------------------------- cameras
 
-    def cameras(self) -> dict[str, np.ndarray]:
-        """Rendered camera frames.
+def get_privileged_observation(bundle) -> dict[str, np.ndarray]:
+    """特权观测：真实 link 温度与接触归属（不进入模型输入）。"""
+    link_temp = np.asarray(
+        read_region_temperatures(bundle.temperatures[0], bundle.regions).detach().cpu(),
+        dtype=np.float64,
+    ).reshape(-1)
+    mask, foreign = contact_link_mask(bundle)
+    return {
+        "link_temp": link_temp,
+        "contact_link_mask": mask,
+        "contact_foreign": np.asarray(foreign),
+    }
 
-        ``{<name>_rgb: (H,W,3) uint8}``.  Empty unless ``cameras.enabled``, so
-        the no-camera path is untouched.  ``SceneBundle.render_cameras()``
-        returns ``(n_envs,H,W,3)``; with one env ``_env0`` drops the batch axis
-        to the per-step ``(H,W,3)`` the writer stacks into ``(T,H,W,3)``.
 
-        ``astype`` copies: the renderer's read-back buffer is reused between
-        calls, and ``run_episode`` keeps every step's frame until the episode
-        ends. Deliberately *not* called from ``fast_payload()`` — the burst
-        recorder runs at 200 Hz and would spend its whole budget drawing.
-        """
-        out: dict[str, np.ndarray] = {}
-        if self.bundle.cameras:
-            out.update(
-                {
-                    f"{name}_rgb": self._env0(np.asarray(frame)).astype(np.uint8)
-                    for name, frame in self.bundle.render_cameras().items()
-                }
-            )
-        return out
-
-    # ------------------------------------------------------------------- bundles
-
-    def build(self) -> dict[str, Any]:
-        obs: dict[str, Any] = {}
-        obs.update(self.proprio())
-        obs["link_pose"] = self.link_pose()
-        obs["object_pose"] = self.object_pose()
-        obs["tactile"] = self.tactile()
-        obs["contact"] = self.contact()
-        obs["temperature"] = self.temperature()
-        obs.update(self.cameras())
-        return obs
-
-    def fast_payload(self) -> dict[str, np.ndarray]:
-        """Small sim-rate payload for burst windows (L4).
-
-        The payload is captured every substep, so every configured tactile
-        modality is packed into it (docs §5.5).
-        """
-        tac = self.tactile(mode="last")
-        temp = self.temperature()
-        con = self.contact()
-        pos, _ = tcp_pose(self.bundle)
-        payload = {
-            "tcp_pos": pos.astype(np.float32),
-            "finger_joint_pos": self.bundle.joint_state()[len(self.bundle.arm_dofs) :].astype(np.float32),
-            "contact_bool": con["link_contact"],
-            "contact_force": con["link_force"],
-            "finger_temp": temp["fingertip_grid"]
-            .reshape(len(self.bundle.layouts), -1)
-            .mean(axis=1)
-            .astype(np.float32),
-            "object_temp": temp["object"],
-        }
-        for modality, arr in tac.items():
-            payload[f"fingertip_{modality}"] = arr.astype(np.float32)
-        return payload
+__all__ = [
+    "CONTACT_DISPLACEMENT_M",
+    "CONTACT_FORCE_EPS_N",
+    "contact_area",
+    "contact_link_mask",
+    "finger_poses",
+    "get_policy_observation",
+    "get_privileged_observation",
+]

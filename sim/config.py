@@ -1,147 +1,38 @@
-"""Task configuration: a validated YAML mapping.
+"""配置加载：YAML -> 经过严格校验的普通嵌套字典。
 
-One YAML file describes one task end to end (robot, table, objects, sensors,
-thermal parameters, randomization ranges, success criterion, recording). The
-YAML is the single source of truth: :func:`load_task_config` returns a plain
-nested ``dict`` and every module reads ``cfg["section"]["key"]`` directly.
+本项目把配置拆成五类文件，各自只描述一件事：
+
+* ``configs/objects/*.yaml``    物体资产引用 + 放置方式 + 热物性
+* ``configs/sensors/*.yaml``    指尖温度传感器的网格与环境温度
+* ``configs/tasks/*.yaml``      机器人、控制器、桌面、探测区域与时序
+* ``configs/datasets/*.yaml``   数据采样规则、划分与输出路径
+* ``configs/models/*.yaml``     热编码器结构与训练超参
+
+任务配置通过 ``object`` / ``sensor`` 两个键引用前两类文件；加载时被引用
+文件的内容会直接展开进返回的字典（``cfg["object"]`` / ``cfg["sensor"]``），
+所以下游模块只面对一个完整的字典。
+
+本模块只依赖标准库与 PyYAML，不导入 Genesis / torch——测试可以脱离仿真运行。
+所有未知键都会在加载时被拒绝：配置拼写错误必须立刻暴露，而不是运行到一半
+才在某个模块里 ``KeyError``。
 """
 
 from __future__ import annotations
 
-import re
+import math
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-# A task config: nested plain mappings/lists, exactly as the YAML spells them.
+# 仓库根目录：配置里的相对路径（assets/...、configs/...）都以它为基准。
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# 任务配置：嵌套的普通 dict，与 YAML 的写法一一对应。
 TaskConfig = dict[str, Any]
 
-_TOP_REQUIRED = frozenset(
-    {
-        "task_id",
-        "language_template",
-        "material_properties",
-        "material_list",
-        "objects",
-        "temperature_groups",
-        "min_object_gap_m",
-        "target_index",
-        "tray",
-        "robot",
-        "controller",
-        "expert",
-        "tactile",
-        "temperature",
-        "table",
-        "recording",
-        "cameras",
-        "max_episode_steps",
-        "success_criterion",
-        "stable_steps",
-        "tray_rest_tol_m",
-        "seed",
-    }
-)
 
-_SECTION_REQUIRED: dict[str, frozenset[str]] = {
-    "robot": frozenset(
-        {
-            "urdf",
-            "merge_fixed_links",
-            "hand_link_name",
-            "finger_link_names",
-            "arm_joint_names",
-            "finger_joint_names",
-            "tcp_offset",
-            "open_finger_pos",
-            "closed_finger_pos",
-            "base_pos",
-            "base_quat",
-            "init_qpos",
-            "arm_kp",
-            "arm_kv",
-            "finger_kp",
-            "finger_kv",
-            "arm_force_min",
-            "arm_force_max",
-            "finger_force_min",
-            "finger_force_max",
-        }
-    ),
-    "controller": frozenset(
-        {
-            "pos_scale_m",
-            "rot_scale_rad",
-            "ik_damping",
-            "ik_max_iters",
-            "ik_max_samples",
-            "control_hz",
-            "sim_dt",
-            "decimation",
-            "finger_speed_m_per_s",
-        }
-    ),
-    "expert": frozenset(
-        {
-            "approach",
-            "temperature_judge_enabled",
-            "temperature_candidate",
-            "temperature_judge_threshold_c",
-        }
-    ),
-    "tactile": frozenset({"modalities"}),
-    "temperature": frozenset({"finger_grid", "object_grid", "ambient_temp_c"}),
-    "table": frozenset({"pos", "size", "height_m"}),
-    "recording": frozenset(
-        {
-            "output_dir",
-            "keep_failed",
-            "compression",
-            "compression_opts",
-            "contact_burst",
-            "burst_pre_s",
-            "burst_post_s",
-            "burst_max_windows",
-        }
-    ),
-    "cameras": frozenset(
-        {
-            "enabled",
-            "resolution",
-            "agentview_pos",
-            "agentview_lookat",
-            "fov",
-            "eye_in_hand",
-            "eye_in_hand_pos",
-            "eye_in_hand_lookat",
-            "eye_in_hand_up",
-            "eye_in_hand_fov",
-            "near",
-            "far",
-        }
-    ),
-}
-_SECTION_OPTIONAL: dict[str, frozenset[str]] = {
-    "table": frozenset({"color"}),
-}
-
-_OBJECT_COMMON = frozenset(
-    {"shape", "mass_kg", "temp_c", "xy_jitter_m", "yaw_jitter_rad", "place_xy"}
-)
-_SHAPE_KEYS: dict[str, frozenset[str]] = {
-    "cylinder": frozenset({"radius_m", "height_m"}),
-    "box": frozenset({"radius_m", "height_m"}),
-    "cube": frozenset({"side_m"}),
-    "mesh": frozenset({"mesh_file", "mesh_scale", "mesh_euler_deg", "radius_m", "height_m"}),
-}
-_TACTILE_MODALITIES = frozenset({"force", "elastomer"})
-_MATERIAL_PROPERTY_KEYS = frozenset(
-    {"conductivity", "density", "specific_heat", "emissivity"}
-)
-
-
-# validation
+# ---------------------------------------------------------------- 通用校验工具
 
 
 def _check_keys(
@@ -150,14 +41,16 @@ def _check_keys(
     required: frozenset[str],
     optional: frozenset[str],
     where: str,
-    err,
 ) -> None:
+    """键集合必须恰好是 required ∪ optional；多余和缺失都要报错。"""
+    if not isinstance(data, dict):
+        raise ValueError(f"{where} 必须是映射（dict），实际是 {type(data).__name__}")
     missing = required - data.keys()
     unknown = data.keys() - required - optional
     if missing:
-        err(f"{where}: missing key(s) {sorted(missing)}")
+        raise ValueError(f"{where} 缺少键 {sorted(missing)}")
     if unknown:
-        err(f"{where}: unknown key(s) {sorted(unknown)}")
+        raise ValueError(f"{where} 出现未知键 {sorted(unknown)}")
 
 
 def _is_num(value: Any) -> bool:
@@ -166,462 +59,647 @@ def _is_num(value: Any) -> bool:
 
 def _num(value: Any, where: str) -> float:
     if not _is_num(value):
-        raise ValueError(f"{where} must be a number, got {value!r}")
+        raise ValueError(f"{where} 必须是数值，实际是 {value!r}")
     return float(value)
 
 
 def _int(value: Any, where: str, *, minimum: int | None = None) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
-        raise ValueError(f"{where} must be an integer, got {value!r}")
+        raise ValueError(f"{where} 必须是整数，实际是 {value!r}")
     if minimum is not None and value < minimum:
-        raise ValueError(f"{where} must be >= {minimum}, got {value!r}")
+        raise ValueError(f"{where} 必须 >= {minimum}，实际是 {value!r}")
     return value
 
 
 def _num_list(value: Any, where: str, length: int) -> list[float]:
     if not isinstance(value, (list, tuple)) or len(value) != length:
-        raise ValueError(f"{where} must be a list of {length} numbers, got {value!r}")
+        raise ValueError(f"{where} 必须是长度 {length} 的数值列表，实际是 {value!r}")
     return [_num(v, f"{where}[{i}]") for i, v in enumerate(value)]
 
 
 def _range(value: Any, where: str, *, positive: bool = True) -> list[float]:
     lo, hi = _num_list(value, where, 2)
     if lo > hi:
-        raise ValueError(f"{where} must be [low, high] with low <= high, got {value!r}")
+        raise ValueError(f"{where} 必须满足 low <= high，实际是 {value!r}")
     if positive and lo <= 0.0:
-        raise ValueError(f"{where} must be positive, got {value!r}")
+        raise ValueError(f"{where} 必须为正，实际是 {value!r}")
     return [lo, hi]
+
+
+def _str(value: Any, where: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{where} 必须是非空字符串，实际是 {value!r}")
+    return value
 
 
 def _str_list(value: Any, where: str, *, length: int | None = None) -> list[str]:
     if not isinstance(value, (list, tuple)) or not value:
-        raise ValueError(f"{where} must be a non-empty list of strings, got {value!r}")
+        raise ValueError(f"{where} 必须是非空字符串列表，实际是 {value!r}")
     if length is not None and len(value) != length:
-        raise ValueError(f"{where} must have {length} entries, got {value!r}")
+        raise ValueError(f"{where} 必须包含 {length} 项，实际是 {value!r}")
     if not all(isinstance(v, str) and v for v in value):
-        raise ValueError(f"{where} must contain non-empty strings, got {value!r}")
+        raise ValueError(f"{where} 只能包含非空字符串，实际是 {value!r}")
     return list(value)
 
 
 def _check_color(value: Any, where: str) -> None:
     if not isinstance(value, (list, tuple)) or len(value) not in (3, 4):
-        raise ValueError(f"{where} must be an RGB(A) list of 3 or 4 numbers, got {value!r}")
+        raise ValueError(f"{where} 必须是 3 或 4 元 RGB(A) 列表，实际是 {value!r}")
     for i, v in enumerate(value):
         _num(v, f"{where}[{i}]")
 
 
-# Fields that may differ between bodies whose temperature profiles are shuffled:
-# the profile itself, where the body is placed, and the per-episode pose jitter.
-_TEMPERATURE_IDENTITY_EXCLUDED = frozenset(
-    {"temp_c", "place_xy", "xy_jitter_m", "yaw_jitter_rad"}
+def _load_yaml(path: str | Path, what: str) -> dict[str, Any]:
+    """读入一个 YAML 文件，必须是顶层映射。"""
+    path = Path(path)
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"{what}不存在：{path}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError(f"{what}的顶层必须是映射：{path}")
+    return raw
+
+
+def _repo_path(path: str | Path) -> Path:
+    """配置里的相对路径一律相对仓库根目录解析。"""
+    p = Path(path).expanduser()
+    return p if p.is_absolute() else REPO_ROOT / p
+
+
+# ------------------------------------------------------------------ 物体配置
+
+_OBJECT_REQUIRED = frozenset(
+    {
+        "manifest",
+        "material",
+        "material_properties",
+        "place_xy",
+        "rest_height_m",
+        "xy_jitter_m",
+        "yaw_jitter_rad",
+    }
+)
+_OBJECT_OPTIONAL = frozenset({"color"})
+_MATERIAL_KEYS = frozenset({"conductivity", "density", "specific_heat", "emissivity"})
+# 资产清单（manifest）由 scripts/build_cup_4link.py 生成，是区域顺序、link
+# 名称和区域 z 边界的唯一来源；物体配置只引用它，不再重复抄写。
+_MANIFEST_REQUIRED = frozenset(
+    {
+        "asset_version",
+        "urdf_file",
+        "region_order",
+        "regions",
+        "link_names",
+        "base_euler_deg",
+        "mass_kg",
+        "aabb_min_m",
+        "aabb_max_m",
+    }
 )
 
 
-def _freeze(value: Any) -> Any:
-    """Hashable, order-stable representation of a YAML value."""
-    if isinstance(value, dict):
-        return tuple(sorted((str(k), _freeze(v)) for k, v in value.items()))
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze(v) for v in value)
-    return value
-
-
-def _object_identity(obj: dict[str, Any], material: str) -> tuple[Any, str]:
-    """Everything that makes two bodies the same object, minus per-episode fields."""
-    fields = tuple(
-        sorted(
-            (str(key), _freeze(value))
-            for key, value in obj.items()
-            if key not in _TEMPERATURE_IDENTITY_EXCLUDED
-        )
-    )
-    return fields, material
-
-
-def _validate_temperature_groups(cfg: dict[str, Any], err) -> None:
-    """Check the groups whose temperature profiles are permuted per episode.
-
-    Within one group the bodies must be interchangeable (same shape, material,
-    geometry, mass and render color); only `temp_c`, `place_xy` and the pose
-    jitter may differ. If the target's profile anchor is inside a group, every
-    member can become the episode target, so every member must be a temperature
-    judge candidate.
-    """
-    groups = cfg["temperature_groups"]
-    if not isinstance(groups, (list, tuple)):
-        err("temperature_groups must be a list of object-index groups")
-    objects = cfg["objects"]
-    materials = cfg["material_list"]
-    seen: set[int] = set()
-    for gi, group in enumerate(groups):
-        if not isinstance(group, (list, tuple)) or len(group) < 2:
-            err(f"temperature_groups[{gi}] must be a list of at least 2 object indices")
-        if any(not isinstance(i, int) or isinstance(i, bool) for i in group):
-            err(f"temperature_groups[{gi}] must contain only integer object indices")
-        if len(set(group)) != len(group):
-            err(f"temperature_groups[{gi}] must not repeat an object index")
-        if any(i < 0 or i >= len(objects) for i in group):
-            err(f"temperature_groups[{gi}] indices must be in [0, {len(objects)})")
-        overlap = seen.intersection(group)
-        if overlap:
-            err(
-                f"temperature_groups[{gi}] repeats object index(es) from another "
-                f"group: {sorted(overlap)}"
-            )
-        seen.update(group)
-        identity = _object_identity(objects[group[0]], materials[group[0]])
-        for index in group[1:]:
-            if _object_identity(objects[index], materials[index]) != identity:
-                err(
-                    f"temperature_groups[{gi}] must contain identical objects; "
-                    f"objects {group[0]} and {index} differ"
-                )
-
-    target = int(cfg["target_index"])
-    expert = cfg["expert"]
-    if expert["temperature_judge_enabled"]:
-        target_group = next((group for group in groups if target in group), None)
-        if target_group is not None:
-            candidates = {int(i) for i in expert["temperature_candidate"]}
-            missing = [int(i) for i in target_group if int(i) not in candidates]
-            if missing:
-                err(
-                    f"temperature_groups: target_index={target} is in group "
-                    f"{[int(i) for i in target_group]}, so every member must be in "
-                    f"expert.temperature_candidate; missing {missing}"
-                )
-
-
-def _validate(cfg: dict[str, Any], source: str) -> None:
-    def err(message: str) -> None:
-        raise ValueError(f"{source}: {message}")
-
+def _validate_manifest(manifest: dict[str, Any], source: str) -> None:
     _check_keys(
-        cfg,
-        required=_TOP_REQUIRED,
-        optional=frozenset(),
-        where="top level",
-        err=err,
+        manifest,
+        required=_MANIFEST_REQUIRED,
+        optional=frozenset({"meshes", "notes"}),
+        where=f"{source} (manifest)",
     )
-
-    if not isinstance(cfg["task_id"], str) or not cfg["task_id"]:
-        err("task_id must be a non-empty string")
-    _num(cfg["min_object_gap_m"], f"{source}: min_object_gap_m")
-    _int(cfg["max_episode_steps"], f"{source}: max_episode_steps", minimum=1)
-    _int(cfg["stable_steps"], f"{source}: stable_steps", minimum=1)
-    _int(cfg["seed"], f"{source}: seed")
-    if _num(cfg["tray_rest_tol_m"], f"{source}: tray_rest_tol_m") <= 0.0:
-        err("tray_rest_tol_m must be positive")
-
-    # --- sections ---------------------------------------------------------
-    for name, required in _SECTION_REQUIRED.items():
-        section = cfg[name]
-        if not isinstance(section, dict):
-            err(f"{name} must be a mapping")
+    _str(manifest["asset_version"], f"{source}: asset_version")
+    _str(manifest["urdf_file"], f"{source}: urdf_file")
+    order = _str_list(manifest["region_order"], f"{source}: region_order")
+    if len(set(order)) != len(order):
+        raise ValueError(f"{source}: region_order 不能重复")
+    if len(order) != 4:
+        raise ValueError(f"{source}: 本任务固定四个热区，region_order 必须恰好 4 项")
+    link_names = _str_list(manifest["link_names"], f"{source}: link_names")
+    if set(link_names) != set(order):
+        raise ValueError(f"{source}: link_names 与 region_order 必须一致（本资产一个区域对应一个 link）")
+    regions = manifest["regions"]
+    if not isinstance(regions, dict) or set(regions) != set(order):
+        raise ValueError(f"{source}: regions 的键必须恰好是 region_order")
+    for name in order:
+        entry = regions[name]
         _check_keys(
-            section,
-            required=required,
-            optional=_SECTION_OPTIONAL.get(name, frozenset()),
-            where=name,
-            err=err,
+            entry,
+            required=frozenset({"link", "z_span_m"}),
+            optional=frozenset(),
+            where=f"{source}: regions.{name}",
         )
+        link = _str(entry["link"], f"{source}: regions.{name}.link")
+        if link not in link_names:
+            raise ValueError(f"{source}: regions.{name}.link = {link!r} 不在 link_names 中")
+        lo, hi = _num_list(entry["z_span_m"], f"{source}: regions.{name}.z_span_m", 2)
+        if not lo < hi:
+            raise ValueError(f"{source}: regions.{name}.z_span_m 必须满足 low < high")
+    _num_list(manifest["base_euler_deg"], f"{source}: base_euler_deg", 3)
+    if _num(manifest["mass_kg"], f"{source}: mass_kg") <= 0.0:
+        raise ValueError(f"{source}: mass_kg 必须为正")
+    _num_list(manifest["aabb_min_m"], f"{source}: aabb_min_m", 3)
+    _num_list(manifest["aabb_max_m"], f"{source}: aabb_max_m", 3)
 
-    tray = cfg["tray"]
-    if not isinstance(tray, dict):
-        err("tray must be a mapping")
-    _check_keys(
-        tray,
-        required=frozenset({"enabled", "place_xy"}),
-        optional=frozenset(
-            {"inner_x_m", "inner_y_m", "rim_m", "wall_m", "floor_m", "fuse_m", "color"}
-        ),
-        where="tray",
-        err=err,
-    )
 
-    # --- objects ----------------------------------------------------------
-    objects = cfg["objects"]
-    if not isinstance(objects, list) or not objects:
-        err("objects must be a non-empty list")
-    for i, obj in enumerate(objects):
-        where = f"objects[{i}]"
-        if not isinstance(obj, dict):
-            err(f"{where} must be a mapping")
-        shape = obj.get("shape")
-        if shape not in _SHAPE_KEYS:
-            err(f"{where}.shape must be one of {sorted(_SHAPE_KEYS)}, got {shape!r}")
-        _check_keys(
-            obj,
-            required=_OBJECT_COMMON | _SHAPE_KEYS[shape],
-            optional=frozenset({"color"}),
-            where=where,
-            err=err,
-        )
-        _range(obj["mass_kg"], f"{source}: {where}.mass_kg")
-        lo, hi = _num_list(obj["temp_c"], f"{source}: {where}.temp_c", 2)
-        if lo > hi:
-            err(f"{where}.temp_c must be [low, high] with low <= high")
-        if _num(obj["xy_jitter_m"], f"{source}: {where}.xy_jitter_m") < 0.0:
-            err(f"{where}.xy_jitter_m must be >= 0")
-        if _num(obj["yaw_jitter_rad"], f"{source}: {where}.yaw_jitter_rad") < 0.0:
-            err(f"{where}.yaw_jitter_rad must be >= 0")
-        _num_list(obj["place_xy"], f"{source}: {where}.place_xy", 2)
-        if "color" in obj:
-            _check_color(obj["color"], f"{source}: {where}.color")
-        if "radius_m" in obj:
-            _range(obj["radius_m"], f"{source}: {where}.radius_m")
-        if "height_m" in obj:
-            _range(obj["height_m"], f"{source}: {where}.height_m")
-        if "side_m" in obj:
-            _range(obj["side_m"], f"{source}: {where}.side_m")
-        if "mesh_file" in obj:
-            if not isinstance(obj["mesh_file"], str) or not obj["mesh_file"]:
-                err(f"{where}.mesh_file must be a non-empty string")
-        if "mesh_scale" in obj:
-            scale = obj["mesh_scale"]
-            if _is_num(scale):
-                if scale <= 0.0:
-                    err(f"{where}.mesh_scale must be positive")
-            else:
-                for j, v in enumerate(_num_list(scale, f"{source}: {where}.mesh_scale", 3)):
-                    if v <= 0.0:
-                        err(f"{where}.mesh_scale[{j}] must be positive")
-        if "mesh_euler_deg" in obj:
-            _num_list(obj["mesh_euler_deg"], f"{source}: {where}.mesh_euler_deg", 3)
+def load_object_config(path: str | Path) -> dict[str, Any]:
+    """加载物体配置，并把 manifest 的资产字段展开进来。"""
+    source = str(path)
+    cfg = _load_yaml(path, "物体配置")
+    _check_keys(cfg, required=_OBJECT_REQUIRED, optional=_OBJECT_OPTIONAL, where=source)
 
-    # --- materials --------------------------------------------------------
+    manifest_path = _repo_path(_str(cfg["manifest"], f"{source}: manifest"))
+    manifest = _load_yaml(manifest_path, "资产清单")
+    _validate_manifest(manifest, str(manifest_path))
+
     props = cfg["material_properties"]
     if not isinstance(props, dict) or not props:
-        err("material_properties must be a non-empty mapping")
+        raise ValueError(f"{source}: material_properties 必须是非空映射")
     for name, values in props.items():
-        where = f"material_properties.{name}"
-        if not isinstance(values, dict):
-            err(f"{where} must be a mapping")
         _check_keys(
             values,
-            required=_MATERIAL_PROPERTY_KEYS,
+            required=_MATERIAL_KEYS,
             optional=frozenset(),
-            where=where,
-            err=err,
+            where=f"{source}: material_properties.{name}",
         )
-        for key in _MATERIAL_PROPERTY_KEYS:
-            _num(values[key], f"{source}: {where}.{key}")
+        for key in _MATERIAL_KEYS:
+            _num(values[key], f"{source}: material_properties.{name}.{key}")
+    material = _str(cfg["material"], f"{source}: material")
+    if material not in props:
+        raise ValueError(f"{source}: material = {material!r} 不在 material_properties 中")
 
-    material_list = _str_list(cfg["material_list"], f"{source}: material_list")
-    if len(material_list) != len(objects):
-        err(
-            f"material_list has {len(material_list)} entries but objects has "
-            f"{len(objects)}; one material per object"
-        )
-    for i, material in enumerate(material_list):
-        if material not in props:
-            err(f"material_list[{i}] = {material!r} is not in material_properties")
+    _num_list(cfg["place_xy"], f"{source}: place_xy", 2)
+    if _num(cfg["rest_height_m"], f"{source}: rest_height_m") < 0.0:
+        raise ValueError(f"{source}: rest_height_m 必须 >= 0")
+    for key in ("xy_jitter_m", "yaw_jitter_rad"):
+        if _num(cfg[key], f"{source}: {key}") < 0.0:
+            raise ValueError(f"{source}: {key} 必须 >= 0")
+    if "color" in cfg:
+        _check_color(cfg["color"], f"{source}: color")
 
-    # --- target -----------------------------------------------------------
-    target = cfg["target_index"]
-    if not isinstance(target, int) or isinstance(target, bool) or not (
-        0 <= target < len(objects)
-    ):
-        err(f"target_index must be an integer in [0, {len(objects)}), got {target!r}")
+    # 资产字段直接并入：下游只需 cfg["object"]["region_order"] 等。
+    merged = dict(cfg)
+    merged["manifest_path"] = str(manifest_path)
+    merged["urdf_path"] = str(manifest_path.parent / manifest["urdf_file"])
+    merged.update(
+        {
+            "asset_version": manifest["asset_version"],
+            "region_order": list(manifest["region_order"]),
+            "region_links": {n: manifest["regions"][n]["link"] for n in manifest["region_order"]},
+            "region_z_spans": {n: list(manifest["regions"][n]["z_span_m"]) for n in manifest["region_order"]},
+            "link_names": list(manifest["link_names"]),
+            "base_euler_deg": list(manifest["base_euler_deg"]),
+            "mass_kg": float(manifest["mass_kg"]),
+            "aabb_min_m": list(manifest["aabb_min_m"]),
+            "aabb_max_m": list(manifest["aabb_max_m"]),
+        }
+    )
+    return merged
 
-    # --- language ---------------------------------------------------------
-    template = cfg["language_template"]
-    templates = [template] if isinstance(template, str) else template
-    if not isinstance(templates, list) or not templates:
-        err("language_template must be a string or a non-empty list of strings")
-    if not all(isinstance(t, str) and t for t in templates):
-        err("language_template entries must be non-empty strings")
-    placeholder_sets = {frozenset(re.findall(r"\{(\w+)\}", t)) for t in templates}
-    if len(placeholder_sets) > 1:
-        err(f"language_template entries must use the same placeholders, got {[sorted(s) for s in placeholder_sets]}")
-    unsupported = set().union(*placeholder_sets) - {"material", "shape"}
-    if unsupported:
-        err(f"language_template uses unsupported placeholder(s) {sorted(unsupported)}")
 
-    # --- expert -----------------------------------------------------------
-    expert = cfg["expert"]
-    if expert["approach"] != "place_in_tray":
-        err(f"expert.approach must be 'place_in_tray', got {expert['approach']!r}")
-    judge = expert["temperature_judge_enabled"]
-    if not isinstance(judge, bool):
-        err("expert.temperature_judge_enabled must be a boolean")
-    candidates = expert["temperature_candidate"]
-    if not isinstance(candidates, (list, tuple)) or any(
-        not isinstance(i, int) or isinstance(i, bool) for i in candidates
-    ):
-        err("expert.temperature_candidate must be a list of integers")
-    if judge and not candidates:
-        err("expert.temperature_judge_enabled needs temperature_candidate")
-    if len(set(candidates)) != len(candidates) or any(
-        i < 0 or i >= len(objects) for i in candidates
-    ):
-        err(
-            f"expert.temperature_candidate must be distinct indices in [0, {len(objects)}), "
-            f"got {list(candidates)}"
-        )
-    if judge and target not in candidates:
-        # With the judge on, nothing is carried unless a touch matches the
-        # interval, and only candidates are ever touched: a target outside the
-        # list can never reach the tray, so every episode would be a failure.
-        err(
-            f"expert.temperature_candidate must include target_index={target!r} when the "
-            f"temperature judge is enabled, got {list(candidates)}"
-        )
-    threshold = expert["temperature_judge_threshold_c"]
-    if not isinstance(threshold, (list, tuple)) or len(threshold) != 2:
-        err("expert.temperature_judge_threshold_c must be [low, high] (null = open end)")
-    lo, hi = (None if v is None else _num(v, f"{source}: expert.temperature_judge_threshold_c") for v in threshold)
-    if lo is None and hi is None:
-        err("expert.temperature_judge_threshold_c needs at least one finite end")
-    if lo is not None and hi is not None and lo > hi:
-        err(f"expert.temperature_judge_threshold_c low must be <= high, got [{lo}, {hi}]")
+# ------------------------------------------------------------------ 传感器配置
 
-    _validate_temperature_groups(cfg, err)
+_SENSOR_REQUIRED = frozenset(
+    {
+        "finger_grid",
+        "object_grid",
+        "ambient_temp_c",
+        "nominal",
+    }
+)
 
-    # --- tactile / temperature -------------------------------------------
-    modalities = _str_list(cfg["tactile"]["modalities"], f"{source}: tactile.modalities")
-    if len(set(modalities)) != len(modalities):
-        err("tactile.modalities must not contain duplicates")
-    unknown_modalities = set(modalities) - _TACTILE_MODALITIES
-    if unknown_modalities:
-        err(f"tactile.modalities supports {sorted(_TACTILE_MODALITIES)}, got {sorted(unknown_modalities)}")
 
-    temperature = cfg["temperature"]
-    for key in ("finger_grid", "object_grid"):
-        grid = temperature[key]
-        if not isinstance(grid, (list, tuple)) or len(grid) != 3:
-            err(f"temperature.{key} must be a list of 3 positive integers, got {grid!r}")
-        for i, v in enumerate(grid):
-            _int(v, f"{source}: temperature.{key}[{i}]", minimum=1)
-    _num(temperature["ambient_temp_c"], f"{source}: temperature.ambient_temp_c")
+def load_sensor_config(path: str | Path) -> dict[str, Any]:
+    """加载指尖温度传感器配置。"""
+    source = str(path)
+    cfg = _load_yaml(path, "传感器配置")
+    _check_keys(cfg, required=_SENSOR_REQUIRED, optional=frozenset(), where=source)
 
-    # --- table / tray -----------------------------------------------------
+    grid = cfg["finger_grid"]
+    if not isinstance(grid, (list, tuple)) or len(grid) != 3:
+        raise ValueError(f"{source}: finger_grid 必须是 3 个正整数")
+    for i, v in enumerate(grid):
+        _int(v, f"{source}: finger_grid[{i}]", minimum=1)
+    if cfg["object_grid"] is not None:
+        raise ValueError(f"{source}: object_grid 必须为 null（本任务的物体热状态是每 link 一个集总温度）")
+    _num(cfg["ambient_temp_c"], f"{source}: ambient_temp_c")
+    nominal = cfg["nominal"]
+    _check_keys(
+        nominal,
+        required=frozenset({"rc_s", "noise_c", "bias_c", "quantization_c"}),
+        optional=frozenset(),
+        where=f"{source}: nominal",
+    )
+    for key in ("rc_s", "noise_c", "bias_c", "quantization_c"):
+        _num(nominal[key], f"{source}: nominal.{key}")
+    if float(nominal["rc_s"]) < 0.0 or float(nominal["noise_c"]) < 0.0 or float(nominal["quantization_c"]) < 0.0:
+        raise ValueError(f"{source}: nominal 的 rc/noise/quantization 必须 >= 0")
+    return cfg
+
+
+# --------------------------------------------------------------------- 任务配置
+
+_TASK_REQUIRED = frozenset(
+    {
+        "task_id",
+        "seed",
+        "object",
+        "sensor",
+        "robot",
+        "controller",
+        "table",
+        "platform",
+        "regions",
+        "mixed_probe",
+        "timing",
+        "contact",
+    }
+)
+
+_ROBOT_KEYS = frozenset(
+    {
+        "urdf",
+        "merge_fixed_links",
+        "hand_link_name",
+        "finger_link_names",
+        "arm_joint_names",
+        "finger_joint_names",
+        "tcp_offset",
+        "open_finger_pos",
+        "closed_finger_pos",
+        "base_pos",
+        "base_quat",
+        "init_qpos",
+        "arm_kp",
+        "arm_kv",
+        "finger_kp",
+        "finger_kv",
+        "arm_force_min",
+        "arm_force_max",
+        "finger_force_min",
+        "finger_force_max",
+    }
+)
+_CONTROLLER_KEYS = frozenset(
+    {
+        "pos_scale_m",
+        "rot_scale_rad",
+        "ik_damping",
+        "ik_max_iters",
+        "ik_max_samples",
+        "ik_max_step_rad",
+        "pos_speed_m_per_s",
+        "rot_speed_rad_per_s",
+        "control_hz",
+        "sim_dt",
+        "decimation",
+        "finger_speed_m_per_s",
+    }
+)
+_PROBE_KEYS = frozenset({"pos", "tool_dir", "finger_dir", "pre_dist"})
+_PROBE_OPTIONAL = frozenset({"pre_grip", "xy_jitter_m", "z_jitter_m"})
+
+
+def _validate_probe(entry: dict[str, Any], where: str) -> None:
+    _check_keys(entry, required=_PROBE_KEYS, optional=_PROBE_OPTIONAL, where=where)
+    _num_list(entry["pos"], f"{where}.pos", 3)
+    tool = _num_list(entry["tool_dir"], f"{where}.tool_dir", 3)
+    finger = _num_list(entry["finger_dir"], f"{where}.finger_dir", 3)
+    tool_norm = math.sqrt(sum(v * v for v in tool))
+    finger_norm = math.sqrt(sum(v * v for v in finger))
+    if tool_norm <= 1e-9:
+        raise ValueError(f"{where}.tool_dir 不能是零向量")
+    if finger_norm <= 1e-9:
+        raise ValueError(f"{where}.finger_dir 不能是零向量")
+    cross = (
+        tool[1] * finger[2] - tool[2] * finger[1],
+        tool[2] * finger[0] - tool[0] * finger[2],
+        tool[0] * finger[1] - tool[1] * finger[0],
+    )
+    if math.sqrt(sum(v * v for v in cross)) <= 1e-6 * tool_norm * finger_norm:
+        raise ValueError(f"{where}.finger_dir 不能与 tool_dir 平行")
+    if _num(entry["pre_dist"], f"{where}.pre_dist") <= 0.0:
+        raise ValueError(f"{where}.pre_dist 必须为正")
+    if "pre_grip" in entry:
+        grip = _num(entry["pre_grip"], f"{where}.pre_grip")
+        if not -1.0 <= grip <= 1.0:
+            raise ValueError(f"{where}.pre_grip 必须在 [-1, 1]")
+    for key in ("xy_jitter_m", "z_jitter_m"):
+        if key in entry and _num(entry[key], f"{where}.{key}") < 0.0:
+            raise ValueError(f"{where}.{key} 必须 >= 0")
+
+
+def _validate_task(cfg: dict[str, Any], source: str) -> None:
+    _check_keys(cfg, required=_TASK_REQUIRED, optional=frozenset(), where=source)
+    _str(cfg["task_id"], f"{source}: task_id")
+    _int(cfg["seed"], f"{source}: seed")
+    _str(cfg["object"], f"{source}: object")
+    _str(cfg["sensor"], f"{source}: sensor")
+
+    robot = cfg["robot"]
+    _check_keys(robot, required=_ROBOT_KEYS, optional=frozenset(), where=f"{source}: robot")
+    _str(robot["urdf"], f"{source}: robot.urdf")
+    if not isinstance(robot["merge_fixed_links"], bool):
+        raise ValueError(f"{source}: robot.merge_fixed_links 必须是布尔值")
+    _str(robot["hand_link_name"], f"{source}: robot.hand_link_name")
+    _str_list(robot["finger_link_names"], f"{source}: robot.finger_link_names", length=2)
+    arm = _str_list(robot["arm_joint_names"], f"{source}: robot.arm_joint_names")
+    fingers = _str_list(robot["finger_joint_names"], f"{source}: robot.finger_joint_names", length=2)
+    _num_list(robot["tcp_offset"], f"{source}: robot.tcp_offset", 3)
+    _num(robot["open_finger_pos"], f"{source}: robot.open_finger_pos")
+    _num(robot["closed_finger_pos"], f"{source}: robot.closed_finger_pos")
+    if float(robot["closed_finger_pos"]) >= float(robot["open_finger_pos"]):
+        raise ValueError(f"{source}: robot.closed_finger_pos 必须小于 open_finger_pos")
+    _num_list(robot["base_pos"], f"{source}: robot.base_pos", 3)
+    _num_list(robot["base_quat"], f"{source}: robot.base_quat", 4)
+    qpos = robot["init_qpos"]
+    if not isinstance(qpos, (list, tuple)) or len(qpos) != len(arm) + len(fingers):
+        raise ValueError(f"{source}: robot.init_qpos 必须有 {len(arm) + len(fingers)} 项")
+    for i, v in enumerate(qpos):
+        _num(v, f"{source}: robot.init_qpos[{i}]")
+    for key in ("arm_kp", "arm_kv", "arm_force_min", "arm_force_max"):
+        _num_list(robot[key], f"{source}: robot.{key}", len(arm))
+    for key in ("finger_kp", "finger_kv", "finger_force_min", "finger_force_max"):
+        _num_list(robot[key], f"{source}: robot.{key}", len(fingers))
+
+    controller = cfg["controller"]
+    _check_keys(controller, required=_CONTROLLER_KEYS, optional=frozenset(), where=f"{source}: controller")
+    for key in ("pos_scale_m", "rot_scale_rad", "ik_damping", "control_hz", "sim_dt",
+                "ik_max_step_rad", "pos_speed_m_per_s", "rot_speed_rad_per_s"):
+        if _num(controller[key], f"{source}: controller.{key}") <= 0.0:
+            raise ValueError(f"{source}: controller.{key} 必须为正")
+    for key in ("ik_max_iters", "ik_max_samples", "decimation"):
+        _int(controller[key], f"{source}: controller.{key}", minimum=1)
+    if _num(controller["finger_speed_m_per_s"], f"{source}: controller.finger_speed_m_per_s") < 0.0:
+        raise ValueError(f"{source}: controller.finger_speed_m_per_s 必须 >= 0")
+    # 采样率必须能整除仿真步：100 Hz 采样对应每 2 个 5 ms 子步读一次。
+    ratio = 1.0 / float(controller["sim_dt"]) / (float(controller["control_hz"]) * int(controller["decimation"]))
+    if abs(ratio - 1.0) > 1e-6:
+        raise ValueError(f"{source}: sim_dt * control_hz * decimation 必须等于 1")
+
     table = cfg["table"]
+    _check_keys(
+        table,
+        required=frozenset({"pos", "size", "height_m"}),
+        optional=frozenset({"color"}),
+        where=f"{source}: table",
+    )
     _num_list(table["pos"], f"{source}: table.pos", 3)
     size = _num_list(table["size"], f"{source}: table.size", 3)
     if any(v <= 0.0 for v in size):
-        err("table.size entries must be positive")
+        raise ValueError(f"{source}: table.size 必须为正")
     _num(table["height_m"], f"{source}: table.height_m")
     if "color" in table:
         _check_color(table["color"], f"{source}: table.color")
 
-    if not isinstance(tray["enabled"], bool):
-        err("tray.enabled must be a boolean")
-    _num_list(tray["place_xy"], f"{source}: tray.place_xy", 2)
-    tray_geometry = ("inner_x_m", "inner_y_m", "rim_m", "wall_m", "floor_m", "fuse_m", "color")
-    if tray["enabled"]:
-        missing = [k for k in tray_geometry if k not in tray]
-        if missing:
-            err(f"tray: missing key(s) {missing} (required when tray.enabled is true)")
-        for key in ("inner_x_m", "inner_y_m", "rim_m", "wall_m", "floor_m", "fuse_m"):
-            if _num(tray[key], f"{source}: tray.{key}") <= 0.0:
-                err(f"tray.{key} must be positive")
-        _check_color(tray["color"], f"{source}: tray.color")
+    platform = cfg["platform"]
+    _check_keys(
+        platform,
+        required=frozenset({"size_xy", "height_m", "material"}),
+        optional=frozenset({"color"}),
+        where=f"{source}: platform",
+    )
+    _num_list(platform["size_xy"], f"{source}: platform.size_xy", 2)
+    if _num(platform["height_m"], f"{source}: platform.height_m") <= 0.0:
+        raise ValueError(f"{source}: platform.height_m 必须为正")
+    _str(platform["material"], f"{source}: platform.material")
+    if "color" in platform:
+        _check_color(platform["color"], f"{source}: platform.color")
 
-    # --- success ----------------------------------------------------------
-    if cfg["success_criterion"] != "place_in_tray":
-        err(f"success_criterion must be 'place_in_tray', got {cfg['success_criterion']!r}")
-    if not tray["enabled"]:
-        err("success_criterion 'place_in_tray' needs tray.enabled: true")
+    regions = cfg["regions"]
+    if not isinstance(regions, dict) or not regions:
+        raise ValueError(f"{source}: regions 必须是非空映射")
+    for name, entry in regions.items():
+        _validate_probe(entry, f"{source}: regions.{name}")
+    _validate_probe(cfg["mixed_probe"], f"{source}: mixed_probe")
 
-    # --- recording / cameras ---------------------------------------------
-    recording = cfg["recording"]
-    if not isinstance(recording["output_dir"], str) or not recording["output_dir"]:
-        err("recording.output_dir must be a non-empty string")
-    if not isinstance(recording["compression"], str) or not recording["compression"]:
-        err("recording.compression must be a non-empty string")
-    _int(recording["compression_opts"], f"{source}: recording.compression_opts")
-    _int(recording["burst_max_windows"], f"{source}: recording.burst_max_windows", minimum=0)
-    for key in ("burst_pre_s", "burst_post_s"):
-        if _num(recording[key], f"{source}: recording.{key}") < 0.0:
-            err(f"recording.{key} must be >= 0")
-    for key in ("keep_failed", "contact_burst"):
-        if not isinstance(recording[key], bool):
-            err(f"recording.{key} must be a boolean")
+    timing = cfg["timing"]
+    _check_keys(
+        timing,
+        required=frozenset({"contact_s", "post_contact_s"}),
+        optional=frozenset(),
+        where=f"{source}: timing",
+    )
+    for key in ("contact_s", "post_contact_s"):
+        if _num(timing[key], f"{source}: timing.{key}") < 0.0:
+            raise ValueError(f"{source}: timing.{key} 必须 >= 0")
 
-    cameras = cfg["cameras"]
-    if not isinstance(cameras["enabled"], bool):
-        err("cameras.enabled must be a boolean")
-    if not isinstance(cameras["eye_in_hand"], bool):
-        err("cameras.eye_in_hand must be a boolean")
-    resolution = cameras["resolution"]
-    if not isinstance(resolution, (list, tuple)) or len(resolution) != 2:
-        err("cameras.resolution must be [width, height]")
-    for i, v in enumerate(resolution):
-        _int(v, f"{source}: cameras.resolution[{i}]", minimum=1)
-    for key in ("agentview_pos", "agentview_lookat", "eye_in_hand_pos", "eye_in_hand_lookat", "eye_in_hand_up"):
-        _num_list(cameras[key], f"{source}: cameras.{key}", 3)
-    for key in ("fov", "eye_in_hand_fov", "near", "far"):
-        _num(cameras[key], f"{source}: cameras.{key}")
-
-    # --- robot / controller ----------------------------------------------
-    robot = cfg["robot"]
-    if not isinstance(robot["urdf"], str) or not robot["urdf"]:
-        err("robot.urdf must be a non-empty string")
-    if not isinstance(robot["merge_fixed_links"], bool):
-        err("robot.merge_fixed_links must be a boolean")
-    for key in ("hand_link_name",):
-        if not isinstance(robot[key], str) or not robot[key]:
-            err(f"robot.{key} must be a non-empty string")
-    _str_list(robot["finger_link_names"], f"{source}: robot.finger_link_names", length=2)
-    arm_names = _str_list(robot["arm_joint_names"], f"{source}: robot.arm_joint_names")
-    finger_names = _str_list(robot["finger_joint_names"], f"{source}: robot.finger_joint_names", length=2)
-    _num_list(robot["tcp_offset"], f"{source}: robot.tcp_offset", 3)
-    _num(robot["open_finger_pos"], f"{source}: robot.open_finger_pos")
-    _num(robot["closed_finger_pos"], f"{source}: robot.closed_finger_pos")
-    _num_list(robot["base_pos"], f"{source}: robot.base_pos", 3)
-    _num_list(robot["base_quat"], f"{source}: robot.base_quat", 4)
-    qpos = robot["init_qpos"]
-    if not isinstance(qpos, (list, tuple)) or len(qpos) != len(arm_names) + len(finger_names):
-        err(f"robot.init_qpos must have {len(arm_names) + len(finger_names)} entries")
-    for i, v in enumerate(qpos):
-        _num(v, f"{source}: robot.init_qpos[{i}]")
-    for key in ("arm_kp", "arm_kv", "arm_force_min", "arm_force_max"):
-        values = _num_list(robot[key], f"{source}: robot.{key}", len(arm_names))
-        if key in ("arm_kp", "arm_kv") and any(v < 0.0 for v in values):
-            err(f"robot.{key} must be >= 0")
-    for key in ("finger_kp", "finger_kv", "finger_force_min", "finger_force_max"):
-        values = _num_list(robot[key], f"{source}: robot.{key}", len(finger_names))
-        if key in ("finger_kp", "finger_kv") and any(v < 0.0 for v in values):
-            err(f"robot.{key} must be >= 0")
-
-    controller = cfg["controller"]
-    for key in ("pos_scale_m", "rot_scale_rad", "ik_damping", "control_hz", "sim_dt"):
-        if _num(controller[key], f"{source}: controller.{key}") <= 0.0:
-            err(f"controller.{key} must be positive")
-    _int(controller["ik_max_iters"], f"{source}: controller.ik_max_iters", minimum=1)
-    _int(controller["ik_max_samples"], f"{source}: controller.ik_max_samples", minimum=1)
-    _int(controller["decimation"], f"{source}: controller.decimation", minimum=1)
-    if _num(controller["finger_speed_m_per_s"], f"{source}: controller.finger_speed_m_per_s") < 0.0:
-        err("controller.finger_speed_m_per_s must be >= 0")
-
-
-# --------------------------------------------------------------------- helpers
-
-
-def language_templates(cfg: TaskConfig) -> tuple[str, ...]:
-    """Every instruction phrasing; a single template is a one-tuple."""
-    template = cfg["language_template"]
-    return (template,) if isinstance(template, str) else tuple(template)
-
-
-def tray_floor_z(tray: dict[str, Any], table_height_m: float) -> float:
-    """World z of the cavity floor's top face — the surface a body rests on."""
-    return float(table_height_m) + float(tray["floor_m"]) - float(tray["fuse_m"])
-
-
-def tray_rim_z(tray: dict[str, Any], table_height_m: float) -> float:
-    """World z of the walls' top edge."""
-    return tray_floor_z(tray, table_height_m) + float(tray["rim_m"])
-
-
-# ---------------------------------------------------------------------- load
+    contact = cfg["contact"]
+    _check_keys(
+        contact,
+        required=frozenset(
+            {
+                "nominal_force_n",
+                "force_multipliers",
+                "force_band_n",
+                "seek_timeout_s",
+                "close_step_m",
+                "gain_m_per_n",
+                "brief_hold_s",
+                "fail_retreat_m",
+                "sample_every_sim_steps",
+            }
+        ),
+        optional=frozenset(),
+        where=f"{source}: contact",
+    )
+    if _num(contact["nominal_force_n"], f"{source}: contact.nominal_force_n") <= 0.0:
+        raise ValueError(f"{source}: contact.nominal_force_n 必须为正")
+    multipliers = contact["force_multipliers"]
+    if not isinstance(multipliers, (list, tuple)) or not multipliers:
+        raise ValueError(f"{source}: contact.force_multipliers 必须是非空列表")
+    for i, v in enumerate(multipliers):
+        if _num(v, f"{source}: contact.force_multipliers[{i}]") <= 0.0:
+            raise ValueError(f"{source}: contact.force_multipliers 必须为正")
+    for key in ("force_band_n", "seek_timeout_s", "close_step_m", "gain_m_per_n"):
+        if _num(contact[key], f"{source}: contact.{key}") <= 0.0:
+            raise ValueError(f"{source}: contact.{key} 必须为正")
+    _range(contact["brief_hold_s"], f"{source}: contact.brief_hold_s", positive=False)
+    _range(contact["fail_retreat_m"], f"{source}: contact.fail_retreat_m")
+    _int(contact["sample_every_sim_steps"], f"{source}: contact.sample_every_sim_steps", minimum=1)
 
 
 def load_task_config(path: str | Path) -> TaskConfig:
-    """Load one task YAML into a validated plain mapping."""
-    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(raw, dict):
-        raise ValueError(f"Task config must be a YAML mapping: {path}")
-    _validate(raw, str(path))
-    return raw
+    """加载任务配置，并把引用的物体/传感器配置展开进来。"""
+    cfg = _load_yaml(path, "任务配置")
+    _validate_task(cfg, str(path))
+    cfg = dict(cfg)
+    object_path = cfg["object"]
+    sensor_path = cfg["sensor"]
+    cfg["object"] = load_object_config(_repo_path(object_path))
+    cfg["sensor"] = load_sensor_config(_repo_path(sensor_path))
+    # 跨文件一致性：探测区域必须与资产清单的热区一一对应，平台材质必须存在。
+    order = set(cfg["object"]["region_order"])
+    if set(cfg["regions"]) != order:
+        raise ValueError(
+            f"{path}: regions 的键 {sorted(cfg['regions'])} 必须与资产清单的 "
+            f"region_order {sorted(order)} 一致"
+        )
+    platform_material = cfg["platform"]["material"]
+    if platform_material not in cfg["object"]["material_properties"]:
+        raise ValueError(f"{path}: platform.material = {platform_material!r} 不在物体配置的热物性表中")
+    # 数据生成器需要知道任务/物体/传感器配置文件的位置，写进元数据。
+    cfg["config_paths"] = {
+        "task": str(Path(path)),
+        "object": cfg["object"]["manifest_path"],
+        "sensor": str(_repo_path(sensor_path)),
+    }
+    return cfg
+
+
+# ------------------------------------------------------------------- 数据集配置
+
+_DATASET_REQUIRED = frozenset(
+    {
+        "dataset_version",
+        "output_dir",
+        "seed",
+        "sample_hz",
+        "training_hz",
+        "prefixes_s",
+        "region_temps_c",
+        "fingertip",
+        "force_levels",
+        "contact_quality_probabilities",
+        "sensor",
+        "splits",
+    }
+)
+
+
+def load_dataset_config(path: str | Path) -> dict[str, Any]:
+    """加载 ThermalContact-v1 数据采样配置。"""
+    source = str(path)
+    cfg = _load_yaml(path, "数据集配置")
+    _check_keys(cfg, required=_DATASET_REQUIRED, optional=frozenset(), where=source)
+    _str(cfg["dataset_version"], f"{source}: dataset_version")
+    _str(cfg["output_dir"], f"{source}: output_dir")
+    _int(cfg["seed"], f"{source}: seed")
+    for key in ("sample_hz", "training_hz"):
+        if _num(cfg[key], f"{source}: {key}") <= 0.0:
+            raise ValueError(f"{source}: {key} 必须为正")
+    if float(cfg["training_hz"]) > float(cfg["sample_hz"]):
+        raise ValueError(f"{source}: training_hz 不能高于 sample_hz")
+    prefixes = cfg["prefixes_s"]
+    if not isinstance(prefixes, (list, tuple)) or not prefixes:
+        raise ValueError(f"{source}: prefixes_s 必须是非空列表")
+    for i, v in enumerate(prefixes):
+        if _num(v, f"{source}: prefixes_s[{i}]") <= 0.0:
+            raise ValueError(f"{source}: prefixes_s 必须为正")
+    if list(prefixes) != sorted(prefixes):
+        raise ValueError(f"{source}: prefixes_s 必须递增")
+    # 四段 link 的 5 种温度情景：每个映射 = 区域名 -> [lo, hi]。
+    # 区域名与 region_order 的一致性在采样器里跨文件校验（此处只看结构）。
+    cases = cfg["region_temps_c"]
+    if not isinstance(cases, (list, tuple)) or not cases:
+        raise ValueError(f"{source}: region_temps_c 必须是非空列表（每种情景一个映射）")
+    for i, case in enumerate(cases):
+        if not isinstance(case, dict) or not case:
+            raise ValueError(f"{source}: region_temps_c[{i}] 必须是非空映射（区域名 -> [lo, hi]）")
+        for name, span in case.items():
+            _str(name, f"{source}: region_temps_c[{i}] 的键")
+            _range(span, f"{source}: region_temps_c[{i}].{name}", positive=False)
+
+    finger = cfg["fingertip"]
+    _check_keys(
+        finger,
+        required=frozenset(
+            {
+                "history_mode_c",
+                "history_probability",
+                "pair_delta_c",
+                "physical_range_c",
+            }
+        ),
+        optional=frozenset(),
+        where=f"{source}: fingertip",
+    )
+    _range(finger["history_mode_c"], f"{source}: fingertip.history_mode_c", positive=False)
+    _range(finger["pair_delta_c"], f"{source}: fingertip.pair_delta_c", positive=False)
+    _range(finger["physical_range_c"], f"{source}: fingertip.physical_range_c", positive=False)
+    p = _num(finger["history_probability"], f"{source}: fingertip.history_probability")
+    if not 0.0 <= p <= 1.0:
+        raise ValueError(f"{source}: fingertip.history_probability 必须在 [0, 1]")
+
+    levels = cfg["force_levels"]
+    if not isinstance(levels, (list, tuple)) or not levels:
+        raise ValueError(f"{source}: force_levels 必须是非空列表")
+    for i, v in enumerate(levels):
+        _num(v, f"{source}: force_levels[{i}]")
+
+    quality = cfg["contact_quality_probabilities"]
+    _check_keys(
+        quality,
+        required=frozenset({"stable", "brief", "failed"}),
+        optional=frozenset(),
+        where=f"{source}: contact_quality_probabilities",
+    )
+    qtotal = sum(_num(v, f"{source}: contact_quality_probabilities.{k}") for k, v in quality.items())
+    if abs(qtotal - 1.0) > 1e-6:
+        raise ValueError(f"{source}: contact_quality_probabilities 之和必须为 1，实际 {qtotal}")
+
+    sensor = cfg["sensor"]
+    _check_keys(
+        sensor,
+        required=frozenset({"rc_s", "noise_c", "bias_c", "quantization_c", "shift_test"}),
+        optional=frozenset(),
+        where=f"{source}: sensor",
+    )
+    # 三个乘性量（RC / 噪声 / 量化）用 multiplier_range 缩放名义值；
+    # 偏置是加性 °C，用 absolute_range。
+    for key in ("rc_s", "noise_c", "quantization_c"):
+        entry = sensor[key]
+        _check_keys(
+            entry,
+            required=frozenset({"nominal", "multiplier_range"}),
+            optional=frozenset(),
+            where=f"{source}: sensor.{key}",
+        )
+        _num(entry["nominal"], f"{source}: sensor.{key}.nominal")
+        lo, hi = _num_list(entry["multiplier_range"], f"{source}: sensor.{key}.multiplier_range", 2)
+        if lo <= 0.0 or lo > hi:
+            raise ValueError(f"{source}: sensor.{key}.multiplier_range 必须是正区间 [lo, hi]")
+    bias = sensor["bias_c"]
+    _check_keys(
+        bias,
+        required=frozenset({"nominal", "absolute_range"}),
+        optional=frozenset(),
+        where=f"{source}: sensor.bias_c",
+    )
+    _num(bias["nominal"], f"{source}: sensor.bias_c.nominal")
+    _range(bias["absolute_range"], f"{source}: sensor.bias_c.absolute_range", positive=False)
+    shift = sensor["shift_test"]
+    _check_keys(
+        shift,
+        required=frozenset(
+            {
+                "rc_multiplier_range",
+                "noise_multiplier_range",
+                "quantization_multiplier_range",
+                "bias_absolute_range",
+            }
+        ),
+        optional=frozenset(),
+        where=f"{source}: sensor.shift_test",
+    )
+    for key in ("rc_multiplier_range", "noise_multiplier_range", "quantization_multiplier_range"):
+        lo, hi = _num_list(shift[key], f"{source}: sensor.shift_test.{key}", 2)
+        if lo <= 0.0 or lo > hi:
+            raise ValueError(f"{source}: sensor.shift_test.{key} 必须是正区间")
+    _range(shift["bias_absolute_range"], f"{source}: sensor.shift_test.bias_absolute_range", positive=False)
+
+    splits = cfg["splits"]
+    if not isinstance(splits, dict) or not splits:
+        raise ValueError(f"{source}: splits 必须是非空映射")
+    for name, count in splits.items():
+        _str(name, f"{source}: splits 的键")
+        _int(count, f"{source}: splits.{name}", minimum=0)
+    return cfg
+
+
+__all__ = [
+    "REPO_ROOT",
+    "TaskConfig",
+    "load_dataset_config",
+    "load_object_config",
+    "load_sensor_config",
+    "load_task_config",
+]

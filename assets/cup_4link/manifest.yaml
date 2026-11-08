@@ -1,0 +1,46 @@
+asset_version: cup4link-v1
+urdf_file: cup_4link.urdf
+region_order:
+- lower
+- middle
+- upper
+- handle
+regions:
+  lower:
+    link: lower
+    z_span_m:
+    - 0.0
+    - 0.03666666666666667
+  middle:
+    link: middle
+    z_span_m:
+    - 0.03666666666666667
+    - 0.07333333333333333
+  upper:
+    link: upper
+    z_span_m:
+    - 0.07333333333333333
+    - 0.11
+  handle:
+    link: handle
+    z_span_m:
+    - 0.021045339068568834
+    - 0.09095466093143117
+link_names:
+- lower
+- middle
+- upper
+- handle
+base_euler_deg:
+- 0.0
+- 0.0
+- 90.0
+mass_kg: 0.22000000000000003
+aabb_min_m:
+- -0.065
+- -0.03
+- 0.0
+aabb_max_m:
+- 0.03
+- 0.03
+- 0.11

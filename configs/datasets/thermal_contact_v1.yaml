@@ -1,0 +1,66 @@
+# ThermalContact-v1 数据采样规则（第一阶段：单区域接触）。
+#
+# 每集只探测一个区域；四段 link 的初始温度从 5 种固定情景中选一种，
+# 每段在情景给定的区间内均匀采样。划分按完整参数组合生成（manifest），
+# 绝不按帧切分。
+dataset_version: thermalcontact-v1
+output_dir: datasets/thermal_contact_v1
+seed: 20261108
+
+# 原始记录 100 Hz；训练集重采样到 50 Hz（加载器负责）。
+sample_hz: 100.0
+training_hz: 50.0
+# 一次前向用的历史前缀；每个前缀都保留在同一个划分里。
+prefixes_s: [0.10, 0.20, 0.30, 0.50]
+
+# 四段 link 的初始温度：5 种情景，每集随机选一种；
+# 每种情景里每一段在给定区间内均匀采样（°C）。
+#   1 高温梯度：lower 65–70 → handle 30–40
+#   2 中高温梯度：lower 65–70 → handle 27–35
+#   3 温热梯度：lower 55–60 → handle 27–33
+#   4 微温梯度：lower 35–40 → handle 25–27
+#   5 把手局部高温：handle 47–55，其余接近室温
+region_temps_c:
+  - {lower: [65.0, 70.0], middle: [55.0, 60.0], upper: [50.0, 55.0], handle: [30.0, 40.0]}
+  - {lower: [65.0, 70.0], middle: [45.0, 55.0], upper: [35.0, 40.0], handle: [27.0, 35.0]}
+  - {lower: [55.0, 60.0], middle: [37.0, 45.0], upper: [30.0, 35.0], handle: [27.0, 33.0]}
+  - {lower: [35.0, 40.0], middle: [30.0, 33.0], upper: [25.0, 27.0], handle: [25.0, 27.0]}
+  - {lower: [31.0, 34.0], middle: [29.0, 30.0], upper: [26.0, 28.0], handle: [47.0, 55.0]}
+
+# 指尖初始温度：70% 直接初始化在常温（取传感器配置的 ambient_temp_c），
+# 30% 携带历史余温。初始化后读数即为该温度，记录不含收敛过渡。
+fingertip:
+  history_mode_c: [15.0, 40.0]
+  history_probability: 0.3
+  pair_delta_c: [-1.5, 1.5]    # 仅 history 分支：左右指尖的小差异
+  physical_range_c: [10.0, 45.0]
+
+# 力档位：目标法向力 = nominal_force_n × 档位，实际力逐帧记录。
+force_levels: [0.7, 1.0, 1.3]
+
+# 接触质量：80% 稳定 / 10% 短暂或低力 / 10% 失败（未接触）。
+contact_quality_probabilities: {stable: 0.8, brief: 0.1, failed: 0.1}
+
+# 传感器随机化：乘性范围缩放名义值；偏置为加性 °C。
+sensor:
+  rc_s: {nominal: 0.05, multiplier_range: [0.8, 1.2]}
+  noise_c: {nominal: 0.05, multiplier_range: [0.8, 1.2]}
+  quantization_c: {nominal: 0.1, multiplier_range: [0.8, 1.2]}
+  bias_c: {nominal: 0.0, absolute_range: [-0.01, 0.01]}
+  # 传感器漂移测试集：范围明显更宽。
+  shift_test:
+    rc_multiplier_range: [0.6, 1.5]
+    noise_multiplier_range: [0.6, 1.5]
+    quantization_multiplier_range: [0.6, 1.5]
+    bias_absolute_range: [-0.05, 0.05]
+
+# 各划分集数（缩小规模：训练集 20k → 12k，总计 15.2k；原设计 36k）。
+splits:
+  train: 12000
+  validation: 2000
+  test_id: 400
+  test_finger_history: 300
+  test_sensor_shift: 300
+  test_mixed_contact: 200
+  # 试生产：4 区域 × 250。
+  pilot: 1000

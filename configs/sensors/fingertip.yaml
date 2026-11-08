@@ -1,0 +1,15 @@
+# 指尖温度传感器：官方集总 (1,1,1) 单胞 + 测量通道非理想性。
+#
+# 物体侧没有温度网格：四连杆杯子的热状态是每个 link 一个集总温度，
+# 由生成器逐集写入引擎共享的 link_temps 表。
+finger_grid: [1, 1, 1]
+object_grid: null
+# 室温：材料基准温度，也是 70% 集数的指尖初始温度。
+ambient_temp_c: 25.0
+
+# 名义值；每集的随机化范围在 datasets/thermal_contact_v1.yaml 里采样。
+nominal:
+  rc_s: 0.05            # 一阶 RC 时间常数（秒）
+  noise_c: 0.05         # 白噪声标准差（°C）
+  bias_c: 0.0           # 固定偏置（°C）
+  quantization_c: 0.1   # 量化步长（°C）

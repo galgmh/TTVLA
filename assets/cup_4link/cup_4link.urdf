@@ -1,0 +1,78 @@
+<?xml version="1.0"?>
+<robot name="cup_4link">
+  <link name="lower">
+    <inertial>
+      <origin xyz="2.9220873e-19 -4.67533967e-18 0.0138448607" rpy="0 0 0"/>
+      <mass value="0.0837628298"/>
+      <inertia ixx="3.66945625e-05" ixy="5.73661642e-23" ixz="8.42417438e-22" iyy="3.66945625e-05" iyz="1.10507475e-21" izz="5.23138016e-05"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="meshes/lower.obj"/></geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="meshes/lower.obj"/></geometry>
+    </collision>
+  </link>
+  <link name="middle">
+    <inertial>
+      <origin xyz="6.98322515e-19 -8.18431941e-19 0.055" rpy="0 0 0"/>
+      <mass value="0.0584167286"/>
+      <inertia ixx="2.87527034e-05" ixy="5.29043515e-22" ixz="3.62044237e-21" iyy="2.87527034e-05" iyz="9.89541435e-22" izz="4.44157324e-05"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="meshes/middle.obj"/></geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="meshes/middle.obj"/></geometry>
+    </collision>
+  </link>
+  <link name="upper">
+    <inertial>
+      <origin xyz="6.98322515e-19 -8.18431941e-19 0.0916666667" rpy="0 0 0"/>
+      <mass value="0.0584167286"/>
+      <inertia ixx="2.87527034e-05" ixy="5.29043515e-22" ixz="-1.35979056e-22" iyy="2.87527034e-05" iyz="-3.20509374e-21" izz="4.44157324e-05"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="meshes/upper.obj"/></geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="meshes/upper.obj"/></geometry>
+    </collision>
+  </link>
+  <link name="handle">
+    <inertial>
+      <origin xyz="-0.0465291251 -7.22688493e-20 0.056" rpy="0 0 0"/>
+      <mass value="0.0194037131"/>
+      <inertia ixx="7.99033401e-06" ixy="-1.13225463e-22" ixz="-1.2238115e-20" iyy="9.66835772e-06" iyz="2.98304054e-23" izz="1.90512937e-06"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="meshes/handle.obj"/></geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="meshes/handle_collision.obj"/></geometry>
+    </collision>
+  </link>
+  <joint name="lower_middle" type="fixed">
+    <parent link="lower"/>
+    <child link="middle"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+  <joint name="middle_upper" type="fixed">
+    <parent link="middle"/>
+    <child link="upper"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+  <joint name="middle_handle" type="fixed">
+    <parent link="middle"/>
+    <child link="handle"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+</robot>

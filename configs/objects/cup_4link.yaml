@@ -1,0 +1,22 @@
+# 四连杆杯子资产（lower / middle / upper / handle 四个热节点，固定关节焊成刚体）。
+#
+# 资产几何、区域顺序和 link 名称的唯一来源是 assets/cup_4link/manifest.yaml
+# （由 scripts/build_cup_4link.py 生成）；本文件只描述“怎么摆放、什么材质”。
+manifest: assets/cup_4link/manifest.yaml
+
+# 物体热物性；陶瓷用于杯体所有 link，平台材质供场景里的抬升平台使用。
+material: ceramic
+material_properties:
+  ceramic: {conductivity: 1.5, density: 2300.0, specific_heat: 900.0, emissivity: 0.0}
+  platform: {conductivity: 0.2, density: 700.0, specific_heat: 1200.0, emissivity: 0.0}
+
+# 放置：坐在 60 mm 高的平台上（rest_height_m），槽位相对桌面中心。
+# place_object 用 AABB 中心对齐槽位；杯子的 AABB 因手柄偏向 -y，
+# 所以杯体轴线会落在槽位 +17.5 mm 处。
+place_xy: [-0.08, 0.0]
+rest_height_m: 0.06
+# 每集姿态抖动：热接触任务要求接触区域内的小范围随机化，
+# 位置/朝向扰动由采样器逐集抽取。
+xy_jitter_m: 0.004
+yaw_jitter_rad: 0.03
+color: [0.85, 0.84, 0.80]
