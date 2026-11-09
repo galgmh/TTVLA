@@ -5,6 +5,7 @@
     python scripts/generate_all.py --workers 4                # 本地 4 进程
     python scripts/generate_all.py --workers 12 --chunk 200   # 云端 12 进程
     python scripts/generate_all.py --splits train --chunk 20 --limit 240   # 测速
+    python scripts/generate_all.py --splits train --start 6000             # 多卡分片：train 后一半
 
 每个分块调用一次 ``scripts/generate_thermal_contact.py``；已存在的文件由
 ``--skip-existing`` 跳过，中断后重跑同一条命令即可续跑。
@@ -51,8 +52,13 @@ def build_jobs(
     counts: dict[str, int],
     chunk: int,
     limit: int | None,
+    start: int = 0,
 ) -> list[tuple[str, int, int]]:
-    """把每个划分切成 ``chunk`` 大小的块；``limit`` 限制总集数（测速用）。"""
+    """把每个划分切成 ``chunk`` 大小的块。
+
+    ``limit`` 限制总集数（测速用）；``start`` 让每个划分从第 N 集开始，
+    用于多卡分片（两张卡各跑一半，索引范围不重叠，配合 --skip-existing）。
+    """
     jobs: list[tuple[str, int, int]] = []
     remaining = limit
     for split in splits:
@@ -60,14 +66,15 @@ def build_jobs(
         if total <= 0:
             print(f"警告：划分 {split} 在数据集配置里没有集数，跳过")
             continue
-        for start in range(0, total, chunk):
+        begin = min(max(start, 0), total)
+        for offset in range(begin, total, chunk):
             if remaining is not None and remaining <= 0:
                 return jobs
-            count = min(chunk, total - start)
+            count = min(chunk, total - offset)
             if remaining is not None:
                 count = min(count, remaining)
                 remaining -= count
-            jobs.append((split, start, count))
+            jobs.append((split, offset, count))
     return jobs
 
 
@@ -124,6 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=4, help="并行进程数；GPU 计算饱和后收益递减")
     parser.add_argument("--chunk", type=int, default=200, help="每个进程一次生成的集数")
     parser.add_argument("--limit", type=int, default=None, help="总共只生成 N 集（测速用）")
+    parser.add_argument("--start", type=int, default=0, help="每个划分从第 N 集开始（多卡分片用）")
     parser.add_argument("--out", default=None, help="输出根目录（默认取数据集配置 output_dir）")
     parser.add_argument("--log-dir", default="logs/generate_all", help="每个分块的日志目录")
     parser.add_argument("--dry-run", action="store_true", help="只打印分块计划")
@@ -132,6 +140,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    # 重定向到文件时 stdout 默认块缓冲，nohup 下进度会延迟很久才出现；改为行缓冲。
+    sys.stdout.reconfigure(line_buffering=True)
     if args.workers < 1 or args.chunk < 1:
         raise SystemExit("--workers 和 --chunk 必须 >= 1")
 
@@ -149,7 +159,7 @@ def main() -> int:
                 "请先重新生成清单（scripts/generate_contact_manifests.py）"
             )
 
-    jobs = build_jobs(args.splits, counts, args.chunk, args.limit)
+    jobs = build_jobs(args.splits, counts, args.chunk, args.limit, args.start)
     total_eps = sum(job[2] for job in jobs)
     print(
         f"划分 {len(args.splits)} 个，分块 {len(jobs)} 个，共 {total_eps} 集；"
