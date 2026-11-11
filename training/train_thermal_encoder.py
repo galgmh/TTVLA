@@ -37,6 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--val-split", default=None, help="覆盖验证划分目录名")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None, help="覆盖学习率")
     parser.add_argument("--limit-train", type=int, default=None, help="只用前 N 个训练文件")
     parser.add_argument("--limit-val", type=int, default=None)
     parser.add_argument("--stats", default=None, help="已有的归一化统计 JSON")
@@ -66,6 +67,10 @@ def dataset_for(files: list[Path], data_cfg: dict, stats: dict | None) -> Therma
         training_hz=training_hz,
         stride=stride,
         stats=stats,
+        # 全量缓存：DataLoader 打乱后逐样本取数，默认缓存 8 个文件时几乎每个
+        # 样本都要重读一遍 HDF5（实测 3.5 ms/文件、每集约 37 个窗口，一个
+        # epoch 要十几分钟）。每集窗口约 55 KB，6000 集约 350 MB。
+        cache_size=max(8, len(files)),
     )
 
 
@@ -116,6 +121,8 @@ def main() -> int:
         train_cfg["epochs"] = args.epochs
     if args.batch_size is not None:
         train_cfg["batch_size"] = args.batch_size
+    if args.lr is not None:
+        train_cfg["learning_rate"] = args.lr
     if args.device is not None:
         train_cfg["device"] = args.device
 
@@ -221,6 +228,10 @@ def main() -> int:
         else:
             score = train_loss
         history.append(row)
+        # 每个 epoch 都落盘，训练中途也能画曲线。
+        out_path.with_suffix(".history.json").write_text(
+            json.dumps(history, indent=2), encoding="utf-8"
+        )
         if score < best:
             best = score
             torch.save(
@@ -237,9 +248,6 @@ def main() -> int:
             )
             print(f"  已保存 {out_path}")
 
-    (out_path.with_suffix(".history.json")).write_text(
-        json.dumps(history, indent=2), encoding="utf-8"
-    )
     print(f"完成：最佳分数 {best:.4f}，checkpoint {out_path}")
     return 0
 
