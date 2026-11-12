@@ -1,6 +1,6 @@
 """因果时序卷积：把每次短时接触的温度/力序列编码成局部热觉 token。
 
-输入只包含传感器时序（[B, K, L, C]）与时间 mask；接触坐标、候选点和
+输入只包含当前传感器滑动窗口（[B,L,C]）与时间 mask；接触坐标和
 link 身份都不进入该编码器，防止用位置代替热响应完成温度预测。
 """
 
@@ -39,9 +39,8 @@ class ThermalContactEncoder(nn.Module):
     """4 层因果膨胀卷积 + masked mean/last-valid pooling。
 
     输入:
-        history:   [B, K, L, C]
-        time_mask: [B, K, L]，True 表示该帧有效
-        contact_mask: [B, K]，True 表示该次历史接触存在（K 允许为 0）
+        window:    [B,L,C]
+        time_mask: [B,L]，True 表示该帧有效
     """
 
     def __init__(
@@ -90,33 +89,26 @@ class ThermalContactEncoder(nn.Module):
 
     def forward(
         self,
-        history: torch.Tensor,
+        window: torch.Tensor,
         time_mask: torch.Tensor,
-        contact_mask: torch.Tensor,
     ) -> ContactEncoderOutput:
-        b, k, length, channels = history.shape
-        if k == 0:
-            # K=0 是合法输入（尚无历史接触）：直接返回空张量，后续由 NO_CONTACT token 处理。
-            zeros = history.new_zeros((b, 0, self.temp_mean_head.in_features))
-            empty = history.new_zeros((b, 0, 1))
-            return ContactEncoderOutput(
-                latent=zeros,
-                temp_mean_c=empty,
-                temp_logvar=empty.clone(),
-                valid_logit=empty.clone(),
+        if window.dim() != 3 or time_mask.shape != window.shape[:2]:
+            raise ValueError(
+                f"window/time_mask必须为[B,L,C]/[B,L]，得到{tuple(window.shape)}/{tuple(time_mask.shape)}"
             )
-
-        h = history.reshape(b * k, length, channels).transpose(1, 2)  # [M, C, L]
-        # 无效接触整体屏蔽：不影响其它接触，也不产生虚假池化。
-        valid_contact = contact_mask.reshape(b * k, 1, 1).to(h.dtype)
-        m = time_mask.reshape(b * k, length).to(h.dtype).unsqueeze(1) * valid_contact
+        b, _, _ = window.shape
+        h = window.transpose(1, 2)  # [B,C,L]
+        m = time_mask.to(h.dtype).unsqueeze(1)
+        # 必须在第一层卷积前清零无效帧；右对齐窗口的无效前缀属于卷积历史，
+        # 若只在卷积后mask，其任意内容会泄漏到后续有效帧。
+        h = h * m
         for block in self.blocks:
             h = block(h, m)
 
         mask_bool = m.squeeze(1) > 0.5
         pooled = torch.cat([self._masked_mean(h, mask_bool), self._last_valid(h, mask_bool)], dim=-1)
 
-        latent = self.project(pooled).view(b, k, -1)
+        latent = self.project(pooled).view(b, -1)
         return ContactEncoderOutput(
             latent=latent,
             temp_mean_c=self.temp_mean_head(latent),

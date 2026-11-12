@@ -34,6 +34,7 @@ import torch
 
 from models.pi05.observation import Observation
 from models.pi05.pi0_pytorch import PI0Pytorch, load_state_dict_compat
+from models.thermal_encoder import load_contact_encoder_checkpoint
 from training.pi05.thermal.finetune import configure_stage, parameter_groups, stage_loss_keys
 from training.pi05.thermal.labels import build_thermal_supervision
 from training.pi05.thermal.step import thermal_train_step
@@ -170,11 +171,13 @@ def train_loop(config: TrainConfig) -> None:
     # ---- 数据 -------------------------------------------------------------
     loader, normalizer = build_dataloader(config, shuffle=True)
     logger.info(
-        "数据：kind=%s 批大小=%d 样本数=%d 图像键=%s",
+        "数据：kind=%s 批大小=%d 样本数=%d 图像键=%s | 机器人动作=%dD -> π0.5内部=%dD",
         config.data.kind,
         config.data.batch_size,
         len(loader.dataset),
         config.data.image_keys,
+        config.data.action_dim,
+        config.model.action_dim,
     )
 
     # ---- 模型 -------------------------------------------------------------
@@ -189,6 +192,16 @@ def train_loop(config: TrainConfig) -> None:
             raise FileNotFoundError(f"找不到预训练权重：{weights}")
         load_state_dict_compat(model, safetensors.torch.load_file(weights, device=str(device)))
         logger.info("已加载预训练权重：%s", weights)
+
+    if config.thermal_contact_checkpoint is not None:
+        if not hasattr(model, "thermal_encoder"):
+            raise ValueError("thermal_contact_checkpoint 需要 model.thermal.enabled=true")
+        contact_checkpoint = pathlib.Path(config.thermal_contact_checkpoint)
+        if not contact_checkpoint.exists():
+            raise FileNotFoundError(f"找不到单触点预训练权重：{contact_checkpoint}")
+        payload = torch.load(contact_checkpoint, map_location=device, weights_only=True)
+        load_contact_encoder_checkpoint(model.thermal_encoder.contact_encoder, payload)
+        logger.info("已严格迁入共享单触点编码器权重：%s", contact_checkpoint)
 
     thermal_stage = config.thermal_stage
     thermal_loss_keys = stage_loss_keys(thermal_stage) if thermal_stage is not None else None

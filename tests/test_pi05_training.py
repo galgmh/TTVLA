@@ -42,7 +42,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 CONFIG_DIR = ROOT / "configs" / "training"
 SMOKE_CONFIG = CONFIG_DIR / "pi05_thermal_smoke.yaml"
 
-THERMAL = ThermalPi0Config(enabled=True, history_size=2, window_size=4, signal_dim=6, num_surface_points=5)
+THERMAL = ThermalPi0Config(enabled=True, memory_size=2, window_size=4, signal_dim=6)
 
 
 class ConfigTest(unittest.TestCase):
@@ -51,7 +51,8 @@ class ConfigTest(unittest.TestCase):
             config = load_train_config(CONFIG_DIR / f"pi05_thermal_stage{stage}.yaml")
             self.assertEqual(config.thermal_stage, stage)
             self.assertEqual(config.model.thermal.enabled, True)  # noqa: E712
-            self.assertEqual(config.data.action_dim, config.model.action_dim)
+            self.assertEqual(config.model.action_dim, 32)
+            self.assertEqual(config.data.action_dim, 7)
             self.assertEqual(config.data.action_horizon, config.model.action_horizon)
 
     def test_unknown_key_rejected(self) -> None:
@@ -77,8 +78,9 @@ class DataTest(unittest.TestCase):
         sample = dataset[0]
         self.assertEqual(sample["image"]["base_0_rgb"].shape, (32, 32, 3))
         self.assertEqual(sample["actions"].shape, (4, 7))
-        self.assertEqual(sample["thermal_history"].shape, (2, 4, 6))
-        self.assertEqual(sample["surface_xyz_obj"].shape, (5, 3))
+        self.assertEqual(sample["thermal_window"].shape, (4, 6))
+        self.assertEqual(sample["sensor_xyz_base"].shape, (3,))
+        self.assertEqual(sample["thermal_supervision"]["field_query_xyz_base"].shape, (16, 3))
         self.assertEqual(sample["thermal_supervision"]["strategy_type"].shape, ())
         self.assertTrue(all(key in sample["thermal_supervision"] for key in SUPERVISION_FIELDS))
 
@@ -94,15 +96,20 @@ class DataTest(unittest.TestCase):
             thermal=THERMAL,
         )
         tokenizer = PaligemmaTokenizer(max_len=16)
-        normalizer = Normalizer.identity(7, 7)
+        # LIBERO 风格：state=8、robot action=7，进入 π0.5 后都补到 32。
+        normalizer = Normalizer.identity(8, 7)
+        raw_samples = [dataset[index] for index in range(2)]
+        for sample in raw_samples:
+            sample["state"] = np.linspace(-1, 1, 8, dtype=np.float32)
         samples = [
             prepare_sample(
-                dataset[index],
+                raw_samples[index],
                 normalizer=normalizer,
                 tokenizer=tokenizer,
                 image_keys=("base_0_rgb",),
                 action_dim=7,
                 action_horizon=6,
+                model_action_dim=32,
             )
             for index in range(2)
         ]
@@ -110,10 +117,14 @@ class DataTest(unittest.TestCase):
         self.assertEqual(batch["image"]["base_0_rgb"].shape, (2, 32, 32, 3))
         self.assertEqual(batch["image"]["base_0_rgb"].dtype, torch.uint8)
         self.assertEqual(batch["tokenized_prompt"].shape, (2, 16))
-        self.assertEqual(batch["thermal_history"].shape, (2, 2, 4, 6))
-        self.assertEqual(batch["thermal_history_time_mask"].dtype, torch.bool)
+        self.assertEqual(batch["state"].shape, (2, 32))
+        self.assertEqual(batch["actions"].shape, (2, 6, 32))
+        self.assertTrue(torch.count_nonzero(batch["state"][:, 8:]) == 0)
+        self.assertTrue(torch.count_nonzero(batch["actions"][:, :, 7:]) == 0)
+        self.assertEqual(batch["thermal_window"].shape, (2, 4, 6))
+        self.assertEqual(batch["thermal_window_time_mask"].dtype, torch.bool)
         self.assertEqual(batch["thermal_supervision"]["strategy_type"].shape, (2,))
-        self.assertEqual(batch["thermal_supervision"]["surface_temp_mask"].dtype, torch.bool)
+        self.assertEqual(batch["thermal_supervision"]["field_query_mask"].dtype, torch.bool)
 
     def test_hdf5_dataset_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -124,7 +135,7 @@ class DataTest(unittest.TestCase):
             self.assertEqual(sample["image"]["base_0_rgb"].shape, (32, 32, 3))
             self.assertEqual(sample["actions"].shape, (6, 7))
             self.assertEqual(sample["prompt"], "pick the cold block")
-            self.assertEqual(sample["thermal_history"].shape, (2, 4, 6))
+            self.assertEqual(sample["thermal_window"].shape, (4, 6))
             self.assertEqual(sample["thermal_supervision"]["strategy_type"].shape, ())
             states, actions = dataset.stats()
             self.assertEqual(states.shape, (3, 8))
@@ -135,32 +146,23 @@ class DataTest(unittest.TestCase):
         rng = np.random.default_rng(0)
         with h5py.File(path, "w") as f:
             f.attrs["language_instruction"] = "pick the cold block"
+            f.attrs["thermal_strategy_schema"] = "probe-grasp-retract-abort-v1"
             images = f.create_group("images")
             images.create_dataset("base_0_rgb", data=rng.integers(0, 256, (3, 32, 32, 3), dtype=np.uint8))
             f.create_dataset("state", data=rng.uniform(-1, 1, (3, 8)).astype(np.float32))
             f.create_dataset("actions", data=rng.uniform(-1, 1, (3, 6, 7)).astype(np.float32))
             thermal = f.create_group("thermal")
-            thermal.create_dataset("thermal_history", data=rng.uniform(-5, 45, (3, 2, 4, 6)).astype(np.float32))
-            thermal.create_dataset("thermal_history_time_mask", data=np.ones((3, 2, 4), dtype=bool))
-            thermal.create_dataset("contact_mask", data=np.ones((3, 2), dtype=bool))
-            thermal.create_dataset("contact_xyz_obj", data=rng.uniform(-1, 1, (3, 2, 3)).astype(np.float32))
-            thermal.create_dataset("contact_normal_obj", data=rng.uniform(-1, 1, (3, 2, 3)).astype(np.float32))
-            thermal.create_dataset("contact_age_s", data=rng.uniform(0, 5, (3, 2, 1)).astype(np.float32))
-            thermal.create_dataset("surface_xyz_obj", data=rng.uniform(-1, 1, (3, 5, 3)).astype(np.float32))
-            thermal.create_dataset("surface_normal_obj", data=rng.uniform(-1, 1, (3, 5, 3)).astype(np.float32))
-            thermal.create_dataset("surface_mask", data=np.ones((3, 5), dtype=bool))
-            thermal.create_dataset("surface_reachable", data=np.ones((3, 5), dtype=bool))
-            thermal.create_dataset("surface_grasp_score", data=rng.uniform(0, 1, (3, 5, 1)).astype(np.float32))
-            thermal.create_dataset("ee_xyz_obj", data=rng.uniform(-1, 1, (3, 3)).astype(np.float32))
-            thermal.create_dataset("probe_budget_remaining", data=np.ones((3, 1), dtype=np.float32))
+            thermal.create_dataset("thermal_window", data=rng.uniform(-5, 45, (3, 4, 6)).astype(np.float32))
+            thermal.create_dataset("thermal_window_time_mask", data=np.ones((3, 4), dtype=bool))
+            thermal.create_dataset("sensor_xyz_base", data=rng.uniform(-1, 1, (3, 3)).astype(np.float32))
+            thermal.create_dataset("sensor_normal_base", data=rng.uniform(-1, 1, (3, 3)).astype(np.float32))
             supervision = f.create_group("supervision")
-            supervision.create_dataset("contact_temp_c", data=rng.uniform(-5, 45, (3, 2, 1)).astype(np.float32))
-            supervision.create_dataset("contact_valid", data=np.ones((3, 2, 1), dtype=np.float32))
-            supervision.create_dataset("surface_temp_c", data=rng.uniform(-5, 45, (3, 5, 1)).astype(np.float32))
-            supervision.create_dataset("surface_temp_mask", data=np.ones((3, 5), dtype=bool))
-            supervision.create_dataset("surface_safe", data=rng.uniform(0, 1, (3, 5, 1)).astype(np.float32))
+            supervision.create_dataset("contact_temp_c", data=rng.uniform(-5, 45, (3, 1)).astype(np.float32))
+            supervision.create_dataset("contact_valid", data=np.ones((3, 1), dtype=np.float32))
+            supervision.create_dataset("field_query_xyz_base", data=rng.uniform(-1, 1, (3, 5, 3)).astype(np.float32))
+            supervision.create_dataset("field_query_temp_c", data=rng.uniform(-5, 45, (3, 5, 1)).astype(np.float32))
+            supervision.create_dataset("field_query_mask", data=np.ones((3, 5), dtype=bool))
             supervision.create_dataset("strategy_type", data=np.zeros((3,), dtype=np.int64))
-            supervision.create_dataset("target_surface_index", data=np.zeros((3,), dtype=np.int64))
 
     def test_pad_or_trim(self) -> None:
         values = np.arange(6, dtype=np.float32).reshape(3, 2)
@@ -169,6 +171,18 @@ class DataTest(unittest.TestCase):
         np.testing.assert_array_equal(padded[3:], np.repeat(values[-1:], 2, axis=0))
         trimmed = pad_or_trim(values, 2)
         np.testing.assert_array_equal(trimmed, values[:2])
+
+    def test_denormalize_crops_internal_action_padding(self) -> None:
+        normalizer = Normalizer(
+            state_mean=np.zeros(7, dtype=np.float32),
+            state_std=np.ones(7, dtype=np.float32),
+            action_mean=np.arange(7, dtype=np.float32),
+            action_std=np.full(7, 2.0, dtype=np.float32),
+        )
+        internal = np.ones((2, 4, 32), dtype=np.float32)
+        physical = normalizer.denormalize_actions(internal)
+        self.assertEqual(physical.shape, (2, 4, 7))
+        np.testing.assert_allclose(physical[0, 0], np.arange(7, dtype=np.float32) + 2.0)
 
 
 @unittest.skipUnless(DEFAULT_TOKENIZER_PATH.exists(), "缺少 paligemma tokenizer")

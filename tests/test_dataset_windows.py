@@ -18,15 +18,21 @@ from data.datasets.thermal_contact_dataset import (  # noqa: E402
     window_end_times,
 )
 from data.datasets.window_dataset import ThermalWindowDataset, compute_stats as stats_stream  # noqa: E402
-from data.schema.thermal_contact_v1 import ENCODER_INPUT_CHANNELS, empty_episode  # noqa: E402
+from data.schema.thermal_contact_v1 import ENCODER_INPUT_CHANNELS  # noqa: E402
 from data.writer.hdf5_writer import write_episode  # noqa: E402
+from data.writer.recorder import EpisodeRecorder  # noqa: E402
 
 PREFIXES = [0.10, 0.20, 0.30, 0.50]
 
 
 def _write_episode(path: Path, *, target_region: int, contact_start: float, contact_end: float, link_temps):
     """写一集 2 s / 100 Hz 的合成数据：接触段由时间决定。"""
-    buffers = empty_episode()
+    recorder = EpisodeRecorder(target_region=target_region)
+    recorder.set_camera_calibration({
+        "base_0_intrinsics": np.eye(3), "wrist_0_intrinsics": np.eye(3),
+        "base_0_pose": np.array([0.8, 0.0, 0.8, 1.0, 0.0, 0.0, 0.0]),
+        "hand_to_wrist_camera": np.eye(4),
+    })
     dt = 0.01
     frames = 200
     for i in range(frames):
@@ -36,29 +42,36 @@ def _write_episode(path: Path, *, target_region: int, contact_start: float, cont
         mask = np.zeros((2, 4), dtype=bool)
         if inside and target_region >= 0:
             mask[0, target_region] = True
-        buffers["time/sim_time"].append(t)
-        buffers["obs/fingertip_temp"].append(np.array([temp, temp + 0.4]))
-        buffers["obs/contact_force_world"].append(np.array([[0.0, 0.0, -1.0], [0.0, 0.0, -1.0]]) * inside)
-        buffers["obs/contact_normal_force"].append(np.array([1.5, 1.2]) * inside)
-        buffers["obs/contact_mask"].append(np.array([inside, inside]))
-        buffers["obs/gripper_width"].append(0.06)
-        buffers["obs/finger_joint_position"].append(np.array([0.03, 0.03]))
-        buffers["obs/eef_pose"].append(np.array([0.3, 0.0, 0.5, 1.0, 0.0, 0.0, 0.0]))
-        buffers["obs/contact_area"].append(np.array([1e-4, 1e-4]) * inside)
-        buffers["action/eef_target"].append(np.array([0.3, 0.0, 0.5, 1.0, 0.0, 0.0, 0.0]))
-        buffers["action/gripper_target"].append(0.06)
-        buffers["action/target_force"].append(2.0)
-        buffers["action/probe_region"].append(target_region)
-        buffers["action/phase"].append(4 if inside else 2)
-        buffers["privileged/link_temp"].append(np.asarray(link_temps, dtype=np.float64))
-        buffers["privileged/contact_link_mask"].append(mask)
-        buffers["privileged/pure_contact"].append(bool(inside) and target_region >= 0)
-        buffers["privileged/contact_valid"].append(bool(inside))
+        sensor_index = recorder.add_sensor(
+            sim_time=t,
+            tactile={
+                "fingertip_temp": np.array([temp, temp + 0.4]),
+                "contact_force_link": np.array([[0.0, -1.5, 0.0], [0.0, 1.2, 0.0]]) * inside,
+                "contact_normal_force": np.array([1.5, 1.2]) * inside,
+                "contact_mask": np.array([inside, inside]),
+                "contact_area": np.array([1e-4, 1e-4]) * inside,
+                "sensor_position_base": np.array([[0.4, -0.03, 0.5], [0.4, 0.03, 0.5]]),
+                "sensor_normal_base": np.array([[0.0, 1.0, 0.0], [0.0, -1.0, 0.0]]),
+            },
+            privileged={"link_temp": np.asarray(link_temps), "contact_link_mask": mask},
+        )
+        if i % 5 == 0:
+            pose = np.array([0.3, 0.0, 0.5, 1.0, 0.0, 0.0, 0.0])
+            recorder.add_control(
+                sim_time=t, sensor_index=sensor_index, command=(pose, 0.06), target_force_n=2.0,
+                robot={"eef_pose": pose, "joint_position": np.zeros(9),
+                       "joint_velocity": np.zeros(9), "gripper_width": 0.06},
+                camera={"base_0_rgb": np.zeros((8, 8, 3), np.uint8),
+                        "wrist_0_rgb": np.zeros((8, 8, 3), np.uint8), "wrist_0_pose": pose},
+            )
+    recorder.finalize()
     metadata = {
         "episode_id": path.stem,
         "dataset_version": "thermalcontact-v1",
         "random_seed": 0,
         "split": "pilot",
+        "genesis_version": "test",
+        "coordinate_convention": "right-handed; wxyz",
         "region_order": ["lower", "middle", "upper", "handle"],
         "target_region": target_region,
         "regime": "case_1",
@@ -82,8 +95,7 @@ def _write_episode(path: Path, *, target_region: int, contact_start: float, cont
         "policy_steps": 100,
         "peak_normal_force_n": 1.5,
     }
-    scalars = {"privileged/target_region": target_region}
-    write_episode(path, buffers, metadata, scalars)
+    write_episode(path, recorder.buffers, metadata, recorder.static)
 
 
 class WindowLoaderTest(unittest.TestCase):

@@ -1,6 +1,6 @@
 """π0.5 的观测数据结构（纯 PyTorch / NumPy，不依赖 JAX）。
 
-字段与官方 openpi ``model.Observation`` 一致；``thermal_*`` 等 13 个热觉字段是
+字段与官方 openpi ``model.Observation`` 一致；热觉字段是
 Thermal-π0.5 追加的可选输入，热觉关闭时全部为 ``None``，原 π0.5 输入不变。
 
 数据变换产出的嵌套字典（``image`` / ``image_mask`` / ``state`` / token 及热觉字段）
@@ -48,24 +48,12 @@ class Observation:
     token_ar_mask: Any | None = None
     token_loss_mask: Any | None = None
 
-    # Thermal-π0.5 可选字段。thermal_enabled=False 时全部为 None。
-    # 历史接触窗口 [B, K, L, C] 与逐帧有效 mask [B, K, L]。
-    thermal_history: Any | None = None
-    thermal_history_time_mask: Any | None = None
-    # 每次历史接触的物体坐标系锚点、法向、时效与存在 mask。
-    contact_mask: Any | None = None
-    contact_xyz_obj: Any | None = None
-    contact_normal_obj: Any | None = None
-    contact_age_s: Any | None = None
-    # 当前候选表面点（物体坐标系，已归一化）。
-    surface_xyz_obj: Any | None = None
-    surface_normal_obj: Any | None = None
-    surface_mask: Any | None = None
-    surface_reachable: Any | None = None
-    surface_grasp_score: Any | None = None
-    # 末端位置与剩余 probe 预算（主动策略的全局条件）。
-    ee_xyz_obj: Any | None = None
-    probe_budget_remaining: Any | None = None
+    # 当前时刻及前L-1帧的在线热触觉窗口；历史接触由模型内部MemoryBank维护。
+    thermal_window: Any | None = None  # [B,L,C]
+    thermal_window_time_mask: Any | None = None  # [B,L]
+    # 当前传感器位置/表面法向，由机器人状态/FK提供，不是预先枚举的候选点。
+    sensor_xyz_base: Any | None = None  # [B,3]
+    sensor_normal_base: Any | None = None  # [B,3]
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Observation":
@@ -90,19 +78,10 @@ class Observation:
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
-            thermal_history=data.get("thermal_history"),
-            thermal_history_time_mask=data.get("thermal_history_time_mask"),
-            contact_mask=data.get("contact_mask"),
-            contact_xyz_obj=data.get("contact_xyz_obj"),
-            contact_normal_obj=data.get("contact_normal_obj"),
-            contact_age_s=data.get("contact_age_s"),
-            surface_xyz_obj=data.get("surface_xyz_obj"),
-            surface_normal_obj=data.get("surface_normal_obj"),
-            surface_mask=data.get("surface_mask"),
-            surface_reachable=data.get("surface_reachable"),
-            surface_grasp_score=data.get("surface_grasp_score"),
-            ee_xyz_obj=data.get("ee_xyz_obj"),
-            probe_budget_remaining=data.get("probe_budget_remaining"),
+            thermal_window=data.get("thermal_window"),
+            thermal_window_time_mask=data.get("thermal_window_time_mask"),
+            sensor_xyz_base=data.get("sensor_xyz_base"),
+            sensor_normal_base=data.get("sensor_normal_base"),
         )
 
     def to_dict(self) -> dict[str, Any]:

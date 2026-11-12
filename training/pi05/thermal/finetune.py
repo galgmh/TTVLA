@@ -2,15 +2,14 @@
 
 阶段划分：
 
-1. 冻结 π0.5 全部参数，只训练热接触编码器、接触 token 构造、候选点编码器、
-   空间记忆（含温度/安全头）；
-2. 冻结 π0.5 与阶段 1 模块，只训练 ``ActiveStrategyModule``（技能与目标点）；
-3. 训练全部热觉模块、thermal→prefix 投影与 Action Expert（含动作投影），
-   冻结 SigLIP 与 PaliGemma VLM 主干；
-4. 联合微调：在阶段 3 基础上解冻 PaliGemma 最后 ``paligemma_last_layers`` 层。
+1. 纯热物理预训练，不执行 π0.5 主干；
+2. 只训练 gated PrefixAdapter，以 flow loss 对齐冻结的 PaliGemma/Action Expert；
+3. 训练热物理模块、PrefixAdapter 与 Action Expert，策略辅助头仍冻结；
+4. 加入策略辅助头的技能/目标监督，PaliGemma 继续冻结；
+5. 可选：在阶段4基础上仅解冻 PaliGemma 最后1～2层。
 
 说明：PyTorch 版 openpi 目前没有 LoRA 实现（``openpi/models/lora.py`` 只服务
-JAX 路径），因此阶段 4 用「最后 N 层全量微调」代替规格中的 PaliGemma LoRA；
+JAX 路径），因此阶段 5 用「最后 N 层全量微调」代替规格中的 PaliGemma LoRA；
 学习率仍按规格分三组：新模块 1e-4、Action Expert 5e-5、PaliGemma 1e-5。
 
 冻结只改 ``requires_grad``，不动 ``state_dict``：任何阶段保存的 checkpoint 都能
@@ -22,11 +21,12 @@ from __future__ import annotations
 from torch import nn
 
 #: 规格允许的训练阶段。
-STAGES = (1, 2, 3, 4)
+STAGES = (1, 2, 3, 4, 5)
 
 _THERMAL_PREFIX = "thermal_encoder."
 #: 阶段 1 可训练的集成编码器子模块（温度/安全头位于 spatial_memory 内）。
-_STAGE1_MODULES = ("contact_encoder", "contact_builder", "point_encoder", "spatial_memory")
+_STAGE1_MODULES = ("contact_encoder", "contact_builder", "spatial_memory", "field_decoder")
+_BEHAVIOR_MODULES = (*_STAGE1_MODULES, "prefix_adapter")
 #: 阶段 3 起随 Action Expert 一起训练的动作投影层。
 _ACTION_MODULES = (
     "action_in_proj",
@@ -40,10 +40,11 @@ _ACTION_MODULES = (
 
 #: 每个阶段的损失项（``compute_loss_dict`` 的键）；用于分阶段只回传相关项。
 _STAGE_LOSS_KEYS = {
-    1: ("contact_temp", "contact_valid", "field_temp", "field_safe"),
-    2: ("skill", "target"),
-    3: ("flow", "contact_temp", "contact_valid", "field_temp", "field_safe", "skill", "target"),
-    4: ("flow", "contact_temp", "contact_valid", "field_temp", "field_safe", "skill", "target"),
+    1: ("contact_temp", "contact_valid", "field_temp"),
+    2: ("flow",),
+    3: ("flow", "contact_temp", "contact_valid", "field_temp"),
+    4: ("flow", "contact_temp", "contact_valid", "field_temp", "skill"),
+    5: ("flow", "contact_temp", "contact_valid", "field_temp", "skill"),
 }
 
 
@@ -70,14 +71,14 @@ def _paligemma_language_layers(model: nn.Module) -> nn.ModuleList:
     return paligemma.model.language_model.layers
 
 
-def configure_stage(model: nn.Module, stage: int, *, paligemma_last_layers: int = 4) -> dict[str, int]:
+def configure_stage(model: nn.Module, stage: int, *, paligemma_last_layers: int = 2) -> dict[str, int]:
     """按阶段设置 ``requires_grad``，返回各角色可训练参数个数（便于日志）。
 
     角色：``thermal`` / ``action_expert`` / ``paligemma``。未列出的参数全部冻结。
     """
     _validate_stage(stage)
-    if stage == 4 and paligemma_last_layers < 1:
-        raise ValueError("stage=4 时 paligemma_last_layers 必须 >= 1")
+    if stage == 5 and paligemma_last_layers < 1:
+        raise ValueError("stage=5 时 paligemma_last_layers 必须 >= 1")
     thermal = _thermal_encoder(model)
 
     # 先全部冻结，再按阶段解冻，避免调用方残留的 requires_grad 影响结果。
@@ -87,15 +88,21 @@ def configure_stage(model: nn.Module, stage: int, *, paligemma_last_layers: int 
         for name in _STAGE1_MODULES:
             _set_requires_grad(getattr(thermal, name), value=True)
     elif stage == 2:
-        _set_requires_grad(thermal.strategy, value=True)
+        _set_requires_grad(thermal.prefix_adapter, value=True)
     else:
-        _set_requires_grad(thermal, value=True)
+        for name in _BEHAVIOR_MODULES:
+            _set_requires_grad(getattr(thermal, name), value=True)
+        if stage >= 4:
+            _set_requires_grad(thermal.strategy_aux, value=True)
+            _set_requires_grad(thermal.image_proj, value=True)
+            _set_requires_grad(thermal.language_proj, value=True)
+            _set_requires_grad(thermal.state_proj, value=True)
         _set_requires_grad(model.paligemma_with_expert.gemma_expert, value=True)
         for name in _ACTION_MODULES:
             module = getattr(model, name, None)
             if module is not None:
                 _set_requires_grad(module, value=True)
-        if stage == 4:
+        if stage == 5:
             layers = _paligemma_language_layers(model)
             count = min(paligemma_last_layers, len(layers))
             for layer in layers[-count:]:

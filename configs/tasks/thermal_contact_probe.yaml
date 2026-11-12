@@ -51,6 +51,23 @@ controller:
   rot_speed_rad_per_s: 1.2
   finger_speed_m_per_s: 0.2
 
+# RGB 与控制帧严格同步（20 Hz）。base_0 使用世界/base 坐标；
+# wrist_0 的 pos/lookat/up 使用 panda_hand 局部坐标。
+camera:
+  resolution: [224, 224]
+  near_m: 0.01
+  far_m: 20.0
+  base_0:
+    pos: [0.38, -0.62, 0.82]
+    lookat: [0.40, 0.0, 0.43]
+    up: [0.0, 0.0, 1.0]
+    fov_deg: 45.0
+  wrist_0:
+    pos: [0.10, 0.0, 0.02]
+    lookat: [0.0, 0.0, 0.10]
+    up: [0.0, 0.0, -1.0]
+    fov_deg: 60.0
+
 table:
   pos: [0.4, 0.0, 0.0]
   size: [0.6, 1.2, 0.04]
@@ -78,6 +95,8 @@ regions:
     pre_dist: 0.06
     xy_jitter_m: 0.002
     z_jitter_m: 0.0015
+    azimuth_jitter_rad: 0.35
+    tilt_jitter_rad: 0.12
   middle:
     # 中三分之一，同样水平进入；指尖覆盖杯 z 0.044..0.066。
     pos: [0.0, 0.0, 0.055]
@@ -86,6 +105,8 @@ regions:
     pre_dist: 0.06
     xy_jitter_m: 0.002
     z_jitter_m: 0.0015
+    azimuth_jitter_rad: 0.35
+    tilt_jitter_rad: 0.12
   upper:
     # 上三分之一，从上往下；z=0.088 时指尖覆盖 0.077..0.099，完全落在
     # 上段 0.0733..0.110 内。
@@ -95,6 +116,8 @@ regions:
     pre_dist: 0.08
     xy_jitter_m: 0.002
     z_jitter_m: 0.001
+    azimuth_jitter_rad: 0.35
+    tilt_jitter_rad: 0.10
   handle:
     # 手柄外侧竖条：世界 -y 方向、离轴 57 mm、高 56 mm。
     pos: [-0.057, 0.0, 0.056]
@@ -103,6 +126,8 @@ regions:
     pre_dist: 0.07
     xy_jitter_m: 0.0008
     z_jitter_m: 0.0008
+    azimuth_jitter_rad: 0.0
+    tilt_jitter_rad: 0.08
 
 # 混杂接触测试集专用：跨 middle/upper 分界（z≈0.0733），两指的接触垫面
 # 同时压在两个热 link 上。只用于 test_mixed_contact，不进入训练集。

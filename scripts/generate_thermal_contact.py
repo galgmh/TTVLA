@@ -28,8 +28,12 @@ from data.schema.thermal_contact_v1 import metadata_for_spec  # noqa: E402
 from data.writer.hdf5_writer import write_episode  # noqa: E402
 from data.writer.recorder import EpisodeRecorder  # noqa: E402
 from sim.config import load_dataset_config, load_task_config  # noqa: E402
-from sim.control.probe_controller import ProbeController  # noqa: E402
-from sim.obs import get_policy_observation, get_privileged_observation  # noqa: E402
+from sim.control.probe_controller import MultiProbeController, ProbeController  # noqa: E402
+from sim.obs import (  # noqa: E402
+    get_policy_observation,
+    get_privileged_observation,
+    get_robot_observation,
+)
 from sim.sampling.thermal_contact_sampler import ThermalContactSampler  # noqa: E402
 from sim.scene import build_scene  # noqa: E402
 
@@ -56,39 +60,50 @@ def _resolve_indices(sampler: ThermalContactSampler, start: int, count: int | No
 
 
 def run_episode(bundle, spec) -> tuple[dict, dict, dict]:
-    """跑一集，返回 ``(逐帧缓冲, 元数据, 标量)``。"""
-    probe = ProbeController(bundle, spec)
-    recorder = EpisodeRecorder(target_region=int(spec.target_region))
+    """跑一集，返回 ``(多时间轴缓冲, 元数据, 静态标定)``。"""
+    probe = MultiProbeController(bundle, spec) if spec.contact_order else ProbeController(bundle, spec)
+    recorder = EpisodeRecorder(
+        target_region=int(spec.target_region),
+        link_count=len(bundle.regions),
+    )
+    recorder.set_camera_calibration(bundle.camera_calibration())
     sim_dt = float(bundle.cfg["controller"]["sim_dt"])
 
-    def on_sample(sim_step: int) -> None:
+    def on_sensor_sample(sim_step: int) -> None:
+        recorder.add_sensor(
+            sim_time=float(sim_step) * sim_dt,
+            tactile=get_policy_observation(bundle),
+            privileged=get_privileged_observation(bundle),
+        )
+
+    def on_control_sample(sim_step: int) -> None:
         command = probe.last_command
         if command is None:
             raise RuntimeError("控制器尚未下发任何指令")
-        recorder.add(
+        recorder.add_control(
             sim_time=float(sim_step) * sim_dt,
-            policy=get_policy_observation(bundle),
-            privileged=get_privileged_observation(bundle),
+            sensor_index=recorder.sensor_frames - 1,
             command=command,
             target_force_n=float(spec.target_force_n),
-            probe_region=int(spec.target_region),
-            phase=probe.phase,
+            robot=get_robot_observation(bundle),
+            camera=bundle.camera_observation(),
         )
 
-    outcome = probe.run(on_sample=on_sample)
+    outcome = probe.run(on_sample=on_sensor_sample, on_control=on_control_sample)
+    recorder.finalize()
     cup_pos, cup_quat = bundle.cup_pose()
+    import genesis as gs
+
     metadata = metadata_for_spec(
         spec,
+        genesis_version=str(getattr(gs, "__version__", "unknown")),
         cup_pose=np.concatenate([cup_pos, cup_quat]),
         cup_asset_version=str(bundle.cfg["object"]["asset_version"]),
         outcome=outcome,
     )
     metadata.update(recorder.summary())
     metadata["config_paths"] = dict(bundle.cfg["config_paths"])
-    scalars = {
-        "privileged/target_region": int(spec.target_region),
-    }
-    return recorder.buffers, metadata, scalars
+    return recorder.buffers, metadata, recorder.static
 
 
 def main() -> int:
@@ -120,8 +135,8 @@ def main() -> int:
             skipped += 1
             continue
         bundle.reset_episode(spec)
-        buffers, metadata, scalars = run_episode(bundle, spec)
-        write_episode(path, buffers, metadata, scalars)
+        buffers, metadata, static = run_episode(bundle, spec)
+        write_episode(path, buffers, metadata, static)
         written += 1
         if not args.quiet:
             elapsed = time.time() - t0
@@ -130,7 +145,8 @@ def main() -> int:
                 f"[{n}/{len(indices)}] {spec.episode_id} "
                 f"{spec.target_region_name:>6} {spec.contact_quality:>6} "
                 f"{metadata['termination_reason']:>16} "
-                f"{metadata['frames']:4d} 帧 {metadata['peak_normal_force_n']:.2f} N "
+                f"{metadata['sensor_frames']:4d}/{metadata['control_frames']:4d} 帧 "
+                f"{metadata['peak_normal_force_n']:.2f} N "
                 f"({rate:.2f} 集/s)"
             )
     elapsed = time.time() - t0

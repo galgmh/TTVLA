@@ -5,8 +5,7 @@
 * 杯子放在 ``object.place_xy`` 指定的槽位，每集加 xy 抖动与偏航抖动；
 * 抬升平台与杯体轴线同轴（AABB 中心相对作者原点偏 17.5 mm，构建时按
   实测 AABB 补偿），杯底离桌面 60 mm，否则手掌前缘会撞杯口；
-* 不用相机、不用物体侧 TemperatureGrid：杯子四段各是一个热节点，温度
-  播种进共享的 ``link_temps`` 表。
+* 两路 RGB 与 20 Hz 控制帧同步：固定 base 相机和跟随 hand link 的腕部相机。
 
 构建顺序里有两条硬约束：
 
@@ -27,7 +26,7 @@ import numpy as np
 
 from sim.config import TaskConfig
 from sim.regions import ThermalRegionRuntime, resolve_thermal_regions
-from sim.rotations import quat_mul, yaw_to_quat
+from sim.rotations import quat_conj, quat_mul, quat_rotate, yaw_to_quat
 from sim.sampling.episode_spec import EpisodeSpec
 from sim.sensors.finger_layout import FingerLayout, derive_finger_layout
 from sim.sensors.tactile import (
@@ -154,6 +153,8 @@ class SceneBundle:
     tactile: list[TactileHandle]
     link_contacts: list[TactileHandle]
     temperatures: list[TemperatureHandle]
+    base_camera: Any
+    wrist_camera: Any
     arm_dofs: np.ndarray
     finger_dofs: np.ndarray
     hand_link_name: str
@@ -161,6 +162,74 @@ class SceneBundle:
     joint_names: list[str] = field(default_factory=list)
     link_names: list[str] = field(default_factory=list)
     n_envs: int = 1
+
+    def _to_numpy(self, value: Any) -> np.ndarray:
+        if hasattr(value, "detach"):
+            value = value.detach().cpu()
+        return np.asarray(value)
+
+    def _pose_in_base(self, pos_world: np.ndarray, quat_world: np.ndarray) -> np.ndarray:
+        base_pos = np.asarray(self.cfg["robot"]["base_pos"], dtype=np.float64)
+        base_inv = quat_conj(np.asarray(self.cfg["robot"]["base_quat"], dtype=np.float64))
+        pos_base = quat_rotate(base_inv, np.asarray(pos_world, dtype=np.float64) - base_pos)
+        quat_base = quat_mul(base_inv, np.asarray(quat_world, dtype=np.float64))
+        return np.concatenate([pos_base, quat_base])
+
+    def update_wrist_camera(self) -> None:
+        """按 hand link 当前位姿更新腕部相机。"""
+        hand_pos, hand_quat = self.hand_pose()
+        cfg = self.cfg["camera"]["wrist_0"]
+        pos = hand_pos + quat_rotate(hand_quat, np.asarray(cfg["pos"], dtype=np.float64))
+        lookat = hand_pos + quat_rotate(hand_quat, np.asarray(cfg["lookat"], dtype=np.float64))
+        up = quat_rotate(hand_quat, np.asarray(cfg["up"], dtype=np.float64))
+        self.wrist_camera.set_pose(pos=pos, lookat=lookat, up=up)
+
+    def camera_observation(self) -> dict[str, np.ndarray]:
+        """渲染两路 RGB，并返回腕部相机在 base 系的位姿。"""
+        self.update_wrist_camera()
+        base_rgb = self.base_camera.render(rgb=True, depth=False, segmentation=False)[0]
+        wrist_rgb = self.wrist_camera.render(rgb=True, depth=False, segmentation=False)[0]
+
+        def _rgb(value: Any) -> np.ndarray:
+            arr = self._to_numpy(value)
+            if np.issubdtype(arr.dtype, np.floating):
+                if arr.size and float(np.nanmax(arr)) <= 1.0:
+                    arr = arr * 255.0
+                arr = np.clip(arr, 0.0, 255.0)
+            return np.asarray(arr, dtype=np.uint8)
+
+        wrist_pos = self._to_numpy(self.wrist_camera.get_pos()).reshape(-1)[:3]
+        wrist_quat = self._to_numpy(self.wrist_camera.get_quat()).reshape(-1)[:4]
+        return {
+            "base_0_rgb": _rgb(base_rgb),
+            "wrist_0_rgb": _rgb(wrist_rgb),
+            "wrist_0_pose": self._pose_in_base(wrist_pos, wrist_quat),
+        }
+
+    def camera_calibration(self) -> dict[str, np.ndarray]:
+        """返回相机静态内参、base 相机位姿和 ``T_hand_camera``。"""
+        from scipy.spatial.transform import Rotation
+
+        self.update_wrist_camera()
+        base_pos = self._to_numpy(self.base_camera.get_pos()).reshape(-1)[:3]
+        base_quat = self._to_numpy(self.base_camera.get_quat()).reshape(-1)[:4]
+        hand_pos, hand_quat = self.hand_pose()
+        wrist_pos = self._to_numpy(self.wrist_camera.get_pos()).reshape(-1)[:3]
+        wrist_quat = self._to_numpy(self.wrist_camera.get_quat()).reshape(-1)[:4]
+
+        def _matrix(pos: np.ndarray, quat: np.ndarray) -> np.ndarray:
+            out = np.eye(4, dtype=np.float64)
+            out[:3, :3] = Rotation.from_quat([quat[1], quat[2], quat[3], quat[0]]).as_matrix()
+            out[:3, 3] = pos
+            return out
+
+        hand_to_camera = np.linalg.inv(_matrix(hand_pos, hand_quat)) @ _matrix(wrist_pos, wrist_quat)
+        return {
+            "base_0_intrinsics": np.asarray(self.base_camera.intrinsics, dtype=np.float32),
+            "wrist_0_intrinsics": np.asarray(self.wrist_camera.intrinsics, dtype=np.float32),
+            "base_0_pose": self._pose_in_base(base_pos, base_quat).astype(np.float32),
+            "hand_to_wrist_camera": hand_to_camera.astype(np.float32),
+        }
 
     # --------------------------------------------------------------- 状态读取
     def hand_pose(self) -> tuple[np.ndarray, np.ndarray]:
@@ -270,7 +339,7 @@ def build_scene(
     show_viewer: bool = False,
     logging_level: str = "warning",
 ) -> SceneBundle:
-    """按配置构建场景（单杯、单平台、无相机）。"""
+    """按配置构建场景（单杯、单平台、base+腕部相机）。"""
     import genesis as gs
 
     from sim.compat.sensor_compat import install_contact_area_policy, install_sensor_reset_fix
@@ -288,6 +357,7 @@ def build_scene(
     robot_cfg = cfg["robot"]
     table_cfg = cfg["table"]
     platform_cfg = cfg["platform"]
+    camera_cfg = cfg["camera"]
 
     rigid_options = gs.options.RigidOptions(
         box_box_detection=True,
@@ -385,6 +455,26 @@ def build_scene(
             fixed=True,
         ),
         surface=gs.surfaces.Default(color=tuple(platform_cfg["color"])),
+    )
+
+    # ------------------------------------------------------------------ RGB 相机
+    camera_common = dict(
+        res=tuple(int(v) for v in camera_cfg["resolution"]),
+        near=float(camera_cfg["near_m"]),
+        far=float(camera_cfg["far_m"]),
+        GUI=False,
+    )
+    base_cfg = camera_cfg["base_0"]
+    base_camera = scene.add_camera(
+        pos=tuple(base_cfg["pos"]), lookat=tuple(base_cfg["lookat"]), up=tuple(base_cfg["up"]),
+        fov=float(base_cfg["fov_deg"]),
+        **camera_common,
+    )
+    # 构建时先给一个有效位姿；scene.build 后按 hand 局部配置每帧更新。
+    wrist_camera = scene.add_camera(
+        pos=tuple(base_cfg["pos"]), lookat=tuple(base_cfg["lookat"]), up=tuple(base_cfg["up"]),
+        fov=float(camera_cfg["wrist_0"]["fov_deg"]),
+        **camera_common,
     )
 
     # ------------------------------------------------------------------ 触觉
@@ -487,6 +577,8 @@ def build_scene(
         tactile=tactile,
         link_contacts=link_contacts,
         temperatures=temperatures,
+        base_camera=base_camera,
+        wrist_camera=wrist_camera,
         arm_dofs=arm_dofs,
         finger_dofs=finger_dofs,
         hand_link_name=hand_link_name,
@@ -496,6 +588,7 @@ def build_scene(
         n_envs=n_envs,
     )
     bundle.set_robot_init_qpos()
+    bundle.update_wrist_camera()
     return bundle
 
 

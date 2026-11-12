@@ -80,6 +80,7 @@ def evaluate(model, loader, device, weights) -> dict[str, float]:
     total_loss = 0.0
     batches = 0
     temp_abs = []
+    temp_std = []
     valid_correct = 0
     valid_total = 0
     for batch in loader:
@@ -91,6 +92,7 @@ def evaluate(model, loader, device, weights) -> dict[str, float]:
         keep = torch.isfinite(batch["temperature"])
         if keep.any():
             temp_abs.append((out.temperature[keep] - batch["temperature"][keep]).abs())
+            temp_std.append(torch.exp(0.5 * out.temp_logvar[keep].clamp(-10.0, 10.0)))
         pred_v = out.valid_logit > 0
         label_v = batch["contact_valid"] > 0.5
         valid_correct += int((pred_v == label_v).sum())
@@ -100,6 +102,8 @@ def evaluate(model, loader, device, weights) -> dict[str, float]:
         abs_err = torch.cat(temp_abs)
         result["temp_mae"] = float(abs_err.mean())
         result["temp_rmse"] = float(torch.sqrt((abs_err**2).mean()))
+        std = torch.cat(temp_std)
+        result["coverage_90"] = float((abs_err <= 1.644854 * std).float().mean())
     if valid_total:
         result["valid_acc"] = valid_correct / valid_total
     return result
@@ -107,7 +111,7 @@ def evaluate(model, loader, device, weights) -> dict[str, float]:
 
 def format_metrics(prefix: str, metrics: dict[str, float]) -> str:
     parts = [f"{prefix} loss={metrics['loss']:.4f}"]
-    for key in ("temp_mae", "temp_rmse", "valid_acc"):
+    for key in ("temp_mae", "temp_rmse", "coverage_90", "valid_acc"):
         if key in metrics:
             parts.append(f"{key}={metrics[key]:.4f}")
     return "  ".join(parts)

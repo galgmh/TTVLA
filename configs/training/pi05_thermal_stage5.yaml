@@ -1,0 +1,40 @@
+# Thermal-π0.5 · Stage 5（可选）：轻量语义微调。
+# 仅在 Stage 4 已证明 thermal memory 有效、但语言泛化不足时运行。
+exp_name: thermal_pi05_stage5
+seed: 0
+dtype: bfloat16
+num_train_steps: 5000
+log_interval: 10
+save_interval: 1000
+checkpoint_dir: checkpoints/pi05_thermal/stage5
+resume: false
+overwrite: false
+pytorch_weight_path: null
+thermal_stage: 5
+device: auto
+wandb: {enabled: false, project: thermal-pi05}
+
+model:
+  paligemma_variant: gemma_2b
+  action_expert_variant: gemma_300m
+  pi05: true
+  action_dim: 32
+  action_horizon: 50
+  max_token_len: 200
+  dtype: bfloat16
+  thermal: {enabled: true}
+
+data:
+  kind: hdf5
+  root: datasets/thermalvla/pick_cold_can
+  batch_size: 8
+  num_workers: 4
+  image_keys: [base_0_rgb, left_wrist_0_rgb, right_wrist_0_rgb]
+  prompt: "perform the thermal manipulation task"
+  action_dim: 7
+  action_horizon: 50
+  normalization: null
+  fake_size: 128
+
+optimizer: {b1: 0.9, b2: 0.95, eps: 1.0e-8, weight_decay: 1.0e-10, clip_gradient_norm: 1.0}
+lr_schedule: {warmup_steps: 500, peak_lr: 1.0e-5, decay_steps: 5000, decay_lr: 1.0e-6}

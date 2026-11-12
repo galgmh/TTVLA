@@ -1,7 +1,7 @@
 # Thermal-π0.5 分阶段训练 · Stage 3：热觉模块 + Action Expert 联合训练。
 #
-# 规格 §9：解冻全部热觉模块、Gemma action expert 与动作投影层；
-# PaliGemma 主干保持冻结。flow loss 与全部热觉辅助损失一起回传。
+# 解冻热物理模块、PrefixAdapter、Gemma Action Expert 与动作投影；
+# 策略辅助头和 PaliGemma 保持冻结。
 # 学习率按角色分组：thermal 1e-4 / action expert 5e-5 / PaliGemma 1e-5。
 exp_name: thermal_pi05_stage3
 seed: 0
@@ -23,7 +23,7 @@ model:
   paligemma_variant: gemma_2b
   action_expert_variant: gemma_300m
   pi05: true
-  action_dim: 7
+  action_dim: 32             # π0.5 官方内部动作维度；机器人维度见 data.action_dim
   action_horizon: 50
   max_token_len: 200
   dtype: bfloat16

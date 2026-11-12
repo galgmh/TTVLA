@@ -1,8 +1,7 @@
-# Thermal-π0.5 分阶段训练 · Stage 4：全局微调。
+# Thermal-π0.5 分阶段训练 · Stage 4：策略辅助监督。
 #
-# 规格 §9：在 Stage 3 的基础上解冻 PaliGemma 最后 4 层语言层一起微调
-# （PyTorch π0.5 没有 LoRA 实现，用全量微调代替）。学习率三组：
-# thermal 1e-4 / action expert 5e-5 / PaliGemma 1e-5。
+# 在 Stage 3 基础上训练GlobalSkillAuxHead（PROBE/GRASP/RETRACT/ABORT）。
+# 辅助头不生成触点或goal token，PaliGemma仍冻结。
 exp_name: thermal_pi05_stage4
 seed: 0
 dtype: bfloat16
@@ -23,7 +22,7 @@ model:
   paligemma_variant: gemma_2b
   action_expert_variant: gemma_300m
   pi05: true
-  action_dim: 7
+  action_dim: 32             # π0.5 官方内部动作维度；机器人维度见 data.action_dim
   action_horizon: 50
   max_token_len: 200
   dtype: bfloat16

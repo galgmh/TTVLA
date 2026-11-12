@@ -22,7 +22,7 @@
 | `observation.py` | `src/openpi/models/model.py`（仅 `Observation`） | Flax struct/jaxtyping → 纯 dataclass，增加 13 个热觉字段 |
 | `pi0_config.py` | `src/openpi/models/pi0_config.py` + `gemma.py` 的配置部分 | 删除 JAX 专用接口与 Flax 模块 |
 | `image_tools.py` | `src/openpi/shared/image_tools.py`（仅 PyTorch 部分） | 删除 JAX 版 `resize_with_pad` |
-| `thermal/` | **无（本项目新增）** | 三个核心模块（接触编码器 / 空间记忆 / 主动策略）+ 输出结构、损失与 π0.5 接入；训练/数据侧工具在 `training/pi05/thermal/` |
+| `thermal/` | **无（本项目新增）** | 接触编码器、热空间记忆、gated PrefixAdapter 与策略辅助头；prefix 只注入空间 memory，训练/数据工具在 `training/pi05/thermal/` |
 | `transformers_replace/` | `src/openpi/models_pytorch/transformers_replace/` | 原样保留的 HuggingFace 补丁 |
 
 ## 运行环境
@@ -47,6 +47,11 @@ from models.pi05 import PI0Pytorch, Pi0Config, ThermalPi0Config
 config = Pi0Config(pi05=True, thermal=ThermalPi0Config(enabled=True))
 model = PI0Pytorch(config)
 ```
+
+π0.5 内部 `action_dim` 固定为官方的 32。LIBERO/机器人实际 7 维动作由
+`DataConfig.action_dim=7` 描述：训练数据归一化后右侧补零到 32 维，模型
+推理结果通过 `Normalizer.denormalize_actions()` 裁剪并还原为 7 维物理动作。
+不要把 `Pi0Config.action_dim` 改成 7，否则无法加载官方动作投影权重。
 
 `thermal=None` 或 `enabled=False` 时与原始 π0.5 数值完全一致（Stage-0 回归
 `STAGE0_IDENTICAL`）。训练阶段、数据格式与训练入口见

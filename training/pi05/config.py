@@ -54,10 +54,12 @@ class DataConfig:
     `training.pi05.data` 模块文档）；``kind="fake"`` 时生成随机样本，只用于
     冒烟与单元测试。
 
-    注意：π0.5 的热觉编码器用 ``Linear(action_dim, …)`` 读 state，且数据变换
-    与官方 ``PadStatesAndActions`` 一致把 state 补齐/截断到 ``action_dim``，
-    因此这里没有独立的 ``state_dim``；``image_keys`` 必须包含 π0.5 的三路标准
-    相机键（``base_0_rgb`` / ``left_wrist_0_rgb`` / ``right_wrist_0_rgb``）。
+    ``action_dim`` 是数据集/机器人实际动作维度（LIBERO 为 7），不是 π0.5
+    内部动作维度。state 保留数据集自己的维度（LIBERO 为 8）。模型内部始终
+    保持官方 32 维；数据变换先按各自原始维度完成归一化，再补零到
+    ``model.action_dim``。``image_keys`` 必须包含 π0.5 的
+    三路标准相机键（``base_0_rgb`` / ``left_wrist_0_rgb`` /
+    ``right_wrist_0_rgb``）。
     """
 
     kind: str = "fake"
@@ -108,21 +110,23 @@ class TrainConfig:
     wandb_enabled: bool = False
     wandb_project: str = "thermal-pi05"
     pytorch_weight_path: str | None = None
+    thermal_contact_checkpoint: str | None = None
     thermal_stage: int | None = None
     device: str = "auto"
 
     def __post_init__(self):
         if self.dtype not in DTYPES:
             raise ValueError(f"dtype 必须是 {DTYPES} 之一，得到 {self.dtype!r}")
-        if self.thermal_stage is not None and self.thermal_stage not in (1, 2, 3, 4):
-            raise ValueError(f"thermal_stage 必须是 1-4 或 null，得到 {self.thermal_stage!r}")
+        if self.thermal_stage is not None and self.thermal_stage not in (1, 2, 3, 4, 5):
+            raise ValueError(f"thermal_stage 必须是 1-5 或 null，得到 {self.thermal_stage!r}")
         if self.thermal_stage is not None:
             thermal = self.model.thermal
             if thermal is None or not thermal.enabled:
                 raise ValueError("设置 thermal_stage 时必须开启 model.thermal.enabled")
-        if self.data.action_dim != self.model.action_dim:
+        if self.data.action_dim > self.model.action_dim:
             raise ValueError(
-                f"data.action_dim={self.data.action_dim} 与 model.action_dim={self.model.action_dim} 不一致"
+                f"机器人 data.action_dim={self.data.action_dim} 不能超过模型内部 "
+                f"model.action_dim={self.model.action_dim}"
             )
         if self.data.action_horizon != self.model.action_horizon:
             raise ValueError(

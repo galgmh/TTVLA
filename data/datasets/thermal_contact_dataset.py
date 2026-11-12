@@ -53,11 +53,11 @@ class WindowSet:
 
 
 def load_episode(path: str | Path) -> Episode:
-    arrays, metadata, scalars = read_episode(path)
+    arrays, metadata, _ = read_episode(path)
     return Episode(
         arrays=arrays,
         metadata=metadata,
-        target_region=int(np.asarray(scalars["privileged/target_region"]).reshape(())),
+        target_region=int(metadata["target_region"]),
     )
 
 
@@ -65,7 +65,11 @@ def resample(arrays: dict[str, np.ndarray], *, stride: int = 2) -> dict[str, np.
     """按整数步长抽取（100 Hz -> 50 Hz 即 ``stride=2``）。"""
     if stride <= 1:
         return arrays
-    return {name: np.asarray(arr)[::stride] for name, arr in arrays.items()}
+    sensor_prefixes = ("sensor/", "tactile/", "privileged/")
+    return {
+        name: np.asarray(arr)[::stride] if name.startswith(sensor_prefixes) else np.asarray(arr)
+        for name, arr in arrays.items()
+    }
 
 
 def _rate(values: np.ndarray, dt: float) -> np.ndarray:
@@ -85,22 +89,27 @@ def _rate(values: np.ndarray, dt: float) -> np.ndarray:
 
 def frame_features(arrays: dict[str, np.ndarray], *, dt: float) -> np.ndarray:
     """逐帧 14 维特征矩阵 (L, 14)，通道顺序见 ``ENCODER_INPUT_CHANNELS``。"""
-    temp = np.asarray(arrays["obs/fingertip_temp"], dtype=np.float64)
-    normal = np.asarray(arrays["obs/contact_normal_force"], dtype=np.float64)
-    force = np.asarray(arrays["obs/contact_force_world"], dtype=np.float64)
-    area = np.asarray(arrays["obs/contact_area"], dtype=np.float64)
-    width = np.asarray(arrays["obs/gripper_width"], dtype=np.float64).reshape(-1, 1)
-    time = np.asarray(arrays["time/sim_time"], dtype=np.float64)
+    temp = np.asarray(arrays["tactile/fingertip_temp"], dtype=np.float64)
+    normal = np.asarray(arrays["tactile/contact_normal_force"], dtype=np.float64)
+    force = np.asarray(arrays["tactile/contact_force_link"], dtype=np.float64)
+    area = np.asarray(arrays["tactile/contact_area"], dtype=np.float64)
+    time = np.asarray(arrays["sensor/time"], dtype=np.float64)
+    control_time = np.asarray(arrays["control/time"], dtype=np.float64)
+    control_width = np.asarray(arrays["robot/gripper_width"], dtype=np.float64)
+    control_index = np.searchsorted(control_time, time, side="right") - 1
+    control_index = np.clip(control_index, 0, len(control_width) - 1)
+    width = control_width[control_index].reshape(-1, 1)
 
     # 切向力 = 合力里扣掉法向分量后的模长。
     tangential = np.sqrt(np.maximum(np.sum(force**2, axis=2) - normal**2, 0.0))
 
-    contact_start = _contact_start(arrays)
-    if contact_start is None:
-        # 整集没有接触（失败档）：接触时间恒为 0。
-        contact_time = np.zeros((len(time), 1), dtype=np.float64)
-    else:
-        contact_time = np.clip(time - contact_start, 0.0, None).reshape(-1, 1)
+    # 每次接触事件都从 0 重新计时；离开杯子后回到 0。
+    event_id = np.asarray(arrays["tactile/contact_event_id"], dtype=np.int64)
+    contact_time = np.zeros((len(time), 1), dtype=np.float64)
+    for event in range(1, int(event_id.max(initial=0)) + 1):
+        indices = np.where(event_id == event)[0]
+        if indices.size:
+            contact_time[indices, 0] = time[indices] - time[indices[0]]
 
     dtemp = temp - temp[:1]
     rate = np.stack([_rate(temp[:, 0], dt), _rate(temp[:, 1], dt)], axis=1)
@@ -112,11 +121,11 @@ def frame_features(arrays: dict[str, np.ndarray], *, dt: float) -> np.ndarray:
 
 def _contact_start(arrays: dict[str, np.ndarray]) -> float | None:
     """首次有接触的时刻；整集没有接触时返回 ``None``。"""
-    mask = np.asarray(arrays["obs/contact_mask"], dtype=bool).reshape(-1, 2)
+    mask = np.asarray(arrays["tactile/contact_mask"], dtype=bool).reshape(-1, 2)
     hit = np.where(mask.any(axis=1))[0]
     if hit.size == 0:
         return None
-    time = np.asarray(arrays["time/sim_time"], dtype=np.float64)
+    time = np.asarray(arrays["sensor/time"], dtype=np.float64)
     return float(time[hit[0]])
 
 
@@ -136,14 +145,26 @@ def window_end_times(
     末尾取这么长的一段，把“正在找接触”的帧作为接触有效性的负样本；否则
     返回空数组。
     """
-    time = np.asarray(arrays["time/sim_time"], dtype=np.float64)
-    mask = np.asarray(arrays["obs/contact_mask"], dtype=bool).reshape(-1, 2)
-    hit = np.where(mask.any(axis=1))[0]
-    t_start = float(time[hit[0]]) if hit.size else float("nan")
-    t_end = float(time[hit[-1]]) if hit.size else float("nan")
-    if hit.size == 0 or t_end - t_start < min_contact_s:
-        if no_contact_window_s <= 0.0 or len(time) == 0:
-            return np.zeros(0, dtype=np.float64)
+    time = np.asarray(arrays["sensor/time"], dtype=np.float64)
+    event_id = np.asarray(arrays["tactile/contact_event_id"], dtype=np.int64)
+    ends_per_event: list[np.ndarray] = []
+    for event in range(1, int(event_id.max(initial=0)) + 1):
+        hit = np.where(event_id == event)[0]
+        if hit.size == 0:
+            continue
+        t_start, t_end = float(time[hit[0]]), float(time[hit[-1]])
+        if t_end - t_start < min_contact_s:
+            continue
+        values = np.arange(t_start + window_stride_s, t_end + 1e-9, window_stride_s)
+        ends_per_event.append(values if values.size else np.asarray([t_end]))
+    if ends_per_event:
+        return np.concatenate(ends_per_event)
+
+    if len(time) == 0:
+        return np.zeros(0, dtype=np.float64)
+    if no_contact_window_s <= 0.0:
+        return np.zeros(0, dtype=np.float64)
+    else:
         t_end = float(time[-1])
         t_start = max(float(time[0]), t_end - float(no_contact_window_s))
     ends = np.arange(t_start + window_stride_s, t_end + 1e-9, window_stride_s)
@@ -167,12 +188,13 @@ def build_windows(
     dt = 1.0 / float(training_hz)
     features = frame_features(arrays, dt=dt)
 
-    time = np.asarray(arrays["time/sim_time"], dtype=np.float64)
+    time = np.asarray(arrays["sensor/time"], dtype=np.float64)
     link_temp = np.asarray(arrays["privileged/link_temp"], dtype=np.float64)
-    pure = np.asarray(arrays["privileged/pure_contact"], dtype=bool).reshape(-1)
-    contact_valid = np.asarray(arrays["privileged/contact_valid"], dtype=bool).reshape(-1)
+    link_mask = np.asarray(arrays["privileged/contact_link_mask"], dtype=bool)
+    contact_valid = np.asarray(arrays["privileged/contact_valid"], dtype=bool).any(axis=1)
 
-    region = int(episode.target_region)
+    touched_regions = link_mask.any(axis=1)
+    pure = touched_regions.sum(axis=1) == 1
     ends = window_end_times(
         arrays,
         min_contact_s=min_contact_s,
@@ -182,8 +204,6 @@ def build_windows(
     if ends.size == 0:
         return _empty_windows(0, features.shape[1])
 
-    # 混杂接触集没有单一目标 link：温度标签留 NaN，只保留有效性标签。
-    label_region = region if region >= 0 else -1
     max_len = int(round(max(prefixes_s) * training_hz)) + 1
 
     feats, masks, temps, valids, prefix_col, times = [], [], [], [], [], []
@@ -202,7 +222,8 @@ def build_windows(
             masks.append(window_mask)
             # 温度标签只在“纯目标区域接触”时成立：碰到别的 link 时，接触
             # link 的温度不是目标区域的温度，标签无意义。
-            if label_region >= 0 and pure[end_idx]:
+            if pure[end_idx]:
+                label_region = int(np.flatnonzero(touched_regions[end_idx])[0])
                 temps.append(link_temp[end_idx, label_region])
             else:
                 # 没有接触（失败档的负样本）、混杂接触或越界接触：温度标签留 NaN。

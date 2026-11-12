@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import itertools
 import zlib
 from typing import Any
 
@@ -82,6 +83,20 @@ class ThermalContactSampler:
                 {name: (float(case[name][0]), float(case[name][1])) for name in self.region_order}
             )
         self._material = dict(task_cfg["object"]["material_properties"][task_cfg["object"]["material"]])
+        self.multi_contact = bool(dataset_cfg.get("multi_contact", False))
+        self.instruction = str(dataset_cfg.get("instruction", ""))
+        self.contact_orders = tuple(itertools.permutations(range(4)))
+        self.duration_schedules = tuple(
+            tuple(float(v) for v in row)
+            for row in dataset_cfg.get("contact_duration_schedules", ())
+        )
+        if self.multi_contact:
+            expected = len(self.region_temps) * len(self.contact_orders) * len(self.duration_schedules)
+            if self.split == "train" and self.count != expected:
+                raise ValueError(
+                    f"多接触 train 必须覆盖 {len(self.region_temps)}×{len(self.contact_orders)}×"
+                    f"{len(self.duration_schedules)}={expected} 集，配置为 {self.count}"
+                )
         # 区域 z 范围：校验探测点抖动不越界。
         self._z_spans = {k: tuple(float(v) for v in span) for k, span in task_cfg["object"]["region_z_spans"].items()}
         # 力档位必须与任务配置一致，否则“目标力”和“乘数”会各说各话。
@@ -100,6 +115,8 @@ class ThermalContactSampler:
         seq = np.random.SeedSequence([self.seed, _split_code(self.split), int(index)])
         rng = np.random.default_rng(seq)
         random_seed = int(seq.generate_state(1)[0])
+        if self.multi_contact:
+            return self._sample_multi(index, rng, random_seed)
         mixed = self.split == "test_mixed_contact"
 
         # ---- 目标区域与任务阈值
@@ -224,6 +241,99 @@ class ThermalContactSampler:
             cup_xy_jitter_m=cup_xy,
             cup_yaw_jitter_rad=cup_yaw,
             material_parameters=tuple(sorted((str(k), float(v)) for k, v in self._material.items())),
+        )
+
+    @staticmethod
+    def _rotate_about_axis(vector: np.ndarray, axis: np.ndarray, angle: float) -> np.ndarray:
+        """Rodrigues 旋转，用于在不破坏 tool/finger 正交性的前提下加倾斜。"""
+        axis = np.asarray(axis, dtype=np.float64)
+        axis = axis / np.linalg.norm(axis)
+        vector = np.asarray(vector, dtype=np.float64)
+        return (
+            vector * np.cos(angle)
+            + np.cross(axis, vector) * np.sin(angle)
+            + axis * float(axis @ vector) * (1.0 - np.cos(angle))
+        )
+
+    def _sample_probe(self, rng: np.random.Generator, region_index: int):
+        """为一个物理区域采样高度、绕杯方位角和水平倾斜。"""
+        name = self.region_order[region_index]
+        cfg = self.task["regions"][name]
+        xyz = np.asarray(cfg["pos"], dtype=np.float64).copy()
+        xy_jitter = float(cfg.get("xy_jitter_m", 0.0))
+        xyz[:2] += rng.uniform(-xy_jitter, xy_jitter, size=2)
+        xyz[2] += float(rng.uniform(-float(cfg.get("z_jitter_m", 0.0)), float(cfg.get("z_jitter_m", 0.0))))
+
+        azimuth = 0.0 if name == "handle" else float(
+            rng.uniform(-float(cfg.get("azimuth_jitter_rad", 0.0)), float(cfg.get("azimuth_jitter_rad", 0.0)))
+        )
+        c, s = np.cos(azimuth), np.sin(azimuth)
+        rz = np.asarray([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+        tool = rz @ np.asarray(cfg["tool_dir"], dtype=np.float64)
+        finger = rz @ np.asarray(cfg["finger_dir"], dtype=np.float64)
+        tilt = float(rng.uniform(-float(cfg.get("tilt_jitter_rad", 0.0)), float(cfg.get("tilt_jitter_rad", 0.0))))
+        tool = self._rotate_about_axis(tool, finger, tilt)
+        tool /= np.linalg.norm(tool)
+        finger -= float(finger @ tool) * tool
+        finger /= np.linalg.norm(finger)
+
+        lo, hi = self._z_spans[name]
+        if not lo <= xyz[2] <= hi:
+            raise ValueError(f"探测点 z={xyz[2]:.4f} 超出区域 {name} 的 [{lo}, {hi}]")
+        return tuple(xyz), tuple(tool), tuple(finger)
+
+    def _sample_multi(
+        self, index: int, rng: np.random.Generator, random_seed: int
+    ) -> EpisodeSpec:
+        """5 温度情景 × 24 全排列 × 12 平衡时长方案的确定性展开。"""
+        per_case = len(self.contact_orders) * len(self.duration_schedules)
+        case_index, remainder = divmod(index, per_case)
+        order_index, schedule_index = divmod(remainder, len(self.duration_schedules))
+        case = self.region_temps[case_index]
+        temps = tuple(float(rng.uniform(*case[name])) for name in self.region_order)
+
+        ambient = float(self.task["sensor"]["ambient_temp_c"])
+        fingertip = (ambient, ambient)
+        force_level = float(self.ds["force_levels"][int(rng.integers(0, len(self.ds["force_levels"])))])
+        contact_cfg = self.task["contact"]
+
+        sensor_cfg = self.ds["sensor"]
+        rc = float(sensor_cfg["rc_s"]["nominal"]) * float(rng.uniform(*sensor_cfg["rc_s"]["multiplier_range"]))
+        noise = float(sensor_cfg["noise_c"]["nominal"]) * float(rng.uniform(*sensor_cfg["noise_c"]["multiplier_range"]))
+        quant = float(sensor_cfg["quantization_c"]["nominal"]) * float(
+            rng.uniform(*sensor_cfg["quantization_c"]["multiplier_range"])
+        )
+        bias = float(rng.uniform(*sensor_cfg["bias_c"]["absolute_range"]))
+
+        probes = [self._sample_probe(rng, i) for i in range(4)]
+        object_cfg = self.task["object"]
+        jitter_xy = float(object_cfg["xy_jitter_m"])
+        cup_xy = (float(rng.uniform(-jitter_xy, jitter_xy)), float(rng.uniform(-jitter_xy, jitter_xy)))
+        cup_yaw = float(rng.uniform(-float(object_cfg["yaw_jitter_rad"]), float(object_cfg["yaw_jitter_rad"])))
+
+        first = int(self.contact_orders[order_index][0])
+        return EpisodeSpec(
+            episode_id=f"{self.ds['dataset_version']}_{self.split}_{index:06d}",
+            dataset_version=str(self.ds["dataset_version"]), split=self.split,
+            random_seed=random_seed, region_order=self.region_order,
+            target_region=-2, mixed=False, regime=f"case_{case_index + 1}", finger_mode="ambient",
+            link_temps_c=temps, fingertip_temps_c=fingertip,
+            force_level=force_level,
+            target_force_n=float(contact_cfg["nominal_force_n"]) * force_level,
+            contact_quality="stable", contact_hold_s=float(self.duration_schedules[schedule_index][first]),
+            fail_retreat_m=0.0, sensor_rc_s=rc, sensor_noise_c=noise,
+            sensor_bias_c=bias, sensor_quantization_c=quant,
+            probe_pos=probes[first][0], probe_tool_dir=probes[first][1],
+            probe_finger_dir=probes[first][2],
+            probe_pre_dist=float(self.task["regions"][self.region_order[first]]["pre_dist"]),
+            cup_xy_jitter_m=cup_xy, cup_yaw_jitter_rad=cup_yaw,
+            material_parameters=tuple(sorted((str(k), float(v)) for k, v in self._material.items())),
+            instruction=self.instruction,
+            contact_order=tuple(int(v) for v in self.contact_orders[order_index]),
+            contact_hold_s_by_region=self.duration_schedules[schedule_index],
+            probe_positions=tuple(p[0] for p in probes),
+            probe_tool_dirs=tuple(p[1] for p in probes),
+            probe_finger_dirs=tuple(p[2] for p in probes),
         )
 
     def __iter__(self):

@@ -140,7 +140,7 @@ _OBJECT_REQUIRED = frozenset(
         "yaw_jitter_rad",
     }
 )
-_OBJECT_OPTIONAL = frozenset({"color"})
+_OBJECT_OPTIONAL = frozenset({"color", "link_materials"})
 _MATERIAL_KEYS = frozenset({"conductivity", "density", "specific_heat", "emissivity"})
 # 资产清单（manifest）由 scripts/build_cup_4link.py 生成，是区域顺序、link
 # 名称和区域 z 边界的唯一来源；物体配置只引用它，不再重复抄写。
@@ -225,6 +225,22 @@ def load_object_config(path: str | Path) -> dict[str, Any]:
     material = _str(cfg["material"], f"{source}: material")
     if material not in props:
         raise ValueError(f"{source}: material = {material!r} 不在 material_properties 中")
+
+    if "link_materials" in cfg:
+        link_materials = cfg["link_materials"]
+        if not isinstance(link_materials, dict):
+            raise ValueError(f"{source}: link_materials 必须是区域名 -> 材料名的映射")
+        unknown_regions = set(link_materials) - set(manifest["region_order"])
+        if unknown_regions:
+            raise ValueError(
+                f"{source}: link_materials 包含未知区域 {sorted(unknown_regions)}"
+            )
+        for region_name, material_name in link_materials.items():
+            name = _str(material_name, f"{source}: link_materials.{region_name}")
+            if name not in props:
+                raise ValueError(
+                    f"{source}: 区域 {region_name!r} 的材料 {name!r} 不在 material_properties 中"
+                )
 
     _num_list(cfg["place_xy"], f"{source}: place_xy", 2)
     if _num(cfg["rest_height_m"], f"{source}: rest_height_m") < 0.0:
@@ -311,6 +327,7 @@ _TASK_REQUIRED = frozenset(
         "mixed_probe",
         "timing",
         "contact",
+        "camera",
     }
 )
 
@@ -355,7 +372,41 @@ _CONTROLLER_KEYS = frozenset(
     }
 )
 _PROBE_KEYS = frozenset({"pos", "tool_dir", "finger_dir", "pre_dist"})
-_PROBE_OPTIONAL = frozenset({"pre_grip", "xy_jitter_m", "z_jitter_m"})
+_PROBE_OPTIONAL = frozenset(
+    {"pre_grip", "xy_jitter_m", "z_jitter_m", "azimuth_jitter_rad", "tilt_jitter_rad"}
+)
+
+
+def _validate_camera(camera: dict[str, Any], where: str) -> None:
+    _check_keys(
+        camera,
+        required=frozenset({"resolution", "near_m", "far_m", "base_0", "wrist_0"}),
+        optional=frozenset(),
+        where=where,
+    )
+    resolution = camera["resolution"]
+    if not isinstance(resolution, (list, tuple)) or len(resolution) != 2:
+        raise ValueError(f"{where}.resolution 必须是 [width, height]")
+    for i, value in enumerate(resolution):
+        _int(value, f"{where}.resolution[{i}]", minimum=1)
+    near = _num(camera["near_m"], f"{where}.near_m")
+    far = _num(camera["far_m"], f"{where}.far_m")
+    if near <= 0.0 or far <= near:
+        raise ValueError(f"{where} 必须满足 0 < near_m < far_m")
+    for name in ("base_0", "wrist_0"):
+        entry = camera[name]
+        _check_keys(
+            entry,
+            required=frozenset({"pos", "lookat", "up", "fov_deg"}),
+            optional=frozenset(),
+            where=f"{where}.{name}",
+        )
+        _num_list(entry["pos"], f"{where}.{name}.pos", 3)
+        _num_list(entry["lookat"], f"{where}.{name}.lookat", 3)
+        _num_list(entry["up"], f"{where}.{name}.up", 3)
+        fov = _num(entry["fov_deg"], f"{where}.{name}.fov_deg")
+        if not 1.0 < fov < 179.0:
+            raise ValueError(f"{where}.{name}.fov_deg 必须在 (1,179)")
 
 
 def _validate_probe(entry: dict[str, Any], where: str) -> None:
@@ -382,7 +433,7 @@ def _validate_probe(entry: dict[str, Any], where: str) -> None:
         grip = _num(entry["pre_grip"], f"{where}.pre_grip")
         if not -1.0 <= grip <= 1.0:
             raise ValueError(f"{where}.pre_grip 必须在 [-1, 1]")
-    for key in ("xy_jitter_m", "z_jitter_m"):
+    for key in ("xy_jitter_m", "z_jitter_m", "azimuth_jitter_rad", "tilt_jitter_rad"):
         if key in entry and _num(entry[key], f"{where}.{key}") < 0.0:
             raise ValueError(f"{where}.{key} 必须 >= 0")
 
@@ -470,6 +521,7 @@ def _validate_task(cfg: dict[str, Any], source: str) -> None:
     for name, entry in regions.items():
         _validate_probe(entry, f"{source}: regions.{name}")
     _validate_probe(cfg["mixed_probe"], f"{source}: mixed_probe")
+    _validate_camera(cfg["camera"], f"{source}: camera")
 
     timing = cfg["timing"]
     _check_keys(
@@ -563,15 +615,35 @@ _DATASET_REQUIRED = frozenset(
         "splits",
     }
 )
+_DATASET_OPTIONAL = frozenset({"instruction", "multi_contact", "contact_duration_schedules"})
 
 
 def load_dataset_config(path: str | Path) -> dict[str, Any]:
     """加载 ThermalContact-v1 数据采样配置。"""
     source = str(path)
     cfg = _load_yaml(path, "数据集配置")
-    _check_keys(cfg, required=_DATASET_REQUIRED, optional=frozenset(), where=source)
+    _check_keys(cfg, required=_DATASET_REQUIRED, optional=_DATASET_OPTIONAL, where=source)
     _str(cfg["dataset_version"], f"{source}: dataset_version")
     _str(cfg["output_dir"], f"{source}: output_dir")
+    if "instruction" in cfg:
+        _str(cfg["instruction"], f"{source}: instruction")
+    if "multi_contact" in cfg and not isinstance(cfg["multi_contact"], bool):
+        raise ValueError(f"{source}: multi_contact 必须是 bool")
+    if "contact_duration_schedules" in cfg:
+        schedules = cfg["contact_duration_schedules"]
+        if not isinstance(schedules, (list, tuple)) or len(schedules) != 12:
+            raise ValueError(f"{source}: contact_duration_schedules 必须恰好有 12 项")
+        for i, schedule in enumerate(schedules):
+            values = _num_list(schedule, f"{source}: contact_duration_schedules[{i}]", 4)
+            if any(value not in (0.2, 0.5, 0.8) for value in values):
+                raise ValueError(f"{source}: 接触时长只能是 0.2/0.5/0.8 s")
+        for region, column in enumerate(zip(*schedules)):
+            counts = {
+                value: sum(abs(float(v) - value) < 1e-9 for v in column)
+                for value in (0.2, 0.5, 0.8)
+            }
+            if set(counts.values()) != {4}:
+                raise ValueError(f"{source}: 时长方案第 {region} 列不平衡：{counts}")
     _int(cfg["seed"], f"{source}: seed")
     for key in ("sample_hz", "training_hz"):
         if _num(cfg[key], f"{source}: {key}") <= 0.0:

@@ -1,4 +1,4 @@
-"""热模型：编码器 + 两个头，一个 ``forward`` 出全部输出。"""
+"""共享接触编码器的独立预训练包装：latent + 温度分布 + 有效性。"""
 
 from __future__ import annotations
 
@@ -9,46 +9,42 @@ import torch
 from torch import nn
 
 from models.thermal_encoder import ThermalEncoder
-from models.thermal_heads import ContactValidityHead, TemperatureHead
 
 
 @dataclass
 class ThermalOutput:
-    """一次前向的三个输出。"""
-
-    z: torch.Tensor  # (B, out_dim) 编码
-    temperature: torch.Tensor  # (B,) 预测温度 °C
-    valid_logit: torch.Tensor  # (B,) 本帧杯子是否有接触的 logit
+    z: torch.Tensor
+    temperature: torch.Tensor
+    temp_logvar: torch.Tensor
+    valid_logit: torch.Tensor
 
 
 class ThermalModel(nn.Module):
-    """序列 -> z -> 温度 / 接触有效性。"""
+    """6000集单触点预训练与VLA Stage 1共用同一编码器和预测头。"""
 
     def __init__(self, config: dict[str, Any]):
         super().__init__()
         model = dict(config["model"])
-        hidden = int(model["hidden"])
         self.encoder = ThermalEncoder(
             in_channels=int(model["in_channels"]),
-            hidden=hidden,
+            hidden=int(model["hidden"]),
             levels=int(model["levels"]),
             kernel=int(model["kernel"]),
             dropout=float(model["dropout"]),
             out_dim=int(model["out_dim"]),
         )
-        self.temperature_head = TemperatureHead(self.encoder.out_dim, hidden)
-        self.validity_head = ContactValidityHead(self.encoder.out_dim, hidden)
 
     @property
     def out_dim(self) -> int:
         return self.encoder.out_dim
 
     def forward(self, features: torch.Tensor, mask: torch.Tensor) -> ThermalOutput:
-        z = self.encoder(features, mask)
+        output = self.encoder.forward_output(features, mask)
         return ThermalOutput(
-            z=z,
-            temperature=self.temperature_head(z),
-            valid_logit=self.validity_head(z),
+            z=output.latent,
+            temperature=output.temp_mean_c.squeeze(-1),
+            temp_logvar=output.temp_logvar.squeeze(-1),
+            valid_logit=output.valid_logit.squeeze(-1),
         )
 
 

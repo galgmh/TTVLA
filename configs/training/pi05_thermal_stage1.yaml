@@ -1,7 +1,6 @@
 # Thermal-π0.5 分阶段训练 · Stage 1：只训练热觉编码器。
 #
-# 规格 §9：Stage 1 冻结 π0.5 主干，只训练接触编码器、点编码器、空间记忆与
-# 策略头，让热觉表示先学会读取触觉历史/表面点。loss 只回传热觉辅助项。
+# 修改版 Stage 1：纯热物理前向，不执行 SigLIP/PaliGemma/Action Expert。
 #
 # 数据格式见 models/pi05/thermal 与 training/pi05/data.py 的 thermalvla-1.0：
 # 一集一个 HDF5，root 指向导出目录。
@@ -15,6 +14,7 @@ checkpoint_dir: checkpoints/pi05_thermal/stage1
 resume: false
 overwrite: false
 pytorch_weight_path: null      # 云端转换好的 PyTorch π0.5 权重目录（含 model.safetensors）
+thermal_contact_checkpoint: null  # 例如 datasets/thermal_contact_v1/runs/thermal_encoder.pt
 thermal_stage: 1
 device: auto
 wandb:
@@ -25,28 +25,26 @@ model:
   paligemma_variant: gemma_2b
   action_expert_variant: gemma_300m
   pi05: true
-  action_dim: 7
+  action_dim: 32             # π0.5 官方内部动作维度；机器人维度见 data.action_dim
   action_horizon: 50
   max_token_len: 200
   dtype: bfloat16
   thermal:
     enabled: true
-    history_size: 8
+    memory_size: 8
     window_size: 25
     signal_dim: 14
-    num_surface_points: 64
     hidden_dim: 256
     thermal_latent_dim: 128
     num_spatial_tokens: 8
-    strategy_gumbel_tau: 1.0
-    min_grasp_score: 0.3
-    selection_mode: soft
+    num_skills: 4
+    field_fourier_bands: 6
+    prefix_adapter_hidden_dim: 512
+    prefix_gate_init: 0.01
     loss_weight_contact_temp: 0.2
     loss_weight_contact_valid: 0.1
     loss_weight_field_temp: 0.3
-    loss_weight_field_safe: 0.1
     loss_weight_skill: 0.2
-    loss_weight_target: 0.3
 
 data:
   kind: hdf5

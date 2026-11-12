@@ -11,12 +11,19 @@ import 路径由 ``openpi.*`` 改写为 ``models.pi05.*``；JAX/Flax 参考实�
 
 from models.pi05.observation import Observation
 from models.pi05.pi0_config import Pi0Config
-from models.pi05.pi0_pytorch import PI0Pytorch
-from models.pi05.pi0_pytorch import load_state_dict_compat
 from models.pi05.thermal import IntegratedThermalEncoder
 from models.pi05.thermal import IntegratedThermalOutput
 from models.pi05.thermal import ThermalPi0Config
 from models.pi05.thermal import ThermalSupervision
+
+
+def __getattr__(name: str):
+    """延迟导入 π0.5 主体，使纯 thermal Stage 1 不强制依赖 transformers。"""
+    if name in {"PI0Pytorch", "load_state_dict_compat"}:
+        from models.pi05.pi0_pytorch import PI0Pytorch, load_state_dict_compat
+
+        return {"PI0Pytorch": PI0Pytorch, "load_state_dict_compat": load_state_dict_compat}[name]
+    raise AttributeError(name)
 
 __all__ = [
     "IntegratedThermalEncoder",

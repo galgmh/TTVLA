@@ -45,10 +45,15 @@ def count_windows(
     import h5py
 
     with h5py.File(path, "r") as handle:
-        time = np.asarray(handle["time/sim_time"][...])[::stride]
-        mask = np.asarray(handle["obs/contact_mask"][...]).astype(bool)[::stride]
+        time = np.asarray(handle["sensor/time"][...])[::stride]
+        mask = np.asarray(handle["tactile/contact_mask"][...]).astype(bool)[::stride]
+        event_id = np.asarray(handle["tactile/contact_event_id"][...], dtype=np.int64)[::stride]
     ends = window_end_times(
-        {"time/sim_time": time, "obs/contact_mask": mask},
+        {
+            "sensor/time": time,
+            "tactile/contact_mask": mask,
+            "tactile/contact_event_id": event_id,
+        },
         min_contact_s=min_contact_s,
         window_stride_s=window_stride_s,
         no_contact_window_s=no_contact_window_s,

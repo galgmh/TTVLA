@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools==80.9.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,19 +7,37 @@ name = "thermtacvla"
 version = "0.1.0"
 description = "ThermalContact-v1: single-region thermal contact dataset generation on Genesis"
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+# OpenPI 的锁文件支持 Python >=3.11；本项目固定 Python 3.11 系列，以匹配
+# 当前 conda 环境、官方 π0.5 PyTorch 基线以及 transformers replacement。
+requires-python = "==3.11.*"
 dependencies = [
+    # PyTorch 不在此处声明；必须先按本机 CUDA 版本单独安装，避免 pip 选到
+    # 与 Genesis gs-madrona 不兼容的默认 CUDA wheel。
     "genesis-world==1.4.1",
-    "numpy>=1.26.4",
-    "h5py>=3.10",
-    "PyYAML>=6.0",
-    "scipy>=1.11",   # AABB 旋转、四元数换算
+    "numpy==1.26.4",
+    "h5py==3.13.0",
+    "PyYAML==6.0.2",
+    "scipy==1.15.3",
+    "opencv-python==4.11.0.86",
+    "pydantic==2.13.0",
+    "typing-extensions==4.14.1",
+    "transformers==4.53.2",
+    "tokenizers==0.21.1",
+    "safetensors==0.5.3",
+    "sentencepiece==0.2.0",
+    "huggingface-hub==0.32.3",
+    "pillow==11.2.1",
+    "matplotlib==3.10.3",
 ]
 
 [project.optional-dependencies]
-# torch 需按 CUDA 版本单独安装（见 README）：
-#   pip install torch --index-url https://download.pytorch.org/whl/cu128
-dev = ["matplotlib"]
+dev = [
+    "pytest==8.3.5",
+]
+wandb = ["wandb==0.19.11"]
 
 [tool.setuptools.packages.find]
 include = ["sim*", "data*", "models*", "training*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -19,7 +19,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 import numpy as np
@@ -140,16 +140,29 @@ class ProbeController:
         return normal, touching
 
     # ---------------------------------------------------------------- 主循环
-    def run(self, on_sample: Callable[[int], None] | None = None) -> ProbeOutcome:
-        """执行一整集；每 ``sample_every`` 个仿真步回调一次 ``on_sample``。"""
+    def run(
+        self,
+        on_sample: Callable[[int], None] | None = None,
+        on_control: Callable[[int], None] | None = None,
+    ) -> ProbeOutcome:
+        """执行一整集。
+
+        ``on_sample`` 在 100 Hz 传感器时间轴回调（含 t=0）；
+        ``on_control`` 在每个 20 Hz 策略步执行前回调。因此控制帧表示
+        “当前观测/状态 + 本步将执行的指令”。
+        """
         self._begin()
+        if on_sample is not None:
+            on_sample(self.sim_step)
         while self.phase not in ("DONE", "FAILED"):
             self._command()
+            if on_control is not None:
+                on_control(self.sim_step)
             for _ in range(self.decimation):
                 self.bundle.step()
+                self.sim_step += 1
                 if on_sample is not None and self.sim_step % self.sample_every == 0:
                     on_sample(self.sim_step)
-                self.sim_step += 1
             self.step_index += 1
             self.phase_steps += 1
             normal, touching = self.finger_forces()
@@ -285,9 +298,87 @@ class ProbeController:
             return
 
 
+class MultiProbeController:
+    """同一 episode 内顺序执行四次接触，不重置场景与指尖余温。"""
+
+    def __init__(self, bundle, spec):
+        if not spec.contact_order:
+            raise ValueError("MultiProbeController 需要非空 contact_order")
+        self.bundle = bundle
+        self.spec = spec
+        self.last_command: tuple[np.ndarray, float] | None = None
+        self.phase = "RESET"
+        self.current_region = -1
+        self.current_probe: ProbeController | None = None
+
+    def _child_spec(self, region: int):
+        name = self.spec.region_order[region]
+        return replace(
+            self.spec, target_region=region, mixed=False,
+            contact_hold_s=float(self.spec.contact_hold_s_by_region[region]),
+            probe_pos=self.spec.probe_positions[region],
+            probe_tool_dir=self.spec.probe_tool_dirs[region],
+            probe_finger_dir=self.spec.probe_finger_dirs[region],
+            probe_pre_dist=float(self.bundle.cfg["regions"][name]["pre_dist"]),
+            contact_order=(), contact_hold_s_by_region=(), probe_positions=(),
+            probe_tool_dirs=(), probe_finger_dirs=(),
+        )
+
+    def run(self, on_sample=None, on_control=None) -> ProbeOutcome:
+        global_sim_step = total_policy_steps = 0
+        peak_force = 0.0
+        first_contact = last_contact = None
+        failures: list[str] = []
+        sim_dt = float(self.bundle.cfg["controller"]["sim_dt"])
+
+        for sequence_index, region in enumerate(self.spec.contact_order):
+            self.current_region = int(region)
+            probe = ProbeController(self.bundle, self._child_spec(self.current_region))
+            self.current_probe = probe
+
+            def sample_callback(local_step: int) -> None:
+                if sequence_index > 0 and local_step == 0:
+                    return
+                if on_sample is not None:
+                    on_sample(global_sim_step + local_step)
+
+            def control_callback(local_step: int) -> None:
+                self.last_command = probe.last_command
+                self.phase = probe.phase
+                if on_control is not None:
+                    on_control(global_sim_step + local_step)
+
+            outcome = probe.run(on_sample=sample_callback, on_control=control_callback)
+            if outcome.contact_start_s is not None:
+                offset_s = global_sim_step * sim_dt
+                start = offset_s + outcome.contact_start_s
+                end = offset_s + float(outcome.contact_end_s or outcome.contact_start_s)
+                first_contact = start if first_contact is None else first_contact
+                last_contact = end
+            if outcome.termination_reason != "contact_stable":
+                failures.append(f"{self.spec.region_order[region]}:{outcome.termination_reason}")
+            global_sim_step += int(probe.sim_step)
+            total_policy_steps += int(outcome.policy_steps)
+            peak_force = max(peak_force, float(outcome.peak_normal_force_n))
+
+        self.phase = "DONE" if not failures else "FAILED"
+        return ProbeOutcome(
+            termination_reason=(
+                "multi_contact_complete" if not failures
+                else "multi_contact_partial:" + ",".join(failures)
+            ),
+            contact_detected=first_contact is not None,
+            contact_start_s=first_contact,
+            contact_end_s=last_contact,
+            policy_steps=total_policy_steps,
+            peak_normal_force_n=peak_force,
+        )
+
+
 __all__ = [
     "CONTACT_THRESHOLD_N",
     "MAX_POLICY_STEPS",
+    "MultiProbeController",
     "ProbeController",
     "ProbeOutcome",
     "SEEK_INSERT_SPEED_M_PER_S",

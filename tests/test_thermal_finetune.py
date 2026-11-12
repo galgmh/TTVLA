@@ -22,10 +22,9 @@ from training.pi05.thermal.step import thermal_train_step
 def _small_thermal() -> ThermalPi0Config:
     return ThermalPi0Config(
         enabled=True,
-        history_size=2,
+        memory_size=2,
         window_size=6,
         signal_dim=14,
-        num_surface_points=8,
         hidden_dim=32,
         thermal_latent_dim=16,
         num_spatial_tokens=4,
@@ -39,7 +38,7 @@ def _make_model() -> tuple[pi0_config.Pi0Config, pi0_pytorch.PI0Pytorch]:
         paligemma_variant="dummy",
         action_expert_variant="dummy",
         pi05=True,
-        action_dim=7,
+        action_dim=32,
         action_horizon=4,
         discrete_state_input=False,
         pytorch_compile_mode=None,
@@ -52,26 +51,17 @@ def _make_model() -> tuple[pi0_config.Pi0Config, pi0_pytorch.PI0Pytorch]:
 def _observation(cfg: pi0_config.Pi0Config, batch: int = 2) -> Observation:
     thermal = cfg.thermal
     assert thermal is not None
-    k, length, c, n = thermal.history_size, thermal.window_size, thermal.signal_dim, thermal.num_surface_points
+    length, c = thermal.window_size, thermal.signal_dim
     fields = {
         "images": {key: torch.rand(batch, 3, 32, 32) * 2 - 1 for key in IMAGE_KEYS},
         "image_masks": {key: torch.ones(batch, dtype=torch.bool) for key in IMAGE_KEYS},
         "state": torch.randn(batch, cfg.action_dim),
         "tokenized_prompt": torch.zeros(batch, 16, dtype=torch.long),
         "tokenized_prompt_mask": torch.ones(batch, 16, dtype=torch.bool),
-        "thermal_history": torch.randn(batch, k, length, c),
-        "thermal_history_time_mask": torch.ones(batch, k, length, dtype=torch.bool),
-        "contact_mask": torch.ones(batch, k, dtype=torch.bool),
-        "contact_xyz_obj": torch.randn(batch, k, 3),
-        "contact_normal_obj": torch.nn.functional.normalize(torch.randn(batch, k, 3), dim=-1),
-        "contact_age_s": torch.rand(batch, k, 1),
-        "surface_xyz_obj": torch.randn(batch, n, 3),
-        "surface_normal_obj": torch.nn.functional.normalize(torch.randn(batch, n, 3), dim=-1),
-        "surface_mask": torch.ones(batch, n, dtype=torch.bool),
-        "surface_reachable": torch.ones(batch, n, dtype=torch.bool),
-        "surface_grasp_score": torch.rand(batch, n, 1),
-        "ee_xyz_obj": torch.randn(batch, 3),
-        "probe_budget_remaining": torch.ones(batch, 1),
+        "thermal_window": torch.randn(batch, length, c),
+        "thermal_window_time_mask": torch.ones(batch, length, dtype=torch.bool),
+        "sensor_xyz_base": torch.randn(batch, 3),
+        "sensor_normal_base": torch.nn.functional.normalize(torch.randn(batch, 3), dim=-1),
     }
     return Observation(**fields)
 
@@ -80,13 +70,12 @@ def _supervision(cfg: pi0_config.Pi0Config, batch: int = 2) -> ThermalSupervisio
     thermal = cfg.thermal
     assert thermal is not None
     return ThermalSupervision(
-        contact_temp_c=torch.randn(batch, thermal.history_size, 1),
-        contact_valid=torch.ones(batch, thermal.history_size, 1),
-        surface_temp_c=torch.randn(batch, thermal.num_surface_points, 1),
-        surface_temp_mask=torch.ones(batch, thermal.num_surface_points, dtype=torch.bool),
-        surface_safe=torch.randint(0, 2, (batch, thermal.num_surface_points, 1)).float(),
-        strategy_type=torch.tensor([1, 2]),
-        target_surface_index=torch.tensor([0, 3]),
+        contact_temp_c=torch.randn(batch, 1),
+        contact_valid=torch.ones(batch, 1),
+        field_query_xyz_base=torch.randn(batch, 8, 3),
+        field_query_temp_c=torch.randn(batch, 8, 1),
+        field_query_mask=torch.ones(batch, 8, dtype=torch.bool),
+        strategy_type=torch.tensor([0, 1]),
     )
 
 
@@ -101,18 +90,16 @@ def test_stage1_only_trains_contact_and_spatial_modules():
     assert all(name.startswith("thermal_encoder.") for name in names)
     for prefix in (
         "thermal_encoder.contact_encoder.",
-        "thermal_encoder.point_encoder.",
         "thermal_encoder.spatial_memory.",
+        "thermal_encoder.field_decoder.",
     ):
         assert any(name.startswith(prefix) for name in names)
     # 策略与 prefix 投影在阶段 1 必须冻结。
-    assert not any("thermal_encoder.strategy." in name for name in names)
-    assert not any("thermal_encoder.spatial_proj." in name for name in names)
-    assert not any("thermal_encoder.goal_proj." in name for name in names)
-    assert not any("thermal_encoder.type_embedding" in name for name in names)
+    assert not any("thermal_encoder.strategy_aux." in name for name in names)
+    assert not any("thermal_encoder.prefix_adapter." in name for name in names)
 
 
-def test_stage2_only_trains_strategy():
+def test_stage2_only_trains_prefix_adapter():
     _, model = _make_model()
     counts = configure_stage(model, 2)
     names = trainable_parameter_names(model)
@@ -120,7 +107,7 @@ def test_stage2_only_trains_strategy():
     assert counts["thermal"] > 0
     assert counts["action_expert"] == 0
     assert names
-    assert all(name.startswith("thermal_encoder.strategy.") for name in names)
+    assert all(name.startswith("thermal_encoder.prefix_adapter.") for name in names)
 
 
 def test_stage3_trains_thermal_and_action_expert_but_not_vlm():
@@ -136,9 +123,17 @@ def test_stage3_trains_thermal_and_action_expert_but_not_vlm():
     assert not any(name.startswith("paligemma_with_expert.paligemma.") for name in names)
 
 
-def test_stage4_unfreezes_last_paligemma_layers_only():
+def test_stage4_trains_strategy_but_keeps_paligemma_frozen():
     _, model = _make_model()
-    configure_stage(model, 4, paligemma_last_layers=2)
+    configure_stage(model, 4)
+    names = trainable_parameter_names(model)
+    assert any(name.startswith("thermal_encoder.strategy_aux.") for name in names)
+    assert not any(name.startswith("paligemma_with_expert.paligemma.") for name in names)
+
+
+def test_stage5_unfreezes_last_paligemma_layers_only():
+    _, model = _make_model()
+    configure_stage(model, 5, paligemma_last_layers=2)
     names = trainable_parameter_names(model)
     layer_names = [name for name in names if ".language_model.layers." in name]
 
@@ -164,8 +159,8 @@ def test_parameter_groups_follow_stage_learning_rates():
     assert groups["thermal"]["lr"] == pytest.approx(1e-4)
     assert groups["action_expert"]["lr"] == pytest.approx(5e-5)
 
-    configure_stage(model, 4, paligemma_last_layers=2)
-    groups = {group["name"]: group for group in parameter_groups(model, 4)}
+    configure_stage(model, 5, paligemma_last_layers=2)
+    groups = {group["name"]: group for group in parameter_groups(model, 5)}
     assert set(groups) == {"thermal", "action_expert", "paligemma"}
     assert groups["paligemma"]["lr"] == pytest.approx(1e-5)
 
@@ -176,12 +171,13 @@ def test_parameter_groups_follow_stage_learning_rates():
 
 def test_stage_loss_keys():
     assert "flow" not in stage_loss_keys(1)
-    assert set(stage_loss_keys(1)) == {"contact_temp", "contact_valid", "field_temp", "field_safe"}
-    assert set(stage_loss_keys(2)) == {"skill", "target"}
+    assert set(stage_loss_keys(1)) == {"contact_temp", "contact_valid", "field_temp"}
+    assert set(stage_loss_keys(2)) == {"flow"}
     assert "flow" in stage_loss_keys(3)
     assert "flow" in stage_loss_keys(4)
+    assert "flow" in stage_loss_keys(5)
     with pytest.raises(ValueError, match="stage"):
-        stage_loss_keys(5)
+        stage_loss_keys(6)
 
 
 def test_stage1_optimizer_step_and_checkpoint_reload():
@@ -205,7 +201,8 @@ def test_stage1_optimizer_step_and_checkpoint_reload():
         loss_keys=stage_loss_keys(1),
     )
     assert total.requires_grad
-    assert "flow" in metrics
+    assert "flow" not in metrics
+    assert "weighted_field_temp" in metrics
     total.backward()
     optimizer.step()
 

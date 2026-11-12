@@ -1,9 +1,4 @@
-"""IntegratedThermalEncoder：把热觉历史/候选点/策略输出接成 π0.5 prefix token。
-
-输出 ``prefix_tokens`` 形状 [B, M+1, paligemma_width]，由 π0.5 的
-``embed_prefix`` 追加到图像与语言 token 之后；本模块不接触 noisy action
-suffix，也不修改 adaRMS 时间条件路径。
-"""
+"""在线Thermal-π0.5：当前滑动窗口编码、事件记忆和prefix注入。"""
 
 from __future__ import annotations
 
@@ -12,198 +7,181 @@ from torch import nn
 
 from models.pi05.thermal.config import ThermalPi0Config
 from models.pi05.thermal.contact_encoder import ThermalContactEncoder
+from models.pi05.thermal.field_decoder import SpatialFieldDecoder
+from models.pi05.thermal.memory_bank import ThermalMemoryBank
 from models.pi05.thermal.outputs import IntegratedThermalOutput
-from models.pi05.thermal.point_encoder import SurfacePointEncoder
-from models.pi05.thermal.spatial_memory import ContactTokenBuilder
-from models.pi05.thermal.spatial_memory import ThermalSpatialMemory
-from models.pi05.thermal.strategy import ActiveStrategyModule
+from models.pi05.thermal.prefix_adapter import ThermalPrefixAdapter
+from models.pi05.thermal.spatial_memory import ContactTokenBuilder, ThermalSpatialMemory
+from models.pi05.thermal.strategy_aux import GlobalSkillAuxHead
 
 
 def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """x: [B, T, D]；mask: [B, T] bool -> [B, D]。"""
-    w = mask.to(x.dtype).unsqueeze(-1)
-    return (x * w).sum(dim=1) / w.sum(dim=1).clamp_min(1.0)
+    weight = mask.to(x.dtype).unsqueeze(-1)
+    return (x * weight).sum(dim=1) / weight.sum(dim=1).clamp_min(1.0)
 
 
 class IntegratedThermalEncoder(nn.Module):
-    """热觉分支总装。所有维度来自 ``config``，宽度来自 π0.5 的 paligemma 配置。"""
+    """把当前热触觉窗口和内部完成接触记忆压成M个prefix token。"""
 
-    def __init__(
-        self,
-        config: ThermalPi0Config,
-        paligemma_width: int,
-        state_dim: int = 32,
-        num_heads: int = 8,
-        dropout: float = 0.0,
-    ):
+    def __init__(self, config: ThermalPi0Config, paligemma_width: int, state_dim: int = 32,
+                 num_heads: int = 8, dropout: float = 0.0):
         super().__init__()
         self.config = config
+        self.paligemma_width = paligemma_width
         self.contact_encoder = ThermalContactEncoder(
-            signal_dim=config.signal_dim,
-            latent_dim=config.thermal_latent_dim,
+            signal_dim=config.signal_dim, latent_dim=config.thermal_latent_dim
         )
         self.contact_builder = ContactTokenBuilder(
-            latent_dim=config.thermal_latent_dim,
-            hidden_dim=config.hidden_dim,
+            latent_dim=config.thermal_latent_dim, hidden_dim=config.hidden_dim
         )
-        self.point_encoder = SurfacePointEncoder(hidden_dim=config.hidden_dim)
         self.spatial_memory = ThermalSpatialMemory(
-            hidden_dim=config.hidden_dim,
-            num_spatial_tokens=config.num_spatial_tokens,
-            num_heads=num_heads,
-            dropout=dropout,
+            hidden_dim=config.hidden_dim, num_spatial_tokens=config.num_spatial_tokens,
+            num_heads=num_heads, dropout=dropout,
         )
-        self.strategy = ActiveStrategyModule(
-            hidden_dim=config.hidden_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            min_grasp_score=config.min_grasp_score,
-            gumbel_tau=config.strategy_gumbel_tau,
-            selection_mode=config.selection_mode,
+        self.prefix_adapter = ThermalPrefixAdapter(
+            hidden_dim=config.hidden_dim, paligemma_width=paligemma_width,
+            adapter_hidden_dim=config.prefix_adapter_hidden_dim, gate_init=config.prefix_gate_init,
         )
-        # 把 π0.5 的视觉/语言摘要投影到热觉模块宽度，再投影回 paligemma 宽度。
+        self.field_decoder = SpatialFieldDecoder(
+            hidden_dim=config.hidden_dim, bands=config.field_fourier_bands, num_heads=num_heads
+        )
+        self.strategy_aux = GlobalSkillAuxHead(hidden_dim=config.hidden_dim)
         self.image_proj = nn.Linear(paligemma_width, config.hidden_dim)
         self.language_proj = nn.Linear(paligemma_width, config.hidden_dim)
         self.state_proj = nn.Linear(state_dim, config.hidden_dim)
-        self.spatial_proj = nn.Linear(config.hidden_dim, paligemma_width)
-        self.goal_proj = nn.Linear(config.hidden_dim, paligemma_width)
-        # 两类新增 token 的可学习类型嵌入：0=空间记忆, 1=主动目标。
-        self.type_embedding = nn.Parameter(torch.zeros(2, 1, paligemma_width))
+        self.memory_bank = ThermalMemoryBank(
+            config.memory_size, config.hidden_dim,
+            on_threshold=config.contact_on_threshold,
+            off_threshold=config.contact_off_threshold,
+            on_steps=config.contact_on_steps,
+            off_steps=config.contact_off_steps,
+            momentum=config.active_token_momentum,
+        )
+
+    def reset_memory(self, batch_size: int | None = None, *, device=None, dtype=None) -> None:
+        """新episode开始时调用；不传batch_size则完全清除，下一次前向自动初始化。"""
+        if batch_size is None:
+            self.memory_bank.clear()
+            return
+        parameter = next(self.parameters())
+        self.memory_bank.reset(
+            batch_size, device=parameter.device if device is None else torch.device(device),
+            dtype=parameter.dtype if dtype is None else dtype,
+        )
 
     def _get(self, observation, name: str, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
         value = getattr(observation, name, None)
         if value is None:
-            raise ValueError(f"thermal_enabled=True 时 observation.{name} 不能为 None")
-        if value.is_floating_point():
-            return value.to(device=device, dtype=dtype)
-        return value.to(device=device)
+            raise ValueError(f"thermal_enabled=True时observation.{name}不能为None")
+        return value.to(device=device, dtype=dtype) if value.is_floating_point() else value.to(device=device)
 
     def _validate_shapes(self, observation) -> None:
-        cfg = self.config
         required = (
-            "thermal_history",
-            "thermal_history_time_mask",
-            "contact_mask",
-            "contact_xyz_obj",
-            "contact_normal_obj",
-            "contact_age_s",
-            "surface_xyz_obj",
-            "surface_normal_obj",
-            "surface_mask",
-            "surface_reachable",
-            "surface_grasp_score",
-            "ee_xyz_obj",
-            "probe_budget_remaining",
+            "thermal_window", "thermal_window_time_mask", "sensor_xyz_base",
+            "sensor_normal_base",
         )
         missing = [name for name in required if getattr(observation, name, None) is None]
         if missing:
-            raise ValueError(f"thermal_enabled=True 时 observation 缺少热觉字段: {missing}")
+            raise ValueError(f"thermal_enabled=True时observation缺少字段: {missing}")
+        window = observation.thermal_window
+        expected = (self.config.window_size, self.config.signal_dim)
+        if window.dim() != 3 or tuple(window.shape[1:]) != expected:
+            raise ValueError(f"thermal_window必须为[B,L,C]且L/C={expected}，得到{tuple(window.shape)}")
+        if observation.thermal_window_time_mask.shape != window.shape[:2]:
+            raise ValueError("thermal_window_time_mask必须为[B,L]")
 
-        history = observation.thermal_history
-        if history.dim() != 4:
-            raise ValueError(f"thermal_history 必须是 [B,K,L,C]，得到 {tuple(history.shape)}")
-        b, k, length, channels = history.shape
-        if k != cfg.history_size or length != cfg.window_size or channels != cfg.signal_dim:
-            raise ValueError(
-                "thermal_history 形状与 ThermalPi0Config 不一致："
-                f"得到 K={k}, L={length}, C={channels}；期望 K={cfg.history_size}, "
-                f"L={cfg.window_size}, C={cfg.signal_dim}"
-            )
-        if observation.surface_xyz_obj.shape[1] != cfg.num_surface_points:
-            raise ValueError(
-                f"surface_xyz_obj 的 N={observation.surface_xyz_obj.shape[1]}，"
-                f"期望 {cfg.num_surface_points}"
-            )
-
-    def forward(
-        self,
-        observation,
-        image_embeddings: list[torch.Tensor],
-        language_embeddings: torch.Tensor,
-    ) -> IntegratedThermalOutput:
-        cfg = self.config
-        param = next(self.parameters())
-        dtype, device = param.dtype, param.device
-        self._validate_shapes(observation)
-
-        history = self._get(observation, "thermal_history", dtype, device)
-        time_mask = self._get(observation, "thermal_history_time_mask", dtype, device).bool()
-        contact_mask = self._get(observation, "contact_mask", dtype, device).bool()
-
-        # --- π0.5 视觉/语言摘要 ---
-        image_masks = getattr(observation, "image_masks", None)
-        summaries, weights = [], []
-        for i, emb in enumerate(image_embeddings):
-            if image_masks is None:
-                weight = emb.new_ones(emb.shape[0], 1)
-            else:
-                weight = list(image_masks.values())[i].to(device=device, dtype=dtype).view(-1, 1)
-            summaries.append(emb.to(dtype).mean(dim=1) * weight)
-            weights.append(weight)
-        if summaries:
-            image_summary = torch.stack(summaries).sum(0) / torch.stack(weights).sum(0).clamp_min(1.0)
-        else:
-            image_summary = param.new_zeros(history.shape[0], cfg.hidden_dim)
-
-        lang = language_embeddings.to(dtype=dtype, device=device)
-        lang_mask = getattr(observation, "tokenized_prompt_mask", None)
-        lang_summary = (
-            lang.mean(dim=1) if lang_mask is None else _masked_mean(lang, lang_mask.to(device=device).bool())
+    def _encode_current(self, observation):
+        parameter = next(self.parameters())
+        dtype, device = parameter.dtype, parameter.device
+        window = self._get(observation, "thermal_window", dtype, device)
+        time_mask = self._get(observation, "thermal_window_time_mask", dtype, device).bool()
+        contact = self.contact_encoder(window, time_mask)
+        normal = torch.nn.functional.normalize(
+            self._get(observation, "sensor_normal_base", dtype, device), dim=-1, eps=1e-6
         )
-        lang_summary = self.language_proj(lang_summary)
-
-        # --- 局部接触编码 -> contact token ---
-        contact = self.contact_encoder(history, time_mask, contact_mask)
-        contact_tokens = self.contact_builder(
+        token = self.contact_builder(
             contact.latent,
-            self._get(observation, "contact_xyz_obj", dtype, device),
-            self._get(observation, "contact_normal_obj", dtype, device),
+            self._get(observation, "sensor_xyz_base", dtype, device),
+            normal,
             contact.temp_mean_c,
             contact.temp_logvar,
             torch.sigmoid(contact.valid_logit),
-            self._get(observation, "contact_age_s", dtype, device),
         )
+        return contact, token, time_mask.any(dim=1)
 
-        # --- 候选表面点编码 -> 空间记忆 ---
-        surface_features = self.point_encoder(
-            self._get(observation, "surface_xyz_obj", dtype, device),
-            self._get(observation, "surface_normal_obj", dtype, device),
-            self._get(observation, "surface_reachable", dtype, device),
-            self._get(observation, "surface_grasp_score", dtype, device),
-            self._get(observation, "ee_xyz_obj", dtype, device),
-        )
-        memory = self.spatial_memory(
-            contact_tokens,
-            contact_mask,
-            surface_features,
-            self._get(observation, "surface_mask", dtype, device).bool(),
-            lang_summary,
-        )
+    def _memory_input(self, token, contact, window_present, *, update_memory: bool):
+        probability = torch.sigmoid(contact.valid_logit)
+        if update_memory:
+            self.memory_bank.update(token, probability)
+            return self.memory_bank.read_with_current(token, probability)
+        # 训练batch默认相互独立：只使用当前临时token，不持久化跨样本状态。
+        return token[:, None], window_present[:, None]
 
-        # --- 主动策略 ---
-        strategy = self.strategy(
-            surface_features=memory.surface_features,
-            surface_mask=self._get(observation, "surface_mask", dtype, device).bool(),
-            surface_reachable=self._get(observation, "surface_reachable", dtype, device).bool(),
-            surface_grasp_score=self._get(observation, "surface_grasp_score", dtype, device),
-            image_summary=self.image_proj(image_summary),
-            language_summary=lang_summary,
-            robot_state=self.state_proj(self._get(observation, "state", dtype, device)),
-            probe_budget=self._get(observation, "probe_budget_remaining", dtype, device),
-        )
-
-        # --- 压缩成 π0.5 prefix token：M 个空间记忆 token + 1 个主动目标 token ---
-        spatial_tokens = self.spatial_proj(memory.spatial_latents) + self.type_embedding[0]
-        goal_token = self.goal_proj(strategy.goal_feature).unsqueeze(1) + self.type_embedding[1]
-        prefix_tokens = torch.cat([spatial_tokens, goal_token], dim=1)
-        prefix_mask = torch.ones(prefix_tokens.shape[:2], dtype=torch.bool, device=device)
-
+    def forward_physical(self, observation) -> IntegratedThermalOutput:
+        """Stage 1单窗口热物理路径，不运行视觉、语言、prefix或在线持久记忆。"""
+        self._validate_shapes(observation)
+        parameter = next(self.parameters())
+        contact, token, present = self._encode_current(observation)
+        memory = self.spatial_memory(token[:, None], present[:, None])
+        batch = token.shape[0]
         return IntegratedThermalOutput(
-            prefix_tokens=prefix_tokens,
-            prefix_mask=prefix_mask,
-            contact=contact,
-            field_temp_mean_c=memory.temp_mean_c,
-            field_temp_logvar=memory.temp_logvar,
-            field_safe_logit=memory.safe_logit,
-            strategy=strategy,
+            prefix_tokens=parameter.new_zeros((batch, 0, self.paligemma_width)),
+            prefix_mask=torch.zeros((batch, 0), dtype=torch.bool, device=parameter.device),
+            contact=contact, spatial_latents=memory.spatial_latents, field=None, strategy=None,
         )
+
+    def decode_field(self, output: IntegratedThermalOutput, query_xyz_base: torch.Tensor) -> None:
+        parameter = next(self.parameters())
+        output.field = self.field_decoder(
+            output.spatial_latents,
+            query_xyz_base.to(device=parameter.device, dtype=parameter.dtype),
+        )
+
+    def forward(self, observation, image_embeddings: list[torch.Tensor],
+                language_embeddings: torch.Tensor, *, update_memory: bool = False) -> IntegratedThermalOutput:
+        self._validate_shapes(observation)
+        parameter = next(self.parameters())
+        dtype, device = parameter.dtype, parameter.device
+        batch = observation.thermal_window.shape[0]
+
+        image_masks = getattr(observation, "image_masks", None)
+        summaries, weights = [], []
+        for index, embedding in enumerate(image_embeddings):
+            embedding = embedding.to(device=device, dtype=dtype)
+            weight = embedding.new_ones((batch, 1)) if image_masks is None else (
+                list(image_masks.values())[index].to(device=device, dtype=dtype).view(-1, 1)
+            )
+            summaries.append(embedding.mean(dim=1) * weight)
+            weights.append(weight)
+        image_base = (
+            torch.stack(summaries).sum(0) / torch.stack(weights).sum(0).clamp_min(1.0)
+            if summaries else parameter.new_zeros((batch, self.paligemma_width))
+        )
+        image_summary = self.image_proj(image_base)
+
+        language = language_embeddings.to(device=device, dtype=dtype)
+        language_mask = getattr(observation, "tokenized_prompt_mask", None)
+        language_base = language.mean(dim=1) if language_mask is None else _masked_mean(
+            language, language_mask.to(device=device).bool()
+        )
+
+        contact, current_token, present = self._encode_current(observation)
+        tokens, token_mask = self._memory_input(
+            current_token, contact, present, update_memory=update_memory
+        )
+        memory = self.spatial_memory(tokens, token_mask)
+        prefix_tokens = self.prefix_adapter(memory.spatial_latents)
+        prefix_mask = torch.ones(prefix_tokens.shape[:2], dtype=torch.bool, device=device)
+        strategy = self.strategy_aux(
+            spatial_latents=memory.spatial_latents,
+            image_summary=image_summary,
+            language_summary=self.language_proj(language_base),
+            robot_state=self.state_proj(self._get(observation, "state", dtype, device)),
+        )
+        return IntegratedThermalOutput(
+            prefix_tokens=prefix_tokens, prefix_mask=prefix_mask, contact=contact,
+            spatial_latents=memory.spatial_latents, field=None, strategy=strategy,
+        )
+
+
+__all__ = ["IntegratedThermalEncoder"]

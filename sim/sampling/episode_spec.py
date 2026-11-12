@@ -69,15 +69,25 @@ class EpisodeSpec:
     # ---- 记录用：材质参数（有序元组，保证可哈希/不可变）
     material_parameters: tuple[tuple[str, float], ...] = field(default_factory=tuple)
 
+    # ---- 多接触 episode（空元组表示旧的单接触规格）
+    instruction: str = ""
+    contact_order: tuple[int, ...] = field(default_factory=tuple)
+    contact_hold_s_by_region: tuple[float, ...] = field(default_factory=tuple)
+    probe_positions: tuple[tuple[float, float, float], ...] = field(default_factory=tuple)
+    probe_tool_dirs: tuple[tuple[float, float, float], ...] = field(default_factory=tuple)
+    probe_finger_dirs: tuple[tuple[float, float, float], ...] = field(default_factory=tuple)
+
     def __post_init__(self) -> None:
         if len(self.region_order) != 4:
             raise ValueError(f"region_order 必须是 4 项，实为 {self.region_order}")
         if len(self.link_temps_c) != 4:
             raise ValueError(f"link_temps_c 必须是 4 项，实为 {self.link_temps_c}")
-        if not -1 <= int(self.target_region) < 4:
-            raise ValueError(f"target_region 必须在 [-1, 3]，实为 {self.target_region}")
-        if self.mixed != (int(self.target_region) == -1):
-            raise ValueError("mixed 与 target_region == -1 必须一致")
+        if not -2 <= int(self.target_region) < 4:
+            raise ValueError(f"target_region 必须在 [-2, 3]，实为 {self.target_region}")
+        if int(self.target_region) == -1 and not self.mixed:
+            raise ValueError("target_region == -1 专用于 mixed contact")
+        if int(self.target_region) == -2 and self.mixed:
+            raise ValueError("target_region == -2 表示多区域顺序接触，不是 mixed contact")
         if self.contact_quality not in ("stable", "brief", "failed"):
             raise ValueError(f"未知接触质量 {self.contact_quality!r}")
         if self.contact_hold_s < 0.0:
@@ -88,10 +98,23 @@ class EpisodeSpec:
             raise ValueError(f"sensor_rc_s 超出合理范围：{self.sensor_rc_s}")
         if self.sensor_quantization_c < 0.0 or self.sensor_noise_c < 0.0:
             raise ValueError("噪声与量化必须非负")
+        if self.contact_order:
+            if sorted(self.contact_order) != list(range(4)):
+                raise ValueError(f"contact_order 必须是 0..3 的全排列：{self.contact_order}")
+            for name, values in (
+                ("contact_hold_s_by_region", self.contact_hold_s_by_region),
+                ("probe_positions", self.probe_positions),
+                ("probe_tool_dirs", self.probe_tool_dirs),
+                ("probe_finger_dirs", self.probe_finger_dirs),
+            ):
+                if len(values) != 4:
+                    raise ValueError(f"{name} 必须是按 region_order 排列的 4 项")
 
     # ------------------------------------------------------------ 便捷派生值
     @property
     def target_region_name(self) -> str:
+        if self.target_region == -2:
+            return "multi"
         return "mixed" if self.target_region < 0 else self.region_order[int(self.target_region)]
 
     @property
@@ -128,6 +151,12 @@ class EpisodeSpec:
             "cup_xy_jitter_m": [float(v) for v in self.cup_xy_jitter_m],
             "cup_yaw_jitter_rad": float(self.cup_yaw_jitter_rad),
             "material_parameters": {k: float(v) for k, v in self.material_parameters},
+            "instruction": self.instruction,
+            "contact_order": [int(v) for v in self.contact_order],
+            "contact_hold_s_by_region": [float(v) for v in self.contact_hold_s_by_region],
+            "probe_positions": [[float(x) for x in v] for v in self.probe_positions],
+            "probe_tool_dirs": [[float(x) for x in v] for v in self.probe_tool_dirs],
+            "probe_finger_dirs": [[float(x) for x in v] for v in self.probe_finger_dirs],
         }
 
     @classmethod
@@ -163,6 +192,12 @@ class EpisodeSpec:
             material_parameters=tuple(
                 sorted((str(k), float(v)) for k, v in data["material_parameters"].items())
             ),
+            instruction=str(data.get("instruction", "")),
+            contact_order=tuple(int(v) for v in data.get("contact_order", ())),
+            contact_hold_s_by_region=tuple(float(v) for v in data.get("contact_hold_s_by_region", ())),
+            probe_positions=tuple(tuple(float(x) for x in v) for v in data.get("probe_positions", ())),
+            probe_tool_dirs=tuple(tuple(float(x) for x in v) for v in data.get("probe_tool_dirs", ())),
+            probe_finger_dirs=tuple(tuple(float(x) for x in v) for v in data.get("probe_finger_dirs", ())),
         )
 
 

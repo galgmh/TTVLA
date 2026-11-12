@@ -1,11 +1,25 @@
-# ThermalContact-v1 数据采样规则（第一阶段：单区域接触）。
-#
-# 每集只探测一个区域；四段 link 的初始温度从 5 种固定情景中选一种，
-# 每段在情景给定的区间内均匀采样。划分按完整参数组合生成（manifest），
-# 绝不按帧切分。
+# ThermalContact-v1 数据采样规则：每集依次探测四个区域。
 dataset_version: thermalcontact-v1
 output_dir: datasets/thermal_contact_v1
 seed: 20261108
+instruction: "触碰杯子并感受其温度分布"
+multi_contact: true
+
+# 12 个严格平衡时长方案，列顺序固定为
+# [lower, middle, upper, handle]。每一列的 0.2/0.5/0.8 s 各出现 4 次。
+contact_duration_schedules:
+  - [0.2, 0.2, 0.2, 0.2]
+  - [0.5, 0.5, 0.5, 0.5]
+  - [0.8, 0.8, 0.8, 0.8]
+  - [0.2, 0.5, 0.8, 0.2]
+  - [0.5, 0.8, 0.2, 0.5]
+  - [0.8, 0.2, 0.5, 0.8]
+  - [0.2, 0.8, 0.5, 0.2]
+  - [0.5, 0.2, 0.8, 0.5]
+  - [0.8, 0.5, 0.2, 0.8]
+  - [0.2, 0.2, 0.5, 0.5]
+  - [0.5, 0.5, 0.8, 0.8]
+  - [0.8, 0.8, 0.2, 0.2]
 
 # 原始记录 100 Hz；训练集重采样到 50 Hz（加载器负责）。
 sample_hz: 100.0
@@ -27,19 +41,18 @@ region_temps_c:
   - {lower: [35.0, 40.0], middle: [30.0, 33.0], upper: [25.0, 27.0], handle: [25.0, 27.0]}
   - {lower: [31.0, 34.0], middle: [29.0, 30.0], upper: [26.0, 28.0], handle: [47.0, 55.0]}
 
-# 指尖初始温度：70% 直接初始化在常温（取传感器配置的 ambient_temp_c），
-# 30% 携带历史余温。初始化后读数即为该温度，记录不含收敛过渡。
+# 所有 episode 的左右指尖都从环境温度 25°C 开始。
 fingertip:
-  history_mode_c: [15.0, 40.0]
-  history_probability: 0.3
-  pair_delta_c: [-1.5, 1.5]    # 仅 history 分支：左右指尖的小差异
-  physical_range_c: [10.0, 45.0]
+  history_mode_c: [25.0, 25.0]
+  history_probability: 0.0
+  pair_delta_c: [0.0, 0.0]
+  physical_range_c: [25.0, 25.0]
 
 # 力档位：目标法向力 = nominal_force_n × 档位，实际力逐帧记录。
 force_levels: [0.7, 1.0, 1.3]
 
 # 接触质量：80% 稳定 / 10% 短暂或低力 / 10% 失败（未接触）。
-contact_quality_probabilities: {stable: 0.8, brief: 0.1, failed: 0.1}
+contact_quality_probabilities: {stable: 1.0, brief: 0.0, failed: 0.0}
 
 # 传感器随机化：乘性范围缩放名义值；偏置为加性 °C。
 sensor:
@@ -54,13 +67,13 @@ sensor:
     quantization_multiplier_range: [0.6, 1.5]
     bias_absolute_range: [-0.05, 0.05]
 
-# 各划分集数（缩小规模：训练集 20k → 12k，总计 15.2k；原设计 36k）。
+# 完整析因集：5 温度情景 × 24 接触顺序 × 12 时长方案 = 1440。
+# 先生成 train 主集，后续再按 episode 组合做无泄漏划分。
 splits:
-  train: 12000
-  validation: 2000
-  test_id: 400
-  test_finger_history: 300
-  test_sensor_shift: 300
-  test_mixed_contact: 200
-  # 试生产：4 区域 × 250。
-  pilot: 1000
+  train: 1440
+  validation: 0
+  test_id: 0
+  test_finger_history: 0
+  test_sensor_shift: 0
+  test_mixed_contact: 0
+  pilot: 0

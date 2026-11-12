@@ -17,6 +17,10 @@ from models.pi05.thermal.config import ThermalPi0Config
 #: PaliGemma 词表大小。
 PALIGEMMA_VOCAB_SIZE = 257_152
 
+#: 官方 π0.5 基座统一使用的内部动作维度。机器人/数据集的实际动作维度由
+#: ``training.pi05.config.DataConfig.action_dim`` 单独描述，并在数据边界补零/裁剪。
+PI05_ACTION_DIM = 32
+
 
 @dataclasses.dataclass
 class Config:
@@ -96,6 +100,11 @@ class Pi0Config:
     thermal: ThermalPi0Config | None = None
 
     def __post_init__(self):
+        if self.pi05 and self.action_dim != PI05_ACTION_DIM:
+            raise ValueError(
+                f"π0.5 内部 action_dim 必须保持官方的 {PI05_ACTION_DIM}，得到 {self.action_dim}；"
+                "机器人实际动作维度请设置 data.action_dim，数据管线会自动补零/裁剪"
+            )
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
@@ -111,6 +120,7 @@ class Pi0Config:
 
 __all__ = [
     "PALIGEMMA_VOCAB_SIZE",
+    "PI05_ACTION_DIM",
     "Config",
     "Pi0Config",
     "Variant",

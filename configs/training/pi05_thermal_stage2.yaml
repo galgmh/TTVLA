@@ -1,7 +1,7 @@
-# Thermal-π0.5 分阶段训练 · Stage 2：只训练主动策略头。
+# Thermal-π0.5 分阶段训练 · Stage 2：热 memory 到 prefix 对齐。
 #
-# 规格 §9：Stage 2 在 Stage 1 学到的热觉表示上训练技能分类（OTHER/PROBE/GRASP）
-# 与目标点选择，loss 只回传 skill + target。其余模块全部冻结。
+# 只训练 gated ThermalPrefixAdapter；PaliGemma 与 Action Expert 参数冻结，但保留
+# 对输入 token 的梯度，以 flow loss 学会读取热空间 memory。
 exp_name: thermal_pi05_stage2
 seed: 0
 dtype: bfloat16
@@ -22,7 +22,7 @@ model:
   paligemma_variant: gemma_2b
   action_expert_variant: gemma_300m
   pi05: true
-  action_dim: 7
+  action_dim: 32             # π0.5 官方内部动作维度；机器人维度见 data.action_dim
   action_horizon: 50
   max_token_len: 200
   dtype: bfloat16

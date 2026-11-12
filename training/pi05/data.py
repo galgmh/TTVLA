@@ -5,31 +5,22 @@
     episode.hdf5
       attrs:
         language_instruction   (可选，字节/字符串；缺省用 config.data.prompt)
+        thermal_strategy_schema = "probe-grasp-retract-abort-v1"
       images/<camera_key>      [T, H, W, 3] uint8
       state                    [T, S] float32
       actions                  [T, ah, ad] float32
-      thermal/                 13 个 Observation 热觉字段（逐帧）
-        thermal_history            [T, K, L, C] float32
-        thermal_history_time_mask  [T, K, L] bool
-        contact_mask               [T, K] bool
-        contact_xyz_obj            [T, K, 3] float32
-        contact_normal_obj         [T, K, 3] float32
-        contact_age_s              [T, K, 1] float32
-        surface_xyz_obj            [T, N, 3] float32
-        surface_normal_obj         [T, N, 3] float32
-        surface_mask               [T, N] bool
-        surface_reachable          [T, N] bool
-        surface_grasp_score        [T, N, 1] float32
-        ee_xyz_obj                 [T, 3] float32
-        probe_budget_remaining     [T, 1] float32
-      supervision/             7 个特权监督字段（只进损失，不进 Observation）
-        contact_temp_c             [T, K, 1] float32
-        contact_valid              [T, K, 1] float32
-        surface_temp_c             [T, N, 1] float32
-        surface_temp_mask          [T, N] bool
-        surface_safe               [T, N, 1] float32
-        strategy_type              [T] int64（0=OTHER, 1=PROBE, 2=GRASP）
-        target_surface_index       [T] int64（OTHER 时为 -1）
+      thermal/                 5个运行时热觉字段（逐帧）
+        thermal_window             [T, L, C] float32
+        thermal_window_time_mask   [T, L] bool
+        sensor_xyz_base            [T, 3] float32
+        sensor_normal_base         [T, 3] float32
+      supervision/             6个训练/评测字段（不进控制prefix）
+        contact_temp_c             [T, 1] float32
+        contact_valid              [T, 1] float32
+        field_query_xyz_base       [T, Q, 3] float32
+        field_query_temp_c         [T, Q, 1] float32
+        field_query_mask           [T, Q] bool
+        strategy_type              [T] int64（0=PROBE,1=GRASP,2=RETRACT,3=ABORT）
 
 ``FakeThermalVlaDataset`` 生成形状合法的随机样本，只用于冒烟测试和单元测试。
 """
@@ -57,18 +48,19 @@ from training.pi05.transforms import Normalizer, pad_to_dim, prepare_sample
 
 logger = logging.getLogger(__name__)
 
+THERMAL_STRATEGY_SCHEMA = "probe-grasp-retract-abort-v1"
+
 #: 监督字段及其 dtype（bool / 整数项单独处理）。
 SUPERVISION_FIELDS = (
     "contact_temp_c",
     "contact_valid",
-    "surface_temp_c",
-    "surface_temp_mask",
-    "surface_safe",
+    "field_query_xyz_base",
+    "field_query_temp_c",
+    "field_query_mask",
     "strategy_type",
-    "target_surface_index",
 )
-_SUPERVISION_BOOL = frozenset({"surface_temp_mask"})
-_SUPERVISION_INT = frozenset({"strategy_type", "target_surface_index"})
+_SUPERVISION_BOOL = frozenset({"field_query_mask"})
+_SUPERVISION_INT = frozenset({"strategy_type"})
 
 
 # --------------------------------------------------------------------------- #
@@ -131,30 +123,20 @@ class FakeThermalVlaDataset(ThermalVlaDataset):
         thermal = self._thermal
         if thermal is None:
             return sample
-        k, length, channels, n = thermal.history_size, thermal.window_size, thermal.signal_dim, thermal.num_surface_points
+        length, channels, q = thermal.window_size, thermal.signal_dim, 16
         sample.update(
             {
-                "thermal_history": rng.uniform(-5, 45, (k, length, channels)).astype(np.float32),
-                "thermal_history_time_mask": rng.random((k, length)) > 0.2,
-                "contact_mask": rng.random(k) > 0.3,
-                "contact_xyz_obj": rng.uniform(-1, 1, (k, 3)).astype(np.float32),
-                "contact_normal_obj": _unit_vectors(rng, k).astype(np.float32),
-                "contact_age_s": rng.uniform(0, 10, (k, 1)).astype(np.float32),
-                "surface_xyz_obj": rng.uniform(-1, 1, (n, 3)).astype(np.float32),
-                "surface_normal_obj": _unit_vectors(rng, n).astype(np.float32),
-                "surface_mask": rng.random(n) > 0.1,
-                "surface_reachable": rng.random(n) > 0.2,
-                "surface_grasp_score": rng.uniform(0, 1, (n, 1)).astype(np.float32),
-                "ee_xyz_obj": rng.uniform(-1, 1, 3).astype(np.float32),
-                "probe_budget_remaining": np.asarray([rng.uniform(0, 1)], dtype=np.float32),
+                "thermal_window": rng.uniform(-5, 45, (length, channels)).astype(np.float32),
+                "thermal_window_time_mask": rng.random(length) > 0.2,
+                "sensor_xyz_base": rng.uniform(-1, 1, (3,)).astype(np.float32),
+                "sensor_normal_base": _unit_vectors(rng, 1)[0].astype(np.float32),
                 "thermal_supervision": {
-                    "contact_temp_c": rng.uniform(-5, 45, (k, 1)).astype(np.float32),
-                    "contact_valid": (rng.random((k, 1)) > 0.3).astype(np.float32),
-                    "surface_temp_c": rng.uniform(-5, 45, (n, 1)).astype(np.float32),
-                    "surface_temp_mask": rng.random(n) > 0.1,
-                    "surface_safe": rng.random((n, 1)).astype(np.float32),
-                    "strategy_type": np.int64(index % 3),
-                    "target_surface_index": np.int64(index % n),
+                    "contact_temp_c": rng.uniform(-5, 45, (1,)).astype(np.float32),
+                    "contact_valid": (rng.random((1,)) > 0.3).astype(np.float32),
+                    "field_query_xyz_base": rng.uniform(-1, 1, (q, 3)).astype(np.float32),
+                    "field_query_temp_c": rng.uniform(-5, 45, (q, 1)).astype(np.float32),
+                    "field_query_mask": rng.random(q) > 0.1,
+                    "strategy_type": np.int64(index % 4),
                 },
             }
         )
@@ -199,6 +181,14 @@ class Hdf5ThermalVlaDataset(ThermalVlaDataset):
                 if self._camera_keys is None:
                     self._camera_keys = tuple(sorted(f["images"].keys()))
                 if self._thermal is not None:
+                    schema = f.attrs.get("thermal_strategy_schema")
+                    if isinstance(schema, bytes):
+                        schema = schema.decode("utf-8")
+                    if schema != THERMAL_STRATEGY_SCHEMA:
+                        raise ValueError(
+                            f"{path} 的 thermal_strategy_schema={schema!r}；期望 "
+                            f"{THERMAL_STRATEGY_SCHEMA!r}。旧 OTHER/PROBE/GRASP 编号不能静默复用"
+                        )
                     missing = [key for key in THERMAL_OBSERVATION_KEYS if key not in f["thermal"]]
                     if missing:
                         raise ValueError(f"{path} 缺少热觉字段 {missing}")
@@ -338,9 +328,9 @@ def resolve_normalizer(cfg: DataConfig, dataset: ThermalVlaDataset) -> Normalize
     arrays = dataset.stats()
     if arrays is None:
         raise ValueError("数据集没有可用于归一化统计的 state/actions")
-    # 与 prepare_sample 一致：state/action 都截到 action_dim 后再统计。
+    # action 按机器人动作维度整理；state 保留数据集原生维度（例如 LIBERO
+    # state=8、action=7），二者归一化后才在 prepare_sample 中补到模型 32 维。
     states, actions = arrays
-    states = pad_to_dim(states, cfg.action_dim)
     actions = pad_to_dim(actions, cfg.action_dim)
     logger.info("正在从数据集统计 state/action 归一化参数（%d 帧）", states.shape[0])
     return Normalizer.compute(states, actions)
@@ -368,6 +358,7 @@ def build_dataloader(
         image_keys=cfg.data.image_keys,
         action_dim=cfg.data.action_dim,
         action_horizon=cfg.data.action_horizon,
+        model_action_dim=cfg.model.action_dim,
     )
     loader = DataLoader(
         _TransformedDataset(dataset, transform),
@@ -383,6 +374,7 @@ def build_dataloader(
 
 __all__ = [
     "SUPERVISION_FIELDS",
+    "THERMAL_STRATEGY_SCHEMA",
     "FakeThermalVlaDataset",
     "Hdf5ThermalVlaDataset",
     "ThermalVlaDataset",

@@ -213,12 +213,12 @@ class PI0Pytorch(nn.Module):
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks, observation=None
+        self, images, img_masks, lang_tokens, lang_masks, observation=None, *, update_thermal_memory=False
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, "IntegratedThermalOutput | None"]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
 
-        thermal_enabled=True 时额外追加 M 个空间记忆 token + 1 个主动目标 token
+        thermal_enabled=True 时额外追加 M 个热空间记忆 token；策略辅助头不进入 prefix
         （与图像/语言同一 attention block，att_masks 为 0）。
         """
         embs = []
@@ -258,7 +258,7 @@ class PI0Pytorch(nn.Module):
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
-        # Thermal-π0.5：热觉历史 + 候选点 + 主动目标 -> prefix token。
+        # 修改版 Thermal-π0.5：只有热空间 memory -> prefix token。
         thermal_output = None
         if self.thermal_enabled:
             if observation is None:
@@ -267,6 +267,7 @@ class PI0Pytorch(nn.Module):
                 observation,
                 image_embeddings=image_embeddings,
                 language_embeddings=lang_emb,
+                update_memory=update_thermal_memory,
             )
             thermal_tokens = thermal_output.prefix_tokens.to(dtype=embs[0].dtype, device=embs[0].device)
             embs.append(thermal_tokens)
@@ -369,13 +370,16 @@ class PI0Pytorch(nn.Module):
             "contact_temp": cfg.loss_weight_contact_temp,
             "contact_valid": cfg.loss_weight_contact_valid,
             "field_temp": cfg.loss_weight_field_temp,
-            "field_safe": cfg.loss_weight_field_safe,
             "skill": cfg.loss_weight_skill,
-            "target": cfg.loss_weight_target,
         }
 
     def _flow_loss(self, observation, actions, noise=None, time=None) -> tuple[Tensor, IntegratedThermalOutput | None]:
         """π0.5 flow matching 损失（逐元素 [B, H, A]）与热觉分支输出。"""
+        if actions.shape[-1] != self.config.action_dim:
+            raise ValueError(
+                f"模型内部 actions 最后一维必须是 {self.config.action_dim}，"
+                f"得到 {actions.shape[-1]}；请先在数据边界把机器人动作补零到模型维度"
+            )
         processed = self._preprocess_observation(observation, train=True)
 
         if noise is None:
@@ -450,6 +454,7 @@ class PI0Pytorch(nn.Module):
         if self.thermal_enabled and supervision is not None:
             if thermal_output is None:
                 raise RuntimeError("热觉分支已启用但没有产生 thermal_output")
+            self.thermal_encoder.decode_field(thermal_output, supervision.field_query_xyz_base)
             terms = compute_thermal_losses(thermal_output, supervision, self._thermal_loss_weights())
             loss = loss + terms["aux_total"][:, None, None]
 
@@ -461,15 +466,18 @@ class PI0Pytorch(nn.Module):
         """返回联合损失各分项（标量），供新的训练 wrapper 记录日志。
 
         L = 1.0 * L_flow + 0.2 * L_contact_temp + 0.1 * L_contact_valid
-            + 0.3 * L_field_temp + 0.1 * L_field_safe + 0.2 * L_skill + 0.3 * L_target
+            + 0.3 * L_field_temp + 0.2 * L_skill
         """
         flow_loss, thermal_output = self._flow_loss(observation, actions, noise, time)
         losses = {"flow": flow_loss.mean()}
 
         if self.thermal_enabled and supervision is not None:
+            self.thermal_encoder.decode_field(thermal_output, supervision.field_query_xyz_base)
             terms = compute_thermal_losses(thermal_output, supervision, self._thermal_loss_weights())
-            for name in ("contact_temp", "contact_valid", "field_temp", "field_safe", "skill", "target", "aux_total"):
+            for name in ("contact_temp", "contact_valid", "field_temp", "skill", "aux_total"):
                 losses[name] = terms[name].mean()
+            for name, weight in self._thermal_loss_weights().items():
+                losses[f"weighted_{name}"] = weight * losses[name]
             losses["total"] = losses["flow"] + losses["aux_total"]
         else:
             # supervision=None：只算 flow loss（无热觉标签的数据集，例如 LIBERO）。
@@ -477,12 +485,32 @@ class PI0Pytorch(nn.Module):
 
         return losses
 
+    def compute_thermal_only_loss_dict(self, observation, supervision) -> dict[str, Tensor]:
+        """Stage 1纯热物理前向，不执行SigLIP、PaliGemma或Action Expert。"""
+        if not self.thermal_enabled:
+            raise ValueError("compute_thermal_only_loss_dict 需要 thermal.enabled=true")
+        if supervision is None:
+            raise ValueError("纯热物理训练需要 ThermalSupervision")
+        processed = self._preprocess_observation(observation, train=True)
+        output = self.thermal_encoder.forward_physical(processed)
+        self.thermal_encoder.decode_field(output, supervision.field_query_xyz_base)
+        terms = compute_thermal_losses(output, supervision, self._thermal_loss_weights())
+        losses = {}
+        for name in ("contact_temp", "contact_valid", "field_temp"):
+            losses[name] = terms[name].mean()
+            losses[f"weighted_{name}"] = self._thermal_loss_weights()[name] * losses[name]
+        losses["aux_total"] = sum(losses[f"weighted_{name}"] for name in (
+            "contact_temp", "contact_valid", "field_temp"
+        ))
+        losses["total"] = losses["aux_total"]
+        return losses
+
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10, *, return_diagnostics=False):
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)
 
         与训练使用完全相同的 prefix 构造（同一 embed_prefix）；return_diagnostics=True
-        时额外返回热觉分支诊断（技能概率、选中点、热场均值/标准差）。
+        时额外返回当前窗口的温度、不确定性、有效性和技能概率诊断。
         """
         bsize = observation.state.shape[0]
         if noise is None:
@@ -497,6 +525,7 @@ class PI0Pytorch(nn.Module):
             processed.tokenized_prompt,
             processed.tokenized_prompt_mask,
             observation=processed,
+            update_thermal_memory=True,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -536,21 +565,27 @@ class PI0Pytorch(nn.Module):
             return x_t, self._thermal_diagnostics(thermal_output)
         return x_t
 
+    def reset_thermal_memory(self, batch_size: int | None = None) -> None:
+        """在新episode开始时清空在线热空间记忆。"""
+        if self.thermal_enabled:
+            self.thermal_encoder.reset_memory(batch_size)
+
     def _thermal_diagnostics(self, thermal_output: IntegratedThermalOutput | None) -> dict:
         """把热觉分支输出整理成推理诊断；未启用热觉时返回空 dict。"""
         if thermal_output is None:
             return {}
-        strategy = thermal_output.strategy
-        field_var = torch.exp(thermal_output.field_temp_logvar.float().clamp(-10.0, 10.0))
-        selected = strategy.selected_index
-        if selected is None:
-            selected = strategy.selected_distribution.argmax(dim=-1)
-        return {
-            "skill_probability": torch.softmax(strategy.skill_logits.float(), dim=-1),
-            "selected_surface_index": selected,
-            "field_temp_mean_c": thermal_output.field_temp_mean_c.float(),
-            "field_temp_std_c": torch.sqrt(field_var),
+        diagnostics = {
+            "contact_temp_mean_c": thermal_output.contact.temp_mean_c.float(),
+            "contact_temp_std_c": torch.exp(
+                0.5 * thermal_output.contact.temp_logvar.float().clamp(-10.0, 10.0)
+            ),
+            "contact_valid_probability": torch.sigmoid(thermal_output.contact.valid_logit.float()),
         }
+        strategy = thermal_output.strategy
+        if strategy is not None:
+            skill_probability = torch.softmax(strategy.skill_logits.float(), dim=-1)
+            diagnostics["skill_probability"] = skill_probability
+        return diagnostics
 
     def denoise_step(
         self,

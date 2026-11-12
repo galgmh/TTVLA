@@ -26,10 +26,15 @@ def thermal_train_step(
     ``supervision=None`` 时只计算 flow loss（例如 LIBERO 这种没有热觉标签的
     数据）；此时 ``loss_keys`` 只能是 ``("flow",)``。
     ``loss_keys`` 给定时只把这些分项相加作为反传目标（例如阶段 1 只回传
-    ``contact_temp/contact_valid/field_temp/field_safe``）；metrics 仍包含全部
+    ``contact_temp/contact_valid/field_temp``）；metrics 仍包含全部
     分项，方便日志对比。None 表示使用 ``compute_loss_dict`` 的 ``total``。
     """
-    losses = model.compute_loss_dict(observation, actions, supervision, noise=noise, time=time)
+    physical_keys = {"contact_temp", "contact_valid", "field_temp"}
+    thermal_only = loss_keys is not None and set(loss_keys) <= physical_keys
+    if thermal_only:
+        losses = model.compute_thermal_only_loss_dict(observation, supervision)
+    else:
+        losses = model.compute_loss_dict(observation, actions, supervision, noise=noise, time=time)
     metrics = {name: value.detach() for name, value in losses.items()}
     if loss_keys is None:
         return losses["total"], metrics
@@ -38,5 +43,7 @@ def thermal_train_step(
     unknown = [name for name in loss_keys if name not in losses]
     if unknown:
         raise ValueError(f"未知损失项 {unknown}；可选 {sorted(losses)}")
-    total = sum(losses[name] for name in loss_keys)
+    # flow 本身权重为 1；thermal辅助项使用配置权重，避免阶段训练绕过YAML权重。
+    objective_terms = [losses[name] if name == "flow" else losses[f"weighted_{name}"] for name in loss_keys]
+    total = sum(objective_terms)
     return total, metrics

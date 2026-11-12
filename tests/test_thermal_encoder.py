@@ -1,4 +1,4 @@
-"""编码器测试：右对齐 mask 下必须取最后一个有效帧的隐状态。"""
+"""共享单触点编码器兼容包装测试。"""
 
 from __future__ import annotations
 
@@ -10,32 +10,26 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from models.thermal_encoder import ThermalEncoder  # noqa: E402
+from models.thermal_encoder import ThermalEncoder, load_contact_encoder_checkpoint  # noqa: E402
+from models.pi05.thermal.contact_encoder import ThermalContactEncoder  # noqa: E402
 
 
 class EncoderTest(unittest.TestCase):
     def test_receptive_field(self) -> None:
         model = ThermalEncoder(in_channels=14, hidden=8, levels=4, kernel=3)
-        # kernel 3、膨胀 1/2/4/8：1 + 2 + 4 + 8 + 16 = 31 帧。
-        self.assertEqual(model.receptive_field, 31)
+        # 四个残差块各有两层卷积：1 + 2*2*(1+2+4+8) = 61。
+        self.assertEqual(model.receptive_field, 61)
 
-    def test_last_valid_frame_is_gathered(self) -> None:
-        """短前缀（前端补零）与完整输入在同一末帧上必须给出相同 z。"""
+    def test_wrapper_uses_shared_core(self) -> None:
         torch.manual_seed(0)
         model = ThermalEncoder(in_channels=1, hidden=4, levels=1, kernel=1, dropout=0.0, out_dim=3)
         model.eval()
-        full = torch.randn(1, 8, 1)
-        # 只保留最后 3 帧，前端补零并把 mask 置 False。
-        short = torch.zeros(1, 8, 1)
-        short[:, -3:] = full[:, -3:]
-        short_mask = torch.zeros(1, 8, dtype=torch.bool)
-        short_mask[:, -3:] = True
-        full_mask = torch.ones(1, 8, dtype=torch.bool)
+        features = torch.randn(1, 8, 1)
+        mask = torch.ones(1, 8, dtype=torch.bool)
         with torch.no_grad():
-            z_full = model(full, full_mask)
-            z_short = model(short, short_mask)
-        # kernel=1 时末帧的隐状态只取决于末帧本身，两者必须一致。
-        torch.testing.assert_close(z_short, z_full)
+            z = model(features, mask)
+        shared = model.core(features, mask).latent
+        torch.testing.assert_close(z, shared)
 
     def test_padded_frames_do_not_leak(self) -> None:
         """mask 外的帧内容不得影响输出（偏置/前向都已被清零）。"""
@@ -51,6 +45,14 @@ class EncoderTest(unittest.TestCase):
             a = model(base, mask)
             b = model(other, mask)
         torch.testing.assert_close(a, b)
+
+    def test_checkpoint_converts_strictly_to_vla_encoder(self) -> None:
+        source = ThermalEncoder()
+        target = ThermalContactEncoder()
+        state = {f"encoder.core.{key}": value for key, value in source.core.state_dict().items()}
+        load_contact_encoder_checkpoint(target, {"model": state})
+        for key, value in source.core.state_dict().items():
+            torch.testing.assert_close(value, target.state_dict()[key])
 
 
 if __name__ == "__main__":

@@ -15,7 +15,6 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from data.schema.thermal_contact_v1 import PHASE_NAMES  # noqa: E402
 from data.writer.hdf5_writer import read_episode  # noqa: E402
 
 # 中文字体的候选列表；系统里装了哪个就用哪个。
@@ -76,11 +75,11 @@ def main() -> int:
     args = parser.parse_args()
 
     arrays, metadata, _ = read_episode(args.path)
-    t = np.asarray(arrays["time/sim_time"], dtype=np.float64)
-    temp = np.asarray(arrays["obs/fingertip_temp"], dtype=np.float64)
-    normal = np.asarray(arrays["obs/contact_normal_force"], dtype=np.float64)
-    width = np.asarray(arrays["obs/gripper_width"], dtype=np.float64).reshape(-1)
-    phase = np.asarray(arrays["action/phase"]).reshape(-1)
+    t = np.asarray(arrays["sensor/time"], dtype=np.float64)
+    tc = np.asarray(arrays["control/time"], dtype=np.float64)
+    temp = np.asarray(arrays["tactile/fingertip_temp"], dtype=np.float64)
+    normal = np.asarray(arrays["tactile/contact_normal_force"], dtype=np.float64)
+    width = np.asarray(arrays["robot/gripper_width"], dtype=np.float64).reshape(-1)
 
     fig, axes = plt.subplots(3, 1, sharex=True, figsize=(9, 8))
     labels = setup_fonts()
@@ -92,21 +91,20 @@ def main() -> int:
     axes[1].plot(t, normal[:, 1], label=labels["right"])
     axes[1].set_ylabel(labels["force"])
     axes[1].legend(loc="best")
-    axes[2].plot(t, width * 1e3, color="tab:gray")
+    axes[2].plot(tc, width * 1e3, color="tab:gray")
     axes[2].set_ylabel(labels["width"])
     axes[2].set_xlabel(labels["time"])
 
-    # 阶段切换线 + 名称：每条竖线标注新阶段。
-    previous = None
-    for i, code in enumerate(phase):
-        if code == previous:
-            continue
-        previous = code
+    # 用淡色背景标出每个右开接触事件。
+    starts = np.asarray(arrays["contact_events/start_sensor_index"], dtype=np.int64)
+    ends = np.asarray(arrays["contact_events/end_sensor_index_exclusive"], dtype=np.int64)
+    for event_id, (start, end) in enumerate(zip(starts, ends), start=1):
+        right = t[end] if end < len(t) else t[-1] + (np.median(np.diff(t)) if len(t) > 1 else 0.01)
         for ax in axes:
-            ax.axvline(t[i], color="tab:orange", lw=0.6, alpha=0.6)
+            ax.axvspan(t[start], right, color="tab:orange", alpha=0.12)
         axes[0].annotate(
-            PHASE_NAMES.get(int(code), str(code)),
-            xy=(t[i], axes[0].get_ylim()[1]),
+            f"contact {event_id}",
+            xy=(t[start], axes[0].get_ylim()[1]),
             xytext=(2, -10),
             textcoords="offset points",
             fontsize=7,

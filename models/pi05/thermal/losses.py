@@ -16,8 +16,8 @@ from models.pi05.thermal.outputs import ThermalSupervision
 
 def _masked_mean_per_sample(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """values/mask: [B, ...] -> [B]；全 mask 的样本返回 0。"""
-    w = mask.to(values.dtype).flatten(1)
-    v = values.flatten(1)
+    w = mask.to(values.dtype).reshape(values.shape[0], -1)
+    v = values.reshape(values.shape[0], -1)
     return (v * w).sum(dim=1) / w.sum(dim=1).clamp_min(1.0)
 
 
@@ -39,34 +39,21 @@ def masked_bce_with_logits(logits: torch.Tensor, target: torch.Tensor, mask: tor
     return _masked_mean_per_sample(loss, mask)
 
 
-def masked_cross_entropy(logits: torch.Tensor, target_index: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    # target_index 在 OTHER 样本上是 -1，clamp 到 0 后由 mask 清零。
-    loss = F.cross_entropy(logits, target_index.clamp_min(0), reduction="none")  # [B]
-    return loss * mask.to(loss.dtype)
-
-
 def compute_thermal_losses(
     output: IntegratedThermalOutput,
     supervision: ThermalSupervision,
     weights: dict[str, float],
 ) -> dict[str, torch.Tensor]:
-    """计算 6 个辅助损失项（每样本 [B]）与加权总和 ``aux_total``。"""
-    device = output.strategy.skill_logits.device
+    """计算接触温度/有效性、查询热场和全局技能损失。"""
+    device = output.contact.temp_mean_c.device
     contact_target = supervision.contact_temp_c.to(device)
     contact_valid = supervision.contact_valid.to(device)
     contact_mask = contact_valid.squeeze(-1) > 0.5
-    surface_mask = supervision.surface_temp_mask.to(device).bool()
+    field_mask = supervision.field_query_mask.to(device).bool()
     strategy_type = supervision.strategy_type.to(device).long()
-    target_index = supervision.target_surface_index.to(device).long()
 
-    probe_selected = strategy_type == 1
-    grasp_selected = strategy_type == 2
-    point_logits = torch.where(
-        probe_selected.unsqueeze(-1),
-        output.strategy.probe_logits,
-        output.strategy.grasp_logits,
-    )
-    target_mask = (probe_selected | grasp_selected) & (target_index >= 0)
+    if output.field is None:
+        raise ValueError("计算field_temp损失前必须用field_query_xyz_base运行SpatialFieldDecoder")
 
     terms = {
         "contact_temp": masked_gaussian_nll(
@@ -81,20 +68,18 @@ def compute_thermal_losses(
             torch.ones_like(contact_mask),
         ),
         "field_temp": masked_gaussian_nll(
-            output.field_temp_mean_c,
-            output.field_temp_logvar,
-            supervision.surface_temp_c.to(device),
-            surface_mask,
+            output.field.temp_mean_c,
+            output.field.temp_logvar,
+            supervision.field_query_temp_c.to(device),
+            field_mask,
         ),
-        "field_safe": masked_bce_with_logits(
-            output.field_safe_logit,
-            supervision.surface_safe.to(device),
-            surface_mask,
-        ),
-        "skill": F.cross_entropy(output.strategy.skill_logits, strategy_type, reduction="none"),
-        "target": masked_cross_entropy(point_logits, target_index, target_mask),
     }
-    names = ("contact_temp", "contact_valid", "field_temp", "field_safe", "skill", "target")
+    if output.strategy is None:
+        zero = torch.zeros_like(terms["contact_temp"])
+        terms["skill"] = zero
+    else:
+        terms["skill"] = F.cross_entropy(output.strategy.skill_logits, strategy_type, reduction="none")
+    names = ("contact_temp", "contact_valid", "field_temp", "skill")
     aux_total = torch.zeros_like(terms["skill"])
     for name in names:
         aux_total = aux_total + weights[name] * terms[name]

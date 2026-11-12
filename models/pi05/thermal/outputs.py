@@ -9,58 +9,55 @@ import torch
 
 @dataclasses.dataclass
 class ContactEncoderOutput:
-    """单次接触窗口的编码结果（每个样本 K 次历史接触）。"""
+    """当前实时滑动窗口的编码结果。"""
 
-    latent: torch.Tensor  # [B, K, thermal_latent_dim]
-    temp_mean_c: torch.Tensor  # [B, K, 1]
-    temp_logvar: torch.Tensor  # [B, K, 1]
-    valid_logit: torch.Tensor  # [B, K, 1]
+    latent: torch.Tensor  # [B, thermal_latent_dim]
+    temp_mean_c: torch.Tensor  # [B, 1]
+    temp_logvar: torch.Tensor  # [B, 1]
+    valid_logit: torch.Tensor  # [B, 1]
 
 
 @dataclasses.dataclass
 class SpatialMemoryOutput:
-    """候选表面点的热场表示与压缩后的空间 token。"""
+    """已完成接触集合压缩后的空间记忆。"""
 
-    surface_features: torch.Tensor  # [B, N, hidden_dim]
-    temp_mean_c: torch.Tensor  # [B, N, 1]
-    temp_logvar: torch.Tensor  # [B, N, 1]
-    safe_logit: torch.Tensor  # [B, N, 1]
     spatial_latents: torch.Tensor  # [B, M, hidden_dim]
 
 
 @dataclasses.dataclass
-class StrategyOutput:
-    """主动策略输出：技能分布 + 可微目标点选择。"""
+class FieldDecoderOutput:
+    """训练/评测查询点的温度分布，不进入控制prefix。"""
 
-    skill_logits: torch.Tensor  # [B, 3]：0=OTHER, 1=PROBE, 2=GRASP
-    probe_logits: torch.Tensor  # [B, N]
-    grasp_logits: torch.Tensor  # [B, N]
-    selected_distribution: torch.Tensor  # [B, N]
-    goal_feature: torch.Tensor  # [B, hidden_dim]
-    selected_index: torch.Tensor | None = None  # 评测模式（masked argmax）下的目标点
+    temp_mean_c: torch.Tensor  # [B, Q, 1]
+    temp_logvar: torch.Tensor  # [B, Q, 1]
+
+
+@dataclasses.dataclass
+class StrategyAuxOutput:
+    """策略辅助监督输出；不直接条件化 PaliGemma 或 Action Expert。"""
+
+    skill_logits: torch.Tensor  # [B, 4]：PROBE/GRASP/RETRACT/ABORT
 
 
 @dataclasses.dataclass
 class IntegratedThermalOutput:
     """IntegratedThermalEncoder 一次前向的全部产物。"""
 
-    prefix_tokens: torch.Tensor  # [B, M+1, paligemma_width]
-    prefix_mask: torch.Tensor  # [B, M+1]
+    prefix_tokens: torch.Tensor  # [B, M, paligemma_width]
+    prefix_mask: torch.Tensor  # [B, M]
     contact: ContactEncoderOutput
-    field_temp_mean_c: torch.Tensor  # [B, N, 1]
-    field_temp_logvar: torch.Tensor  # [B, N, 1]
-    field_safe_logit: torch.Tensor  # [B, N, 1]
-    strategy: StrategyOutput
+    spatial_latents: torch.Tensor  # [B, M, hidden_dim]
+    field: FieldDecoderOutput | None
+    strategy: StrategyAuxOutput | None
 
 
 @dataclasses.dataclass
 class ThermalSupervision:
     """训练监督字段（仿真特权标签），只参与损失，不进入 Observation。"""
 
-    contact_temp_c: torch.Tensor  # [B, K, 1]
-    contact_valid: torch.Tensor  # [B, K, 1]
-    surface_temp_c: torch.Tensor  # [B, N, 1]
-    surface_temp_mask: torch.Tensor  # [B, N]
-    surface_safe: torch.Tensor  # [B, N, 1]
-    strategy_type: torch.Tensor  # [B]：0=OTHER, 1=PROBE, 2=GRASP
-    target_surface_index: torch.Tensor  # [B]：OTHER 时为 -1
+    contact_temp_c: torch.Tensor  # [B, 1]
+    contact_valid: torch.Tensor  # [B, 1]
+    field_query_xyz_base: torch.Tensor  # [B, Q, 3]，仅训练/评测decoder使用
+    field_query_temp_c: torch.Tensor  # [B, Q, 1]
+    field_query_mask: torch.Tensor  # [B, Q]
+    strategy_type: torch.Tensor  # [B]：0=PROBE, 1=GRASP, 2=RETRACT, 3=ABORT

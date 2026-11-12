@@ -16,7 +16,7 @@ from __future__ import annotations
 import numpy as np
 
 from sim.control.actions import tcp_pose
-from sim.rotations import quat_rotate
+from sim.rotations import quat_conj, quat_rotate
 from sim.sensors.tactile import read_all
 from sim.thermal.link_temperature import read_region_temperatures
 
@@ -94,19 +94,39 @@ def get_policy_observation(bundle) -> dict[str, np.ndarray]:
         if bname in data:
             touching[i] = bool(_numpy(data[bname]).reshape(-1)[0] > 0.5)
 
-    _, quat = finger_poses(bundle)
-    force_world = np.stack([quat_rotate(quat[i], force_link[i]) for i in range(2)])
-    eef_pos, eef_quat = tcp_pose(bundle)
+    finger_pos, finger_quat = finger_poses(bundle)
+    base_pos = np.asarray(bundle.cfg["robot"]["base_pos"], dtype=np.float64)
+    base_quat_inv = quat_conj(np.asarray(bundle.cfg["robot"]["base_quat"], dtype=np.float64))
+    sensor_pos_base = np.zeros((2, 3), dtype=np.float64)
+    sensor_normal_base = np.zeros((2, 3), dtype=np.float64)
+    for i, layout in enumerate(bundle.layouts):
+        pad_world = finger_pos[i] + quat_rotate(finger_quat[i], layout.pad_box_origin)
+        normal_world = quat_rotate(finger_quat[i], layout.inner_dir)
+        sensor_pos_base[i] = quat_rotate(base_quat_inv, pad_world - base_pos)
+        sensor_normal_base[i] = quat_rotate(base_quat_inv, normal_world)
 
     return {
         "fingertip_temp": temp,
-        "contact_force_world": force_world,
+        "contact_force_link": force_link,
         "contact_normal_force": normal,
         "contact_mask": (touching | (normal > CONTACT_FORCE_EPS_N)).astype(bool),
-        "gripper_width": np.asarray(bundle.gripper_width(), dtype=np.float64),
-        "finger_joint_position": bundle.finger_positions(),
-        "eef_pose": np.concatenate([eef_pos, eef_quat]),
         "contact_area": contact_area(bundle),
+        "sensor_position_base": sensor_pos_base,
+        "sensor_normal_base": sensor_normal_base,
+    }
+
+
+def get_robot_observation(bundle) -> dict[str, np.ndarray]:
+    """20 Hz 机器人状态，与控制指令和 RGB 对齐。"""
+    dofs = np.concatenate([bundle.arm_dofs, bundle.finger_dofs])
+    q = _numpy(bundle.robot.get_dofs_position(dofs_idx_local=dofs)).reshape(-1)
+    qd = _numpy(bundle.robot.get_dofs_velocity(dofs_idx_local=dofs)).reshape(-1)
+    eef_pos, eef_quat = tcp_pose(bundle)
+    return {
+        "eef_pose": np.concatenate([eef_pos, eef_quat]),
+        "joint_position": q,
+        "joint_velocity": qd,
+        "gripper_width": np.asarray(float(q[-2:].sum()), dtype=np.float64),
     }
 
 
@@ -175,4 +195,5 @@ __all__ = [
     "finger_poses",
     "get_policy_observation",
     "get_privileged_observation",
+    "get_robot_observation",
 ]

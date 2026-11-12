@@ -22,7 +22,7 @@ model:
   paligemma_variant: dummy
   action_expert_variant: dummy
   pi05: true
-  action_dim: 7
+  action_dim: 32             # π0.5 官方内部动作维度；机器人维度见 data.action_dim
   action_horizon: 8
   max_token_len: 64
   dtype: float32
@@ -31,8 +31,7 @@ model:
     hidden_dim: 32
     thermal_latent_dim: 16
     num_spatial_tokens: 4
-    num_surface_points: 16
-    history_size: 2
+    memory_size: 2
     window_size: 4
 
 data:

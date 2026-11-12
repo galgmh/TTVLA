@@ -2,7 +2,7 @@
 
 覆盖：
 1. thermal_enabled=False：state_dict 没有 thermal_* 参数，prefix 长度不变；
-2. thermal_enabled=True：prefix 追加 M+1 个 token，compute_loss_dict/backward 正常；
+2. thermal_enabled=True：prefix 只追加 M 个空间memory token；
 3. sample_actions 与训练使用同一 prefix 构造，并返回诊断字段；
 4. 权重加载只容忍 thermal_encoder.* 缺失。
 """
@@ -26,7 +26,7 @@ def _make_config(*, thermal: ThermalPi0Config | None) -> pi0_config.Pi0Config:
         paligemma_variant="dummy",
         action_expert_variant="dummy",
         pi05=True,
-        action_dim=7,
+        action_dim=32,
         action_horizon=4,
         discrete_state_input=False,
         pytorch_compile_mode=None,
@@ -37,10 +37,9 @@ def _make_config(*, thermal: ThermalPi0Config | None) -> pi0_config.Pi0Config:
 def _small_thermal(**overrides) -> ThermalPi0Config:
     base = {
         "enabled": True,
-        "history_size": 2,
+        "memory_size": 2,
         "window_size": 6,
         "signal_dim": 14,
-        "num_surface_points": 8,
         "hidden_dim": 32,
         "thermal_latent_dim": 16,
         "num_spatial_tokens": 4,
@@ -61,23 +60,25 @@ def _observation(cfg: pi0_config.Pi0Config, batch: int = 2) -> Observation:
     }
     if cfg.thermal is not None and cfg.thermal.enabled:
         t = cfg.thermal
-        k, length, c, n = t.history_size, t.window_size, t.signal_dim, t.num_surface_points
+        length, c = t.window_size, t.signal_dim
         fields.update(
-            thermal_history=torch.randn(batch, k, length, c),
-            thermal_history_time_mask=torch.ones(batch, k, length, dtype=torch.bool),
-            contact_mask=torch.ones(batch, k, dtype=torch.bool),
-            contact_xyz_obj=torch.randn(batch, k, 3),
-            contact_normal_obj=torch.nn.functional.normalize(torch.randn(batch, k, 3), dim=-1),
-            contact_age_s=torch.rand(batch, k, 1),
-            surface_xyz_obj=torch.randn(batch, n, 3),
-            surface_normal_obj=torch.nn.functional.normalize(torch.randn(batch, n, 3), dim=-1),
-            surface_mask=torch.ones(batch, n, dtype=torch.bool),
-            surface_reachable=torch.ones(batch, n, dtype=torch.bool),
-            surface_grasp_score=torch.rand(batch, n, 1),
-            ee_xyz_obj=torch.randn(batch, 3),
-            probe_budget_remaining=torch.ones(batch, 1),
+            thermal_window=torch.randn(batch, length, c),
+            thermal_window_time_mask=torch.ones(batch, length, dtype=torch.bool),
+            sensor_xyz_base=torch.randn(batch, 3),
+            sensor_normal_base=torch.nn.functional.normalize(torch.randn(batch, 3), dim=-1),
         )
     return Observation(**fields)
+
+
+def _supervision(thermal, batch=2, queries=8):
+    return ThermalSupervision(
+        contact_temp_c=torch.randn(batch, 1),
+        contact_valid=torch.ones(batch, 1),
+        field_query_xyz_base=torch.randn(batch, queries, 3),
+        field_query_temp_c=torch.randn(batch, queries, 1),
+        field_query_mask=torch.ones(batch, queries, dtype=torch.bool),
+        strategy_type=torch.tensor([0, 1]),
+    )
 
 
 def _num_image_tokens() -> int:
@@ -90,6 +91,8 @@ def test_thermal_disabled_keeps_original_prefix_and_parameters():
     cfg = _make_config(thermal=None)
     model = pi0_pytorch.PI0Pytorch(cfg).eval()
     assert not any(name.startswith("thermal_encoder.") for name in model.state_dict())
+    assert model.action_in_proj.in_features == 32
+    assert model.action_out_proj.out_features == 32
 
     observation = _observation(cfg)
     processed = model._preprocess_observation(observation, train=False)  # noqa: SLF001
@@ -115,6 +118,17 @@ def test_thermal_disabled_keeps_original_prefix_and_parameters():
     )
     assert loss.shape == (2, cfg.action_horizon, cfg.action_dim)
 
+    with pytest.raises(ValueError, match="补零到模型维度"):
+        model._flow_loss(  # noqa: SLF001
+            observation,
+            torch.randn(2, cfg.action_horizon, 7),
+        )
+
+
+def test_pi05_rejects_non_official_internal_action_dim():
+    with pytest.raises(ValueError, match="必须保持官方的 32"):
+        pi0_config.Pi0Config(pi05=True, action_dim=7, pytorch_compile_mode=None)
+
 
 def test_thermal_enabled_prefix_losses_and_gradients():
     torch.manual_seed(0)
@@ -132,22 +146,14 @@ def test_thermal_enabled_prefix_losses_and_gradients():
         processed.tokenized_prompt_mask,
         observation=processed,
     )
-    expected_len = len(IMAGE_KEYS) * _num_image_tokens() + 16 + thermal.num_spatial_tokens + 1
+    expected_len = len(IMAGE_KEYS) * _num_image_tokens() + 16 + thermal.num_spatial_tokens
     assert embs.shape[1] == expected_len
     assert pad_masks.shape[1] == expected_len
     assert thermal_output is not None
-    assert thermal_output.prefix_tokens.shape[1] == thermal.num_spatial_tokens + 1
+    assert thermal_output.prefix_tokens.shape[1] == thermal.num_spatial_tokens
 
     actions = torch.randn(2, cfg.action_horizon, cfg.action_dim)
-    supervision = ThermalSupervision(
-        contact_temp_c=torch.randn(2, thermal.history_size, 1),
-        contact_valid=torch.ones(2, thermal.history_size, 1),
-        surface_temp_c=torch.randn(2, thermal.num_surface_points, 1),
-        surface_temp_mask=torch.ones(2, thermal.num_surface_points, dtype=torch.bool),
-        surface_safe=torch.randint(0, 2, (2, thermal.num_surface_points, 1)).float(),
-        strategy_type=torch.tensor([1, 2]),
-        target_surface_index=torch.tensor([0, 3]),
-    )
+    supervision = _supervision(thermal)
     losses = model.compute_loss_dict(
         observation,
         actions,
@@ -155,12 +161,12 @@ def test_thermal_enabled_prefix_losses_and_gradients():
         noise=torch.randn_like(actions),
         time=torch.rand(2),
     )
-    for name in ("flow", "contact_temp", "contact_valid", "field_temp", "field_safe", "skill", "target", "aux_total", "total"):
+    for name in ("flow", "contact_temp", "contact_valid", "field_temp", "skill", "aux_total", "total"):
         assert name in losses
         assert torch.isfinite(losses[name]).all()
 
     losses["total"].backward()
-    assert model.thermal_encoder.type_embedding.grad is not None
+    assert model.thermal_encoder.prefix_adapter.type_embedding.grad is not None
     assert model.thermal_encoder.contact_encoder.project[0].weight.grad is not None
     assert model.action_in_proj.weight.grad is not None
 
@@ -174,15 +180,7 @@ def test_forward_with_supervision_matches_compute_loss_dict():
     actions = torch.randn(2, cfg.action_horizon, cfg.action_dim)
     noise = torch.randn_like(actions)
     time = torch.rand(2)
-    supervision = ThermalSupervision(
-        contact_temp_c=torch.randn(2, thermal.history_size, 1),
-        contact_valid=torch.ones(2, thermal.history_size, 1),
-        surface_temp_c=torch.randn(2, thermal.num_surface_points, 1),
-        surface_temp_mask=torch.ones(2, thermal.num_surface_points, dtype=torch.bool),
-        surface_safe=torch.zeros(2, thermal.num_surface_points, 1),
-        strategy_type=torch.zeros(2, dtype=torch.long),
-        target_surface_index=torch.full((2,), -1, dtype=torch.long),
-    )
+    supervision = _supervision(thermal)
     torch.manual_seed(123)
     loss_tensor = model(observation, actions, noise=noise, time=time, supervision=supervision)
     torch.manual_seed(123)
@@ -197,15 +195,7 @@ def test_thermal_train_step_returns_grad_total_and_detached_metrics():
     model = pi0_pytorch.PI0Pytorch(cfg)
     observation = _observation(cfg)
     actions = torch.randn(2, cfg.action_horizon, cfg.action_dim)
-    supervision = ThermalSupervision(
-        contact_temp_c=torch.randn(2, thermal.history_size, 1),
-        contact_valid=torch.ones(2, thermal.history_size, 1),
-        surface_temp_c=torch.randn(2, thermal.num_surface_points, 1),
-        surface_temp_mask=torch.ones(2, thermal.num_surface_points, dtype=torch.bool),
-        surface_safe=torch.zeros(2, thermal.num_surface_points, 1),
-        strategy_type=torch.tensor([1, 2]),
-        target_surface_index=torch.tensor([0, 3]),
-    )
+    supervision = _supervision(thermal)
 
     total, metrics = thermal_train_step(
         model,
@@ -219,7 +209,7 @@ def test_thermal_train_step_returns_grad_total_and_detached_metrics():
     assert {"flow", "aux_total", "total"} <= set(metrics)
     assert all(not value.requires_grad for value in metrics.values())
     total.backward()
-    assert model.thermal_encoder.type_embedding.grad is not None
+    assert model.thermal_encoder.prefix_adapter.type_embedding.grad is not None
 
 
 def test_sample_actions_returns_diagnostics():
@@ -236,14 +226,13 @@ def test_sample_actions_returns_diagnostics():
     assert actions.shape == (2, cfg.action_horizon, cfg.action_dim)
     assert set(diagnostics) == {
         "skill_probability",
-        "selected_surface_index",
-        "field_temp_mean_c",
-        "field_temp_std_c",
+        "contact_temp_mean_c",
+        "contact_temp_std_c",
+        "contact_valid_probability",
     }
-    assert diagnostics["skill_probability"].shape == (2, 3)
-    assert diagnostics["selected_surface_index"].shape == (2,)
-    assert diagnostics["field_temp_mean_c"].shape == (2, thermal.num_surface_points, 1)
-    assert torch.isfinite(diagnostics["field_temp_std_c"]).all()
+    assert diagnostics["skill_probability"].shape == (2, 4)
+    assert diagnostics["contact_temp_mean_c"].shape == (2, 1)
+    assert torch.isfinite(diagnostics["contact_temp_std_c"]).all()
 
 
 def test_weight_loading_allows_only_thermal_missing():

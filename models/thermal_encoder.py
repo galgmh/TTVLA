@@ -1,84 +1,78 @@
-"""因果膨胀卷积编码器：逐帧 14 维序列 -> z ∈ R^out_dim。
-
-* 卷积核向左补零（只看当前与历史），感受野 ``1 + (kernel-1)·Σdilation``；
-  4 层膨胀率 1/2/4/8、kernel 3 时是 31 帧，50 Hz 下 0.62 s。
-* mask 之外的帧在每一层之后都清零：前缀窗口的前端是补零，偏置项会让它
-  变成非零，必须显式清掉，否则“历史长度”会通过偏置泄漏进特征。
-* 输出取每个样本*最后一个有效帧*的隐状态，而不是固定末帧。
-"""
+"""独立单触点训练的兼容入口，内部复用 Thermal-π0.5 的唯一接触编码器。"""
 
 from __future__ import annotations
+
+from collections.abc import Mapping
 
 import torch
 from torch import nn
 
-
-class CausalBlock(nn.Module):
-    """一层因果卷积 + 逐位置归一化 + 残差。
-
-    归一化用 ``LayerNorm`` 在通道维做：每个时刻只统计自己的通道，
-    被 mask 掉的位置（清零后）不会把统计量带偏，也不会随前缀长度漂移。
-    """
-
-    def __init__(self, channels: int, *, kernel: int, dilation: int, dropout: float):
-        super().__init__()
-        self.pad = (kernel - 1) * dilation
-        self.conv = nn.Conv1d(channels, channels, kernel, dilation=dilation)
-        self.norm = nn.LayerNorm(channels)
-        self.act = nn.GELU()
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.conv(nn.functional.pad(x, (self.pad, 0)))
-        # Conv1d 是 (B,C,H)，LayerNorm 要按最后一维（通道）统计，先转置。
-        y = self.norm(y.transpose(1, 2)).transpose(1, 2)
-        return self.drop(self.act(y)) + x
+from models.pi05.thermal.contact_encoder import ThermalContactEncoder
+from models.pi05.thermal.outputs import ContactEncoderOutput
 
 
 class ThermalEncoder(nn.Module):
-    """序列编码器（因果、膨胀、残差）。"""
+    """把 ``[B,L,C]`` 适配成共享编码器需要的 ``[B,K=1,L,C]``。
 
-    def __init__(
-        self,
-        *,
-        in_channels: int = 14,
-        hidden: int = 64,
-        levels: int = 4,
-        kernel: int = 3,
-        dropout: float = 0.1,
-        out_dim: int = 128,
-    ):
+    参数名保留旧训练配置接口，但实现不再维护第二套TCN。四层默认通道为
+    ``64,64,128,128``，与 Thermal-π0.5 的默认接触编码器完全一致。
+    """
+
+    def __init__(self, *, in_channels: int = 14, hidden: int = 64, levels: int = 4,
+                 kernel: int = 3, dropout: float = 0.0, out_dim: int = 128):
         super().__init__()
         if levels < 1:
             raise ValueError("levels 必须 >= 1")
-        self.in_channels = int(in_channels)
-        self.input_proj = nn.Conv1d(in_channels, hidden, 1)
-        self.blocks = nn.ModuleList(
-            CausalBlock(hidden, kernel=kernel, dilation=2**i, dropout=dropout) for i in range(levels)
+        del dropout  # 共享编码器当前不使用dropout；保留参数仅兼容旧YAML。
+        hidden_channels = tuple(hidden if i < 2 else 2 * hidden for i in range(levels))
+        dilations = tuple(2**i for i in range(levels))
+        self.core = ThermalContactEncoder(
+            signal_dim=in_channels,
+            hidden_channels=hidden_channels,
+            dilations=dilations,
+            kernel_size=kernel,
+            latent_dim=out_dim,
         )
-        self.output = nn.Linear(hidden, out_dim)
+        self.in_channels = int(in_channels)
         self.out_dim = int(out_dim)
+        self.kernel = int(kernel)
+        self.dilations = dilations
 
     @property
     def receptive_field(self) -> int:
-        return 1 + sum(block.pad for block in self.blocks)
+        # 每个 residual block 有两层同dilation卷积。
+        return 1 + 2 * (self.kernel - 1) * sum(self.dilations)
 
-    def forward(self, features: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """``features`` (B,H,C)，``mask`` (B,H) -> ``z`` (B,out_dim)。"""
+    def forward_output(self, features: torch.Tensor, mask: torch.Tensor) -> ContactEncoderOutput:
         if features.dim() != 3:
-            raise ValueError(f"features 应为 (B,H,C)，实为 {tuple(features.shape)}")
+            raise ValueError(f"features 应为 (B,L,C)，实为 {tuple(features.shape)}")
         if features.shape[-1] != self.in_channels:
             raise ValueError(f"特征通道 {features.shape[-1]} 与配置 {self.in_channels} 不一致")
-        keep = mask.unsqueeze(1)
-        x = self.input_proj(features.transpose(1, 2)) * keep
-        for block in self.blocks:
-            x = block(x) * keep
-        # 窗口是右对齐的（历史不足时在前端补零），所以最后一个有效帧就是
-        # 第 H-1 帧；按“最后一个 True”取，避免窗口组织方式变化时悄悄取错。
-        flipped = mask.flip(1).to(torch.int64)
-        last_idx = (mask.size(1) - 1 - torch.argmax(flipped, dim=1)).view(-1, 1, 1)
-        last = x.gather(2, last_idx.expand(-1, x.size(1), 1)).squeeze(-1)
-        return self.output(last)
+        if mask.shape != features.shape[:2]:
+            raise ValueError(f"mask 应为 {tuple(features.shape[:2])}，实为 {tuple(mask.shape)}")
+        return self.core(features, mask.bool())
+
+    def forward(self, features: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        return self.forward_output(features, mask).latent
 
 
-__all__ = ["CausalBlock", "ThermalEncoder"]
+def load_contact_encoder_checkpoint(
+    target: ThermalContactEncoder,
+    checkpoint: Mapping[str, object],
+) -> None:
+    """把独立预训练checkpoint严格加载到VLA的``contact_encoder``。
+
+    接受训练脚本保存的完整字典或直接state_dict；只转换固定前缀
+    ``encoder.core.``，任何缺失/多余键都会报错。
+    """
+    state = checkpoint.get("model", checkpoint)
+    if not isinstance(state, Mapping):
+        raise TypeError("checkpoint['model'] 必须是 state_dict 映射")
+    prefix = "encoder.core."
+    converted = {key[len(prefix):]: value for key, value in state.items() if key.startswith(prefix)}
+    if not converted:
+        raise ValueError("checkpoint 中没有 encoder.core.* 权重")
+    target.load_state_dict(converted, strict=True)
+
+
+__all__ = ["ThermalEncoder", "load_contact_encoder_checkpoint"]

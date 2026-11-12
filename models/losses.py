@@ -1,4 +1,4 @@
-"""损失：温度 Huber + 接触有效性 BCE。
+"""损失：带不确定性的温度 Gaussian NLL + 接触有效性 BCE。
 
 总损失 ``L = L_temp + 0.2·L_valid``（权重来自模型配置）。
 
@@ -36,6 +36,20 @@ def masked_huber(pred: torch.Tensor, target: torch.Tensor, *, delta: float = 1.0
     return F.huber_loss(pred[keep], target[keep], delta=delta), count
 
 
+def masked_gaussian_nll(
+    mean: torch.Tensor, logvar: torch.Tensor, target: torch.Tensor
+) -> tuple[torch.Tensor, int]:
+    """只在温度标签有限处计算Gaussian NLL，同时校准预测方差。"""
+    keep = torch.isfinite(target)
+    count = int(keep.sum().item())
+    if count == 0:
+        return (mean.sum() + logvar.sum()) * 0.0, 0
+    lv = logvar[keep].clamp(-10.0, 10.0)
+    variance = torch.exp(lv) + 1e-6
+    nll = 0.5 * (lv + (target[keep] - mean[keep]).square() / variance)
+    return nll.mean(), count
+
+
 def masked_bce(logits: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, int]:
     """只在 ``target`` 有限的样本上算 BCE-with-logits；全无效时返回 0。"""
     keep = torch.isfinite(target)
@@ -47,7 +61,10 @@ def masked_bce(logits: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor
 
 def compute_losses(output, batch, *, huber_delta: float = 1.0) -> LossTerms:
     """``output`` 是 ``ThermalOutput``，``batch`` 是张量字典。"""
-    temp, temp_count = masked_huber(output.temperature, batch["temperature"], delta=huber_delta)
+    del huber_delta
+    temp, temp_count = masked_gaussian_nll(
+        output.temperature, output.temp_logvar, batch["temperature"]
+    )
     valid, valid_count = masked_bce(output.valid_logit, batch["contact_valid"].to(output.valid_logit.dtype))
     return LossTerms(
         temp=temp,
@@ -57,4 +74,4 @@ def compute_losses(output, batch, *, huber_delta: float = 1.0) -> LossTerms:
     )
 
 
-__all__ = ["LossTerms", "compute_losses", "masked_bce", "masked_huber"]
+__all__ = ["LossTerms", "compute_losses", "masked_bce", "masked_gaussian_nll", "masked_huber"]

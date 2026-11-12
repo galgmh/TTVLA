@@ -3,7 +3,7 @@
 openpi 的 data transform 在 numpy 数据字典上运行。本模块提供：
 
 * ``ThermalObservationTransform``：把数据集里的热觉数组统一映射/转换成
-  ``Observation`` 需要的 13 个字段（源键名可配置，默认同名）；
+  ``Observation`` 需要的4个热觉字段（源键名可配置，默认同名）；
 * ``thermal_supervision_from_batch``：从批次里的 ``thermal_supervision``
   子字典构造 ``ThermalSupervision``（监督不进入 Observation）；
 * ``split_thermal_batch``：把监督子字典从批次中拆出来，供训练循环使用。
@@ -23,27 +23,15 @@ from training.pi05.thermal.labels import build_thermal_supervision
 
 #: 热觉 Observation 字段（与规格第 4 节一致）。
 THERMAL_OBSERVATION_KEYS = (
-    "thermal_history",
-    "thermal_history_time_mask",
-    "contact_mask",
-    "contact_xyz_obj",
-    "contact_normal_obj",
-    "contact_age_s",
-    "surface_xyz_obj",
-    "surface_normal_obj",
-    "surface_mask",
-    "surface_reachable",
-    "surface_grasp_score",
-    "ee_xyz_obj",
-    "probe_budget_remaining",
+    "thermal_window",
+    "thermal_window_time_mask",
+    "sensor_xyz_base",
+    "sensor_normal_base",
 )
 
 _BOOL_KEYS = frozenset(
     {
-        "thermal_history_time_mask",
-        "contact_mask",
-        "surface_mask",
-        "surface_reachable",
+        "thermal_window_time_mask",
     }
 )
 FLOAT_KEYS = frozenset(THERMAL_OBSERVATION_KEYS) - _BOOL_KEYS
@@ -58,7 +46,7 @@ class ThermalObservationTransform:
 
     ``key_map`` 的键是数据集里的原始键，值是 Observation 字段名。默认同名；
     若数据集用 ``thermal/history`` 之类的键，只需改写映射。``require_all=True``
-    时缺任一字段立即报错——热觉开启时 13 个字段都必需。
+    时缺任一字段立即报错——热觉开启时7个字段都必需。
     """
 
     key_map: Mapping[str, str] = dataclasses.field(
@@ -81,40 +69,24 @@ class ThermalObservationTransform:
 
 @dataclasses.dataclass(frozen=True)
 class EmptyThermalObservation:
-    """给没有热觉传感器的数据集补齐 13 个空字段（全零 / 全 False）。
+    """给没有热觉传感器的数据集补齐空接触历史。
 
     用于在 LIBERO 等纯视觉数据上微调 Thermal-π0.5：热觉分支收到合法的空历史
-    （K 个空槽）与 N 个无效候选点，不会因为缺字段而报错。默认只补缺失键，
+    （K个空槽），不会因为缺字段而报错。默认只补缺失键，
     ``overwrite=True`` 时覆盖已有字段。
     """
 
-    history_size: int
     window_size: int
     signal_dim: int
-    num_surface_points: int
     overwrite: bool = False
 
     def _empty_fields(self) -> dict[str, np.ndarray]:
-        k, length, channels, n = (
-            self.history_size,
-            self.window_size,
-            self.signal_dim,
-            self.num_surface_points,
-        )
+        length, channels = self.window_size, self.signal_dim
         return {
-            "thermal_history": np.zeros((k, length, channels), dtype=np.float32),
-            "thermal_history_time_mask": np.zeros((k, length), dtype=bool),
-            "contact_mask": np.zeros((k,), dtype=bool),
-            "contact_xyz_obj": np.zeros((k, 3), dtype=np.float32),
-            "contact_normal_obj": np.zeros((k, 3), dtype=np.float32),
-            "contact_age_s": np.zeros((k, 1), dtype=np.float32),
-            "surface_xyz_obj": np.zeros((n, 3), dtype=np.float32),
-            "surface_normal_obj": np.zeros((n, 3), dtype=np.float32),
-            "surface_mask": np.zeros((n,), dtype=bool),
-            "surface_reachable": np.zeros((n,), dtype=bool),
-            "surface_grasp_score": np.zeros((n, 1), dtype=np.float32),
-            "ee_xyz_obj": np.zeros((3,), dtype=np.float32),
-            "probe_budget_remaining": np.ones((1,), dtype=np.float32),
+            "thermal_window": np.zeros((length, channels), dtype=np.float32),
+            "thermal_window_time_mask": np.zeros((length,), dtype=bool),
+            "sensor_xyz_base": np.zeros((3,), dtype=np.float32),
+            "sensor_normal_base": np.zeros((3,), dtype=np.float32),
         }
 
     def __call__(self, data: Mapping[str, Any]) -> dict[str, Any]:

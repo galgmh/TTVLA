@@ -4,10 +4,17 @@
 # （由 scripts/build_cup_4link.py 生成）；本文件只描述“怎么摆放、什么材质”。
 manifest: assets/cup_4link/manifest.yaml
 
-# 物体热物性；陶瓷用于杯体所有 link，平台材质供场景里的抬升平台使用。
+# 物体热物性。lower 用“装水杯底”的等效集总材料：保持与陶瓷相同的
+# 导热率，只增大体积热容并降低有效发射率。其余杯体 link 使用 ceramic。
 material: ceramic
+link_materials:
+  lower: water_filled
+  middle: ceramic
+  upper: ceramic
+  handle: ceramic
 material_properties:
-  ceramic: {conductivity: 1.5, density: 2300.0, specific_heat: 900.0, emissivity: 0.0}
+  ceramic: {conductivity: 1.5, density: 2300.0, specific_heat: 900.0, emissivity: 0.008}
+  water_filled: {conductivity: 1.5, density: 1000.0, specific_heat: 4180.0, emissivity: 0.002}
   platform: {conductivity: 0.2, density: 700.0, specific_heat: 1200.0, emissivity: 0.0}
 
 # 放置：坐在 60 mm 高的平台上（rest_height_m），槽位相对桌面中心。

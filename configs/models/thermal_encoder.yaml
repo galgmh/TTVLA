@@ -1,4 +1,4 @@
-# 热编码器：因果膨胀卷积 + 两个输出头（温度回归、接触有效性）。
+# 共享热编码器：因果膨胀卷积 + 温度mean/logvar + 接触有效性。
 #
 # 输入 14 通道：每指 6 通道（T、ΔT、Tdot、Fn、|Fτ|、M）× 2 指，
 # 加上夹爪宽度 w 和接触时间 t_contact。区域 ID、接触 link ID、真实 link
@@ -6,9 +6,9 @@
 model:
   in_channels: 14
   hidden: 64
-  levels: 4          # 膨胀率 1,2,4,8，感受野 31 帧（50 Hz 下 0.62 s）
+  levels: 4          # 每块2层卷积，膨胀率1,2,4,8，感受野61帧
   kernel: 3
-  dropout: 0.1
+  dropout: 0.0         # 兼容字段；共享 ThermalContactEncoder 当前不使用 dropout
   out_dim: 128
 
 training:

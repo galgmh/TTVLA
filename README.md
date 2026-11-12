@@ -11,12 +11,12 @@
     Thermal-π0.5 热觉分支（`models/pi05/thermal/`）。这是项目中 π0.5 的唯一
     实现，不是 third_party 副本；官方 JAX/Flax 实现已删除，训练/微调/评测
     全部走 PyTorch。
-  - `models/thermal_encoder.py` —— 独立热编码器（因果 TCN，基线）。
+  - `models/thermal_encoder.py` —— 单触点预训练兼容入口，复用VLA的同一接触编码器。
 - **训练层 `training/`**：
   - `training/pi05/` —— 项目自有的 Thermal-π0.5 训练/微调/评测（参考官方
     `scripts/train_pytorch.py` 重写）：YAML 配置、`thermalvla-1.0` 数据集、
     分阶段冻结、三组学习率、检查点续训、离线损失评测。
-  - `training/train_thermal_encoder.py` —— 基线编码器训练。
+  - `training/train_thermal_encoder.py` —— 带不确定性的共享单触点编码器预训练。
 
 ## 目录
 
@@ -94,7 +94,7 @@ PYTHONPATH=. .venv/bin/python -m pytest tests/test_pi05_training.py -q  # 8
 资产清单 -> 场景构建/区域解析 -> EpisodeSpec 采样 -> 初始化 link/指尖温度
   -> 受控触碰 -> 逐帧记录 -> HDF5 thermalcontact-v1.8 -> 校验 -> 窗口加载
   -> [导出器，待实现] thermalvla-1.0（13 热觉字段 + 7 监督字段）
-  -> training/pi05 -> Thermal-π0.5（Stage 1–4）
+  -> training/pi05 -> Thermal-π0.5（Stage 1–5，Stage 5 可选）
 ```
 
 场景与采样都不写随机数：同一 `(seed, split, index)` 必然复现同一集。

@@ -100,9 +100,17 @@ def build_properties_dict(
     links: dict[int, dict[str, float]] = {}
     for link in finger_links:
         links[_global_link_index(link)] = dict(FINGER_PROPERTIES)
-    cup_props = dict(props[material])
-    for idx in cup_link_indices:
-        links[int(idx)] = dict(cup_props)
+    region_order = tuple(str(name) for name in object_cfg["region_order"])
+    if len(region_order) != len(cup_link_indices):
+        raise ValueError(
+            f"region_order 有 {len(region_order)} 项，cup_link_indices 有 {len(cup_link_indices)} 项"
+        )
+    link_materials = object_cfg.get("link_materials", {})
+    for region_name, idx in zip(region_order, cup_link_indices):
+        material_name = str(link_materials.get(region_name, material))
+        if material_name not in props:
+            raise ValueError(f"区域 {region_name!r} 的材料 {material_name!r} 未定义")
+        links[int(idx)] = dict(props[material_name])
 
     return make_properties_dict(
         {
