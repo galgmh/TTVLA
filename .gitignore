@@ -7,11 +7,9 @@ build/
 dist/
 .pytest_cache/
 
-# 数据集与运行输出不入库（data/ 是代码包，只有生成物被忽略）
+# 数据集与运行输出不入库
 datasets/*
 !datasets/README.md
-data/manifests/*.jsonl
-!data/manifests/.gitkeep
 *.hdf5
 *.npz
 *.pt

@@ -117,14 +117,15 @@ class DeltaPoseController:
         # 指令位姿的推进限速（每策略步）。
         self.max_pos_step = float(ctrl["pos_speed_m_per_s"]) * self.dt
         self.max_rot_step = float(ctrl["rot_speed_rad_per_s"]) * self.dt
-        # 宽度限速 -> 每根手指的关节限速。
-        self.finger_step = 0.5 * float(ctrl["finger_speed_m_per_s"]) * self.dt
+        # 夹爪总开口的闭合/张开使用同一个速度上限。
+        self.max_width_step = float(ctrl["finger_speed_m_per_s"]) * self.dt
         # 目标位姿（外部设定）与指令位姿（实际送去 IK 的）。
         self.goal_pos = np.zeros(3)
         self.goal_quat = np.array([1.0, 0.0, 0.0, 0.0])
         self.cmd_pos = np.zeros(3)
         self.cmd_quat = np.array([1.0, 0.0, 0.0, 0.0])
         self.width_target = 0.0
+        self.width_cmd = 0.0
         self.last_ik_error = np.zeros(6)
         self.last_q_command = np.zeros(7)
         self.reset()
@@ -138,6 +139,7 @@ class DeltaPoseController:
         self.cmd_pos = pos.copy()
         self.cmd_quat = self.goal_quat.copy()
         self.width_target = float(self.bundle.gripper_width())
+        self.width_cmd = self.width_target
         self.last_ik_error = np.zeros(6)
 
     def set_pose_target(self, pos, quat) -> None:
@@ -198,17 +200,23 @@ class DeltaPoseController:
         robot.control_dofs_position(q_arm, dofs_idx_local=self.arm_dofs)
 
         # 手指限速逼近目标开口（两个指关节同值指令）。
-        q_f = np.asarray(robot.get_dofs_position(dofs_idx_local=self.finger_dofs).detach().cpu())
-        q_f = q_f.reshape(-1)
-        width_now = float(np.sum(q_f))
-        delta = np.clip(self.width_target - width_now, -2.0 * self.finger_step, 2.0 * self.finger_step)
-        half = 0.5 * (width_now + delta)
+        # Slew from the previous joint command. Re-anchoring to measured width
+        # while an object blocks the fingers caps penetration and therefore
+        # caps the maximum contact force.
+        delta = np.clip(
+            self.width_target - self.width_cmd,
+            -self.max_width_step,
+            self.max_width_step,
+        )
+        self.width_cmd += delta
+        half = 0.5 * self.width_cmd
         half = float(np.clip(half, 0.5 * self.width_min, 0.5 * self.width_max))
+        self.width_cmd = float(2.0 * half)
         finger_cmd = np.full(len(self.finger_dofs), half, dtype=np.float64)
         robot.control_dofs_position(finger_cmd, dofs_idx_local=self.finger_dofs)
 
         eef = np.concatenate([self.cmd_pos, self.cmd_quat])
-        return eef, float(2.0 * half)
+        return eef, self.width_cmd
 
     def at_pose(self, pos, quat=None, *, pos_tol: float = 0.01, rot_tol: float = 0.1) -> bool:
         """实测 TCP 是否已到指定位姿（位置 m / 角度 rad；quat 为 None 时只看位置）。"""

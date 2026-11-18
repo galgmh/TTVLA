@@ -1,107 +1,306 @@
-# ThermTacVLA — 主动空间热触觉探索 VLA
+# ThermTacVLA
 
-研究目标：让 VLA 策略在抓取前**主动**进行空间热触觉探索——用指尖接触感知物体
-温度场，判断冷/热（以及材料类别），再决定继续探测、抓取或放弃。项目分三层：
+在 Genesis 中构建热触觉抓取场景，生成 task episode，并把数据导出为 LeRobot
+格式供 models 微调。代码边界为：
 
-- **仿真/数据层 `sim/` + `data/`**：Genesis 刚性仿真生成受控热接触 episode
-  （当前为 4-link 杯子的单区域触碰数据集 `thermalcontact-v1.8`），HDF5 落盘、
-  清单冻结、契约校验。
-- **模型层 `models/`**：
-  - `models/pi05/` —— OpenPI PyTorch π0.5 本体（pinned commit `215abfb`）+
-    Thermal-π0.5 热觉分支（`models/pi05/thermal/`）。这是项目中 π0.5 的唯一
-    实现，不是 third_party 副本；官方 JAX/Flax 实现已删除，训练/微调/评测
-    全部走 PyTorch。
-  - `models/thermal_encoder.py` —— 单触点预训练兼容入口，复用VLA的同一接触编码器。
-- **训练层 `training/`**：
-  - `training/pi05/` —— 项目自有的 Thermal-π0.5 训练/微调/评测（参考官方
-    `scripts/train_pytorch.py` 重写）：YAML 配置、`thermalvla-1.0` 数据集、
-    分阶段冻结、三组学习率、检查点续训、离线损失评测。
-  - `training/train_thermal_encoder.py` —— 带不确定性的共享单触点编码器预训练。
+- `sim/`：Genesis 场景、触觉/热觉传感器、接触控制和 task 数据生成。
+- `models/`：纯 PyTorch π0.5、LeRobot 微调和推理服务。
+- `models/thermal_model/`：已归档的热觉模块，暂不接入 π0.5。
 
-## 目录
+外部 `models/` 已删除。
 
+## sim 结构
+
+```text
+sim/
+  config.py                 简单 YAML 加载与路径解析
+  scene.py                  Genesis 场景构建和 episode reset
+  obs.py                    策略观测和特权观测
+  episode.py                EpisodeSpec
+  sampler.py                确定性 episode 采样
+  dataset.py                HDF5 字段契约和 metadata
+  episode_recorder.py       逐帧 episode 记录
+  recording.py              HDF5 读写
+  validate.py               数据和物理一致性校验
+  model_env.py              π0.5 7 维动作接入 Genesis 的环境包装
+  run_pi_simpler.py         models WebSocket 闭环评测
+
+  generate.py               生成原始 task episode
+  generate_grasp.py         生成抓取基线
+  generate_pi05_v1.py       生成 thermal-pi05-v1 的 80 集原始数据
+  export_pi05_lerobot.py    原始 HDF5 -> LeRobot 微调数据集
+  select_episodes.py        筛选完整四接触 episode
+
+  control/                  接近、接触、抓取和 IK 控制
+  sensors/                  指尖触觉、温度和指垫布局
+  thermal/                  link 温度和热响应
+  compat/                   Genesis 兼容补丁
+  assets/                   cup/robot 资产和构建校验工具
+  configs/                  仿真任务配置
+  tools/                    episode 检查、图表和视频工具
 ```
-assets/cup_4link/      四段杯子的 URDF、网格与清单（位置/区域边界的唯一真源）
-configs/               物体、传感器、任务、数据集、模型、训练六类 YAML
-sim/                   仿真层：场景、区域映射、控制器、采样、观测、温度播种
-data/                  数据层：契约、写出、加载窗口、校验
-models/                热编码器（thermal_encoder.py）与 π0.5 模型层（pi05/）
-training/              训练/评估：基线编码器（顶层脚本）与 π0.5（pi05/ 包）
-scripts/               资产生成与校验、清单生成、数据生成、检查与画图
-tests/                 单元测试（stdlib unittest）
-datasets/              数据输出（不入库）
-checkpoints/           训练检查点（不入库）
-.venv                  π0.5 运行环境（torch 2.7.1 / transformers 4.53.2，无需 JAX）
+
+`sim/config.py` 只负责加载 YAML、解析相对路径和展开物体 manifest，不再维护
+一套逐字段的配置校验框架。具体字段由使用它的场景或生成流程检查。
+
+## models 结构
+
+```text
+models/
+  pi05_model/                纯 PyTorch π0.5 本体
+  data/                      LeRobot 数据加载和 transforms
+  finetune_new.py            微调入口
+  server_policy.py           WebSocket 推理服务
+  configs/configs.py         数据集、模型和训练配置
+  thermal_model/
+    config.py                热觉模型配置
+    observation.py           最终在线模型输出容器
+    preprocessing.py         12 通道热觉窗口
+    model.py                 最终接入 π0.5 的在线热觉模型
+    contact_encoder.py       因果接触编码器
+    memory_bank.py           接触事件长期记忆
+    spatial_memory.py        热空间记忆
+    prefix_adapter.py        热觉 prefix 适配
+    data/                    预训练数据读取
+    encoder_pretraining/     直接使用 ThermalContactEncoder 的预训练工具
+    spatial_pretraining/     空间表示、热场 decoder 和辅助头训练
+    pi05_training/           热觉训练适配（暂未接入）
+    configs/                 热觉模型、预训练和 π0.5 配置
+    ARCHITECTURE.md          热觉集成设计
+```
+
+`thermal_model` 目前只是独立归档，不影响 models 的普通 π0.5
+训练、推理或闭环测试。
+
+## 数据流
+
+```text
+sim/configs + sim/assets
+  -> EpisodeSpec
+  -> Genesis scene.reset
+  -> 受控接近、接触、力闭环、退回
+  -> 100 Hz 热触觉 + 20 Hz 控制/RGB
+  -> sim.dataset / sim.recording
+  -> sim.export_pi05_lerobot
+  -> models data loader
+  -> pi05_model
+```
+
+模型侧的单步动作约定为：:
+
+```text
+[dx, dy, dz, drot_x, drot_y, drot_z, gripper_width]
+```
+
+[model_env.py](/home/ca/TTVLA/sim/model_env.py:1) 把动作作用到当前 TCP 位姿，
+通过 IK 控制机械臂，并把 7 个关节角和夹爪宽度组成 8 维 state。它同时维护
+模型所需的 25 帧、12 通道热触觉窗口：
+
+```python
+env = GenesisModelEnv(
+    "sim/configs/tasks/thermal_contact_probe.yaml",
+    "sim/configs/datasets/thermal_contact_v1.yaml",
+    split="train",
+)
+
+observations = env.reset(index=0)
+next_observations, done, info = env.step(action_7d)
+```
+
+models 闭环评测：
+
+```bash
+# 终端 1：在 models 环境中启动模型服务
+cd models
+python server_policy.py \
+  --config_name your_config \
+  --checkpoint_dir /path/to/checkpoint \
+  --port 8000
+
+# 终端 2：在 Genesis 环境中执行闭环
+cd ..
+python -m sim.run_pi_simpler \
+  --host 127.0.0.1 --port 8000 \
+  --split train --start 0 --episodes 10 \
+  --replan-steps 5 \
+  --success-kind cup-lift \
+  --success-threshold 0.06 \
+  --output datasets/pi_simpler_eval.json
 ```
 
 ## 环境
 
 ```bash
-# 仿真/数据（Genesis 1.4.1 + torch cu128）
 conda activate tempvla
-export LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH   # WSL2 上必须
-
-# π0.5 模型与训练（项目根 .venv；已装 transformers_replace）
-PYTHONPATH=. .venv/bin/python -m pytest models/pi05/thermal -q
+export LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH
 ```
 
-注意：`.venv` 的 torch cu126 轮子不支持 RTX 5060（sm_120），本机 GPU 训练需
-换 cu128 构建；正式训练与闭环评估在云端 GPU 机器上执行。
-
-## 常用命令
+π0.5 训练使用：
 
 ```bash
-# ---- 仿真数据 ----
-python scripts/generate_contact_manifests.py --splits pilot   # 冻结划分
-python scripts/generate_thermal_contact.py --split pilot --count 10
-python scripts/generate_all.py --workers 4                    # 并行全量
+conda activate tempvla_pi05
+```
 
+项目使用 Python 3.11，不使用 `.venv`。
+
+## task 数据生成
+
+生成单个或部分 episode：
+
+```bash
+python -m sim.generate \
+  --split train \
+  --start 0 \
+  --count 10 \
+  --out datasets/thermal_contact_multi
+```
+
+校验：
+
+```bash
 python - <<'PY'
-from data.validation.validate_thermal_contact import validate_directory
-print(validate_directory("datasets/thermal_contact_v1/pilot") or "0 issues")
+from sim.validate import validate_directory
+
+issues = validate_directory("datasets/thermal_contact_multi/train")
+print(issues or "0 issues")
 PY
-
-# ---- 基线热编码器 ----
-python training/train_thermal_encoder.py --epochs 5
-python training/evaluate_thermal_encoder.py datasets/thermal_contact_v1/runs/thermal_encoder.pt
-
-# ---- Thermal-π0.5 ----
-# 冒烟：dummy 主干 + 随机数据，CPU 数秒跑完
-PYTHONPATH=. .venv/bin/python -m training.pi05.train \
-    --config configs/training/pi05_thermal_smoke.yaml --overwrite
-
-# 正式训练（先由仿真导出器产出 data.root 指向的 thermalvla-1.0 数据）
-PYTHONPATH=. .venv/bin/python -m training.pi05.train \
-    --config configs/training/pi05_thermal_stage1.yaml
-
-# 断点续训
-PYTHONPATH=. .venv/bin/python -m training.pi05.train \
-    --config configs/training/pi05_thermal_stage1.yaml --resume
-
-# 离线损失评测（加载最新检查点；可用 --data-root 指定评估集）
-PYTHONPATH=. .venv/bin/python -m training.pi05.eval \
-    --config configs/training/pi05_thermal_stage1.yaml --num-batches 20
-
-# ---- 测试 ----
-python -m unittest discover -s tests -t .                     # 仿真/数据/编码器
-PYTHONPATH=. .venv/bin/python -m pytest models/pi05/thermal -q      # 39
-PYTHONPATH=. .venv/bin/python -m pytest tests/test_pi05_training.py -q  # 8
 ```
 
-## 数据流
+检查单个 episode：
 
-```
-资产清单 -> 场景构建/区域解析 -> EpisodeSpec 采样 -> 初始化 link/指尖温度
-  -> 受控触碰 -> 逐帧记录 -> HDF5 thermalcontact-v1.8 -> 校验 -> 窗口加载
-  -> [导出器，待实现] thermalvla-1.0（13 热觉字段 + 7 监督字段）
-  -> training/pi05 -> Thermal-π0.5（Stage 1–5，Stage 5 可选）
+```bash
+python -m sim.tools.inspect_episode \
+  datasets/thermal_contact_multi/train/<episode>.hdf5
 ```
 
-场景与采样都不写随机数：同一 `(seed, split, index)` 必然复现同一集。
+筛选完整四接触 episode：
 
-## 文档
+```bash
+python -m sim.select_episodes \
+  --source datasets/thermal_contact_multi/train \
+  --out datasets/thermal_contact_1/train \
+  --expect 90
+```
 
-- `models/pi05/INTEGRATED_PI05_ARCHITECTURE.md`：Thermal-π0.5 完整 13 节规格。
-- `models/pi05/THERMAL_PI05.md`：热觉模块、训练阶段、`training/pi05/` 用法、
-  数据格式与验证记录。
-- `models/pi05/README.md`：模型层文件对应关系与运行环境。
+抓取基线：
+
+```bash
+python -m sim.generate_grasp \
+  --policy sim/configs/policies/direct_lift.yaml \
+  --split train \
+  --count 100
+```
+
+第一版 Pi0.5 数据：
+
+```bash
+# 80 集原始 HDF5
+python -m sim.generate_pi05_v1
+
+# 只导出成功 episode 到 LeRobot
+python -m sim.export_pi05_lerobot \
+  --source datasets/thermal_pi05_v1/raw \
+  --root datasets/lerobot/thermal_pi05_v1 \
+  --repo-id thermtacvla/thermal_pi05_v1 \
+  --fps 20
+```
+
+`generate_pi05_v1.py` 按每种专家 20 个成功 episode 计数。失败 episode 不写盘，
+会用新的确定性 attempt 自动重试；运行前还会清理旧输出目录中未成功的 HDF5。
+单个 episode 默认最多尝试 20 次，可通过 `--max-attempts-per-episode` 调整。
+
+## 热编码器
+
+生成 12 通道派生数据：
+
+```bash
+cd /home/ca/TTVLA
+
+PYTHONPATH=models python -m thermal_model.encoder_pretraining.prepare_dataset \
+  --source datasets/thermal_contact_1_copy/train \
+  --out datasets/thermal_encoder \
+  --overwrite
+```
+
+90 个 episode 会生成 360 个接触组和 360 个非接触组。每组 51 帧
+（50 Hz 下 1 s），从组内切出 25 个长度为 26 的窗口，共 18000 个窗口。
+所有窗口均为真实采样，`mask` 全为 True；非接触组只训练接触有效性。
+
+训练：
+
+```bash
+PYTHONPATH=models python -m thermal_model.encoder_pretraining.train \
+  --config thermal_model/configs/encoder_pretraining.yaml \
+  --data-root datasets/thermal_encoder \
+  --out datasets/thermal_encoder/thermal_encoder.pt
+```
+
+评测：
+
+```bash
+PYTHONPATH=models python -m thermal_model.encoder_pretraining.evaluate \
+  datasets/thermal_encoder/thermal_encoder.pt \
+  --data-root datasets/thermal_encoder \
+  --splits validation test
+```
+
+空间热觉预训练：
+
+```bash
+PYTHONPATH=models python -m thermal_model.spatial_pretraining.prepare_dataset \
+  --source datasets/thermal_encoder \
+  --raw-source datasets/thermal_contact_1_copy/train \
+  --out datasets/thermal_spatial \
+  --overwrite
+
+PYTHONPATH=models python -m thermal_model.spatial_pretraining.train \
+  --config thermal_model/configs/spatial_pretraining.yaml \
+  --data-root datasets/thermal_spatial \
+  --out datasets/thermal_spatial/runs/thermal_spatial.pt \
+  --memory-mode full
+
+PYTHONPATH=models python -m thermal_model.spatial_pretraining.evaluate \
+  datasets/thermal_spatial/runs/thermal_spatial.pt \
+  --data-root datasets/thermal_spatial \
+  --memory-mode full
+```
+
+空间预训练加载 `thermal_encoder.pt`，默认冻结接触编码器，只训练
+`ContactTokenBuilder`、`ThermalSpatialMemory` 和辅助 `SpatialFieldDecoder`。
+辅助头实现位于 `thermal_model/spatial_pretraining/`，最终在线模型不持有它们。
+训练按 `episode_offsets` 逐条运行完整 episode，按时间顺序更新 MemoryBank；
+不同长度 episode 在同一 batch 内 padding，并用 mask 排除。
+训练或评测传 `--memory-mode current` 可关闭历史 MemoryBank，只使用当前
+contact token，用于 full/current 消融。
+`thermal-spatial-v2` 额外保存每个窗口末端的 `contact_valid` 和
+`contact_region`。默认只对当前接触区域的查询点计算 MSE，并把 current token
+显式加入 SpatialMemory 输入。
+评测会额外输出 `current`、`seen`、`unseen` 三类区域的样本数、MAE 和
+RMSE，用于比较 full-memory 与 current-only。
+
+先用 current-only 训练基础空间映射，再加载该 checkpoint 训练 full-memory：
+
+```bash
+PYTHONPATH=models python -m thermal_model.spatial_pretraining.train \
+  --config thermal_model/configs/spatial_pretraining.yaml \
+  --data-root datasets/thermal_spatial \
+  --out datasets/thermal_spatial/runs/with_memory_v2.pt \
+  --init-checkpoint datasets/thermal_spatial/runs/current_only_v2.pt \
+  --memory-mode full \
+  --field-loss mse \
+  --epochs 20 \
+  --batch-size 2 \
+  --lr 0.0001
+```
+
+温度 `logvar` 使用有界 sigmoid 参数化：`[-4, 3]`。对应温度标准差约为
+`0.135～4.48°C`，loss 中不再使用会把梯度截断的固定 `clamp`。
+
+## models 微调
+
+```bash
+cd /home/ca/TTVLA/models
+python finetune_new.py --config_name your_config
+```
+
+热觉模块暂不接入；当前训练使用普通 π0.5、LeRobot 数据和可选零右腕 mask。

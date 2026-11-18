@@ -12,12 +12,16 @@ from sim.control.probe_controller import (
     ProbeController,
     ProbeOutcome,
 )
+from sim.control.grasp_controller import GraspLiftController, GraspPolicyConfig, load_grasp_policy_config
 
 __all__ = [
     "CONTACT_THRESHOLD_N",
     "MAX_JOINT_STEP_RAD",
     "DeltaPoseController",
     "ProbeController",
+    "GraspLiftController",
+    "GraspPolicyConfig",
+    "load_grasp_policy_config",
     "ProbeOutcome",
     "ProbePose",
     "point_world",

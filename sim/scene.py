@@ -27,7 +27,7 @@ import numpy as np
 from sim.config import TaskConfig
 from sim.regions import ThermalRegionRuntime, resolve_thermal_regions
 from sim.rotations import quat_conj, quat_mul, quat_rotate, yaw_to_quat
-from sim.sampling.episode_spec import EpisodeSpec
+from sim.episode import EpisodeSpec
 from sim.sensors.finger_layout import FingerLayout, derive_finger_layout
 from sim.sensors.tactile import (
     CONTACT_LINKS,

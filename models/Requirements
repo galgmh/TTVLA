@@ -1,0 +1,9 @@
+conda install python=3.12
+conda install ffmpeg -c conda-forge
+git clone https://github.com/huggingface/lerobot.git
+pip install -e .
+pip install jax==0.9.2
+pip install transformers==4.53.2
+pip install numpydantic
+pip install wandb tyro
+pip install sentencepiece

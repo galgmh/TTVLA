@@ -1,0 +1,41 @@
+# Spatial thermal pretraining after the contact encoder.
+#
+# The contact encoder is loaded from the encoder pretraining checkpoint and is
+# frozen by default. Only ContactTokenBuilder, ThermalSpatialMemory and the
+# auxiliary SpatialFieldDecoder are trained.
+model:
+  signal_dim: 12
+  contact_hidden_channels: [64, 64, 128, 128]
+  contact_dilations: [1, 2, 4, 8]
+  contact_kernel_size: 3
+  thermal_latent_dim: 128
+  contact_logvar_min: -4.0
+  contact_logvar_max: 3.0
+  hidden_dim: 256
+  num_spatial_tokens: 8
+  num_heads: 8
+  fourier_bands: 6
+  field_logvar_min: -4.0
+  field_logvar_max: 3.0
+  dropout: 0.0
+
+training:
+  encoder_checkpoint: datasets/thermal_encoder/thermal_encoder.pt
+  freeze_encoder: true
+  batch_size: 8
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  epochs: 50
+  seed: 0
+  field_loss: mse
+  huber_delta: 2.0
+  weights: {field_temp: 1.0}
+  output_dir: datasets/thermal_spatial/runs
+  device: auto
+  num_workers: 0
+
+data:
+  root: datasets/thermal_spatial
+  train: train
+  validation: validation
+  test: test

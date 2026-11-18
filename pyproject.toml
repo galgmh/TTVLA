@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "thermtacvla"
 version = "0.1.0"
-description = "ThermalContact-v1: single-region thermal contact dataset generation on Genesis"
+description = "Thermal-tactile VLA simulation, dataset generation, and PyTorch training"
 readme = "README.md"
 # OpenPI 的锁文件支持 Python >=3.11；本项目固定 Python 3.11 系列，以匹配
 # 当前 conda 环境、官方 π0.5 PyTorch 基线以及 transformers replacement。
@@ -37,7 +37,7 @@ dev = [
 wandb = ["wandb==0.19.11"]
 
 [tool.setuptools.packages.find]
-include = ["sim*", "data*", "models*", "training*"]
+include = ["sim*", "models*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

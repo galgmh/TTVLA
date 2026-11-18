@@ -2,17 +2,20 @@
 
 状态机::
 
-    RESET -> APPROACH -> SEEK_CONTACT -> HOLD -> RETRACT -> DONE
+    RESET -> APPROACH -> SEEK_CONTACT -> HOLD
+          -> RETRACT_OPEN -> RETRACT_MOVE -> RETRACT_SETTLE -> DONE
                                      \\-> FAILED（未建立接触）
 
 * RESET      同步控制器到实测位姿，指位保持张开；随后直接进入 APPROACH；
 * APPROACH   分四段到位：先升到杯口以上（姿态不变）→ 原地转到探测姿态 →
              水平移到预接触位正上方 → 下降到预接触位；到达后直接开始插入；
-* SEEK_CONTACT 先沿接近方向直线插入到接触位，再以 ``contact.close_step_m``
-             每策略步闭合手指，直到任一指尖法向力超过
-             ``CONTACT_THRESHOLD_N``；失败档只闭合 ``fail_retreat_m``；
+* SEEK_CONTACT 先沿接近方向直线插入到接触位，再按
+             ``controller.finger_speed_m_per_s`` 闭合手指，直到任一指尖法向力
+             超过 ``CONTACT_THRESHOLD_N``；失败档只闭合 ``fail_retreat_m``；
 * HOLD       把法向力误差积分为指位修正，稳定在 ``spec.target_force_n``；
-* RETRACT    张开手指、退回预接触位，停留 ``timing.post_contact_s``。
+* RETRACT_OPEN   保持 TCP 不动，先张开手指；
+* RETRACT_MOVE   仅在夹爪完全张开后，退回预接触位；
+* RETRACT_SETTLE 在预接触位停留 ``timing.post_contact_s``。
 
 控制器只读力与位姿，不读温度——温度只被记录，不参与决策。
 """
@@ -205,10 +208,10 @@ class ProbeController:
             self.failure_reason = reason
         if self.contact_start_s is not None and self.contact_end_s is None:
             self.contact_end_s = self.step_index * self.dt
-        if self.phase == "RETRACT":
+        if self.phase in ("RETRACT_OPEN", "RETRACT_MOVE", "RETRACT_SETTLE"):
             self._set_phase("FAILED")
         else:
-            self._set_phase("RETRACT")
+            self._set_phase("RETRACT_OPEN")
 
     def _command(self) -> None:
         ctrl = self.controller
@@ -219,11 +222,14 @@ class ProbeController:
         elif self.phase == "SEEK_CONTACT":
             ctrl.set_pose_target(self._insert_target(), self.pose.quat)
             if self._insert_done:
-                target = ctrl.width_target - 2.0 * float(self.contact_cfg["close_step_m"])
-                ctrl.set_width_target(max(target, self.close_stop_width))
+                ctrl.set_width_target(self.close_stop_width)
         elif self.phase == "HOLD":
             ctrl.set_pose_target(self.pose.pos, self.pose.quat)
-        elif self.phase == "RETRACT":
+        elif self.phase == "RETRACT_OPEN":
+            pos_now, quat_now = tcp_pose(self.bundle)
+            ctrl.set_pose_target(pos_now, quat_now)
+            ctrl.set_width_target(self.width_start)
+        elif self.phase in ("RETRACT_MOVE", "RETRACT_SETTLE"):
             ctrl.set_pose_target(self.pose.pre_pos, self.pose.quat)
             ctrl.set_width_target(self.width_start)
         # DONE / FAILED 保持最后指令。
@@ -289,10 +295,24 @@ class ProbeController:
             self.controller.set_width_target(self.controller.width_target + 2.0 * gain * err)
             if self.phase_steps * self.dt >= float(self.spec.contact_hold_s):
                 self.contact_end_s = self.step_index * self.dt
-                self._set_phase("RETRACT")
+                self._set_phase("RETRACT_OPEN")
             return
 
-        if self.phase == "RETRACT":
+        if self.phase == "RETRACT_OPEN":
+            if self.bundle.gripper_width() >= self.width_start - 2.0e-4:
+                self._set_phase("RETRACT_MOVE")
+            elif self.phase_steps * self.dt >= float(self.timing["retract_open_timeout_s"]):
+                self._fail("retract_open_timeout")
+            return
+
+        if self.phase == "RETRACT_MOVE":
+            if self.controller.at_pose(self.pose.pre_pos, pos_tol=0.006) and self.controller.settled():
+                self._set_phase("RETRACT_SETTLE")
+            elif self.phase_steps * self.dt >= float(self.timing["retract_move_timeout_s"]):
+                self._fail("retract_move_timeout")
+            return
+
+        if self.phase == "RETRACT_SETTLE":
             if self.phase_steps * self.dt >= float(self.timing["post_contact_s"]):
                 self._set_phase("DONE" if not self.failure_reason else "FAILED")
             return

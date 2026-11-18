@@ -1,0 +1,76 @@
+dataset_version: thermal-pi05-v1
+output_dir: datasets/thermal_pi05_v1/raw
+seed: 20261118
+instruction: "抓取杯子，并选择安全（非高温）的温度区域"
+split: train
+
+regimes:
+  A:
+    lower: [65.0, 70.0]
+    middle: [62.0, 65.0]
+    upper: [60.0, 62.0]
+    handle: [30.0, 40.0]
+  B:
+    lower: [31.0, 34.0]
+    middle: [29.0, 30.0]
+    upper: [26.0, 28.0]
+    handle: [55.0, 60.0]
+
+contact:
+  probe_force_n: 2.0
+  grasp_force_n: 15.0
+  contact_hold_s: 0.5
+  force_band_n: 1.0
+  force_width_step_m: 0.00002
+  force_fast_width_step_m: 0.0002
+  force_fast_threshold_n: 2.0
+  grasp_hold_s: 0.5
+  lift_height_m: 0.12
+  lift_success_height_m: 0.06
+  lift_timeout_s: 8.0
+  grasp_timeout_s: 10.0
+
+grasp:
+  wall:
+    x: 0.0
+    y: 0.0
+    z_range: [0.035, 0.075]
+    tool_dir: [-1.0, 0.0, 0.0]
+    finger_dir: [0.0, -1.0, 0.0]
+    pre_dist: 0.06
+    xy_jitter_m: 0.001
+  handle:
+    x: -0.057
+    y: 0.0
+    z_range: [0.035, 0.075]
+    tool_dir: [1.0, 0.0, 0.0]
+    finger_dir: [0.0, -1.0, 0.0]
+    pre_dist: 0.07
+    xy_jitter_m: 0.0008
+
+sensor:
+  rc_s: {nominal: 0.05, multiplier_range: [0.8, 1.2]}
+  noise_c: {nominal: 0.05, multiplier_range: [0.8, 1.2]}
+  quantization_c: {nominal: 0.1, multiplier_range: [0.8, 1.2]}
+  bias_c: {nominal: 0.0, absolute_range: [-0.01, 0.01]}
+
+policies:
+  - id: A_wall_handle_grasp_handle
+    regime: A
+    episodes: 20
+    sequence: [probe_wall, probe_handle, grasp_handle]
+
+  - id: A_handle_grasp_handle
+    regime: A
+    episodes: 20
+    sequence: [probe_handle, grasp_handle]
+
+  - id: B_wall_grasp_wall
+    regime: B
+    episodes: 20
+    sequence: [probe_wall, grasp_wall]
+
+  - id: B_handle_wall_grasp_wall
+    regime: B
+    episodes: 20
+    sequence: [probe_handle, probe_wall, grasp_wall]

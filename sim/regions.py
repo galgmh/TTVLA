@@ -1,6 +1,6 @@
 """热区与 link 的映射。
 
-资产清单（``assets/cup_4link/manifest.yaml``）是*唯一*真源：区域顺序、
+资产清单（``sim/assets/cup_4link/manifest.yaml``）是*唯一*真源：区域顺序、
 区域对应的 link 名、区域 z 边界都来自清单，代码里不写死任何 link 名。
 
 ``ThermalRegionRuntime`` 把清单解析成运行时可用的表：
