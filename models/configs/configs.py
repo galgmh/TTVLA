@@ -4,7 +4,11 @@ from finetune_new import TrainConfig
 from data.data_loader import RepackTransform
 
 import dataclasses
+import pathlib
 import numpy as np
+
+# Repo root (models/ is one level down from it); used to keep cloud paths portable.
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 @dataclasses.dataclass(frozen=True)
 class ZeroRightWrist:
@@ -138,6 +142,76 @@ ALLCONFIGS = {
             seed=42,
             batch_size=1,
             num_workers=0,
+            zero_grad_double_check=True,
+            data_config=None,
+        ),
+    },
+    # ------------------------------------------------------------------
+    # Fine-tune on datasets/raw_v4 (80 episodes, exported to LeRobot v3.0).
+    # All paths are derived from this checkout, so the same entry works on
+    # the cloud server once the files are placed as follows:
+    #   dataset       <repo>/datasets/lerobot/thermal_pi05_v1_v4
+    #   norm stats    <repo>/assets/thermal_pi05_v1_v4_norm_stats  (tracked)
+    #   tokenizer     ~/.cache/openpi/big_vision/paligemma_tokenizer.model
+    #   base weights  ~/.cache/openpi/openpi-assets/checkpoints/pi05_base_pytorch
+    #                 (output of convert/convert_jax_to_torch.py --pi05)
+    # ------------------------------------------------------------------
+    "thermal_v4_ft": {
+        "data_config": DataConfig(
+            repo_id="thermtacvla/thermal_pi05_v1_v4",
+            local_root=str(_REPO_ROOT / "datasets/lerobot/thermal_pi05_v1_v4"),
+            asset_id="thermal_pi05_v1_v4_norm_stats",
+            norm_stats_dir=str(_REPO_ROOT / "assets/thermal_pi05_v1_v4_norm_stats"),
+            use_quantile_norm=True,
+            video_backend="pyav",
+            repack_transforms=(
+                RepackTransform({
+                    "images": {
+                        "base_0_rgb": "observation.images.up",
+                        "left_wrist_0_rgb": "observation.images.side",
+                    },
+                    "state": "observation.state",
+                    "actions": "action",
+                    "task_index": "task_index",
+                }),
+            ),
+            data_transforms=(ZeroRightWrist(),),
+            action_sequence_keys=("action",),
+            prompt_from_task=True,
+            default_prompt=None,
+            tokenizer_path=str(pathlib.Path.home() / ".cache/openpi/big_vision/paligemma_tokenizer.model"),
+        ),
+        "model_config": Pi0Config(pi05=True),
+        "train_config": TrainConfig(
+            project_name="pi",
+            exp_name="thermal_v4_ft",
+            run_dir=str(_REPO_ROOT / "runs"),
+            log_interval=10,
+            # Each checkpoint is the full bf16 model (~6.6 GB); 5000 keeps
+            # disk usage ~40 GB for the default 30k-step run.
+            save_interval=5_000,
+            resume=False,
+            load_checkpoint_dir=None,
+            wandb_enabled=True,
+            model_config=None,
+            pytorch_weight_path=str(
+                pathlib.Path.home() / ".cache/openpi/openpi-assets/checkpoints/pi05_base_pytorch"
+            ),
+            freeze_stage="vlm",
+            pytorch_training_precision="bfloat16",
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            end_lr=2.5e-6,
+            optimizer_b1=0.9,
+            optimizer_b2=0.95,
+            optimizer_eps=1e-8,
+            optimizer_weight_decay=1e-10,
+            optimizer_clip_gradient_norm=1.0,
+            num_train_steps=30_000,
+            seed=42,
+            batch_size=32,
+            num_workers=4,
             zero_grad_double_check=True,
             data_config=None,
         ),

@@ -147,7 +147,7 @@ def main() -> int:
             dataset = LeRobotDataset.create(
                 repo_id=args.repo_id,
                 root=root,
-                fps=float(args.fps),
+                fps=int(args.fps),
                 robot_type=str(args.robot_type),
                 features=_features(height, width),
             )
