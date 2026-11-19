@@ -53,7 +53,7 @@ from data.data_loader import (
     ResizeImages,
     TokenizePrompt,
 )
-from utils.normalize import NormStats
+from utils.normalize import NormStats, load as load_norm_stats
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +349,11 @@ def load_policy(
 
     if default_prompt is not None:
         data_config = dataclasses.replace(data_config, default_prompt=default_prompt)
+    if data_config.norm_stats is None and data_config.norm_stats_dir is not None:
+        data_config = dataclasses.replace(
+            data_config,
+            norm_stats=load_norm_stats(data_config.norm_stats_dir),
+        )
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
