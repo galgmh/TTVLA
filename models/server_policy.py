@@ -53,7 +53,7 @@ from data.data_loader import (
     ResizeImages,
     TokenizePrompt,
 )
-from utils.normalize import NormStats
+from utils.normalize import NormStats, load as load_norm_stats
 
 
 # ---------------------------------------------------------------------------
@@ -234,8 +234,11 @@ class Pi05Policy:
             for k, v in sample["images"].items()
         }
         if "image_masks" in sample:
+            # Accept scalar / 1-D / 2-D masks from upstream and reduce them to
+            # one value per sample: `embed_prefix` expects shape (B,). The
+            # server serves a single observation, so B == 1.
             image_masks = {
-                k: torch.from_numpy(np.ascontiguousarray(v)).to(torch.bool).to(device)[None, ...]
+                k: torch.from_numpy(np.asarray(v, dtype=bool).reshape(-1)[:1]).to(device)
                 for k, v in sample["image_masks"].items()
             }
         else:
@@ -346,6 +349,21 @@ def load_policy(
     bundle = ALLCONFIGS[config_name]
     data_config: DataConfig = bundle["data_config"]
     model_config: Pi0Config = bundle["model_config"]
+
+    # Training-time `create_data_loader` hydrates norm stats from `norm_stats_dir`;
+    # the server uses `data_config.norm_stats` directly, so load them here.
+    # Without this, Normalize/Unnormalize silently no-op.
+    if data_config.norm_stats is None and data_config.norm_stats_dir is not None:
+        data_config = dataclasses.replace(
+            data_config,
+            norm_stats=load_norm_stats(pathlib.Path(data_config.norm_stats_dir)),
+        )
+        logging.info(f"Loaded norm stats from {data_config.norm_stats_dir}")
+    if data_config.norm_stats is None:
+        raise ValueError(
+            "DataConfig has neither norm_stats nor norm_stats_dir; "
+            "serving without normalization would not match training."
+        )
 
     if default_prompt is not None:
         data_config = dataclasses.replace(data_config, default_prompt=default_prompt)
