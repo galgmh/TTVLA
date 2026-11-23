@@ -436,13 +436,14 @@ def build_scene(
     regions = resolve_thermal_regions(cup, object_cfg)
 
     # ------------------------------------------------------------------ 平台
-    # 平台与杯体轴线同轴：AABB 中心相对作者原点偏 17.5 mm（手柄侧），
-    # 所以平台中心 = 槽位 − AABB 中心（基础朝向下）。
-    center = cup_spec.center
+    # 垫高砖块拥有独立对象配置；其位置不再由杯子 AABB 隐式推导。
+    support_xy = platform_cfg.get("place_xy", object_cfg["place_xy"])
     platform_pos = (
-        float(table_cfg["pos"][0]) + float(object_cfg["place_xy"][0]) - float(center[0]),
-        float(table_cfg["pos"][1]) + float(object_cfg["place_xy"][1]) - float(center[1]),
-        float(table_cfg["height_m"]) + 0.5 * float(platform_cfg["height_m"]),
+        float(table_cfg["pos"][0]) + float(support_xy[0]),
+        float(table_cfg["pos"][1]) + float(support_xy[1]),
+        float(table_cfg["height_m"])
+        + float(platform_cfg.get("z_above_table_m", 0.0))
+        + 0.5 * float(platform_cfg["height_m"]),
     )
     scene.add_entity(
         gs.morphs.Box(

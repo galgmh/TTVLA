@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import numpy as np
-import yaml
 
 from sim.control.probe_controller import CONTACT_THRESHOLD_N, ProbeController
 
@@ -25,24 +23,24 @@ class GraspPolicyConfig:
     bilateral_force_n: float
 
 
-def load_grasp_policy_config(path: str | Path) -> GraspPolicyConfig:
-    path = Path(path)
-    raw: dict[str, Any] = yaml.safe_load(path.read_text(encoding="utf-8"))
-    required = {field.name for field in GraspPolicyConfig.__dataclass_fields__.values()}
-    if set(raw) != required:
-        raise ValueError(f"{path} 字段必须恰为 {sorted(required)}，实为 {sorted(raw)}")
-    cfg = GraspPolicyConfig(**raw)
-    if not cfg.policy_id or not cfg.instruction or not cfg.grasp_region:
-        raise ValueError("policy_id / instruction / grasp_region 不能为空")
-    for name in (
-        "lift_height_m", "lift_success_height_m", "grasp_timeout_s",
-        "lift_timeout_s", "lift_hold_s", "bilateral_force_n",
-    ):
-        if float(getattr(cfg, name)) <= 0.0:
-            raise ValueError(f"{name} 必须为正数")
-    if cfg.lift_success_height_m > cfg.lift_height_m:
-        raise ValueError("lift_success_height_m 不能大于 lift_height_m")
-    return cfg
+def grasp_policy_from_task(task: dict[str, Any]) -> GraspPolicyConfig:
+    """Build one scripted expert from a goal-only task definition."""
+    required = str(task["success"]["required_grasp_region"])
+    region_by_goal = {"cup_wall": "middle", "handle": "handle", "cup_rim": "upper"}
+    if required not in region_by_goal:
+        raise ValueError(f"任务 {task['task_id']} 不是单握点直接抓取任务：{required}")
+    min_lift = float(task["success"]["min_lift_height_m"])
+    return GraspPolicyConfig(
+        policy_id=str(task["task_id"]),
+        instruction=str(task["instruction"]),
+        grasp_region=region_by_goal[required],
+        lift_height_m=max(0.12, min_lift + 0.03),
+        lift_success_height_m=min_lift,
+        grasp_timeout_s=6.0,
+        lift_timeout_s=5.0,
+        lift_hold_s=0.50,
+        bilateral_force_n=0.30,
+    )
 
 
 class GraspLiftController(ProbeController):
@@ -119,5 +117,5 @@ class GraspLiftController(ProbeController):
                 self._set_phase("DONE")
 
 
-__all__ = ["GraspLiftController", "GraspPolicyConfig", "load_grasp_policy_config"]
+__all__ = ["GraspLiftController", "GraspPolicyConfig", "grasp_policy_from_task"]
 

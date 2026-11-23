@@ -396,7 +396,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="包含 90 个 ThermalContact episode 的目录",
     )
     parser.add_argument("--out", default="datasets/thermal_encoder")
-    parser.add_argument("--dataset", default="sim/configs/datasets/thermal_contact_v1.yaml")
+    parser.add_argument("--dataset", default="sim/generation/presets/thermal_contact_v1.yaml")
     parser.add_argument("--overwrite", action="store_true")
     return parser
 

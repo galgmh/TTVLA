@@ -1,38 +1,25 @@
-"""Generate the first 80-episode Pi0.5 raw dataset."""
+"""Thermal-safe scripted expert pipeline used by the unified generator."""
 
 from __future__ import annotations
 
-import argparse
-import json
 from pathlib import Path
-import sys
 import time
 import zlib
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from sim.config import REPO_ROOT, load_dataset_config, load_task_config
 from sim.control.pi05_expert import ExpertStep, Pi05ExpertController
+from sim.control.cup_expert_defaults import (
+    GRASP_TARGETS,
+    THERMAL_SAFE_EXECUTION,
+    THERMAL_SAFE_POLICIES,
+)
 from sim.episode import EpisodeSpec
-from sim.generate import run_episode
+from sim.generation.episode_runner import run_episode
 from sim.recording import write_episode
 from sim.scene import build_scene
 
 WALL_REGIONS = ("lower", "middle", "upper")
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Generate thermal-pi05-v1 raw HDF5 episodes")
-    parser.add_argument("--task", default="sim/configs/tasks/thermal_contact_probe.yaml")
-    parser.add_argument("--dataset", default="sim/configs/datasets/pi05_v1.yaml")
-    parser.add_argument("--out", default=None)
-    parser.add_argument("--policies", nargs="+", default=None)
-    parser.add_argument("--episodes-per-policy", type=int, default=None)
-    parser.add_argument("--max-attempts-per-episode", type=int, default=20)
-    parser.add_argument("--skip-existing", action="store_true")
-    return parser
 
 
 def _rotate_about_axis(vector: np.ndarray, axis: np.ndarray, angle: float) -> np.ndarray:
@@ -88,17 +75,19 @@ def _sample_grasp(rng: np.random.Generator, grasp_cfg: dict):
     )
 
 
-def _sample_sensor(rng: np.random.Generator, sensor_cfg: dict) -> tuple[float, float, float, float]:
-    rc = float(sensor_cfg["rc_s"]["nominal"]) * float(
-        rng.uniform(*sensor_cfg["rc_s"]["multiplier_range"])
+def _sample_sensor(
+    rng: np.random.Generator, nominal: dict, randomization: dict
+) -> tuple[float, float, float, float]:
+    rc = float(nominal["rc_s"]) * float(
+        rng.uniform(*randomization["rc_multiplier_range"])
     )
-    noise = float(sensor_cfg["noise_c"]["nominal"]) * float(
-        rng.uniform(*sensor_cfg["noise_c"]["multiplier_range"])
+    noise = float(nominal["noise_c"]) * float(
+        rng.uniform(*randomization["noise_multiplier_range"])
     )
-    quantization = float(sensor_cfg["quantization_c"]["nominal"]) * float(
-        rng.uniform(*sensor_cfg["quantization_c"]["multiplier_range"])
+    quantization = float(nominal["quantization_c"]) * float(
+        rng.uniform(*randomization["quantization_multiplier_range"])
     )
-    bias = float(rng.uniform(*sensor_cfg["bias_c"]["absolute_range"]))
+    bias = float(rng.uniform(*randomization["bias_absolute_range"]))
     return rc, noise, bias, quantization
 
 
@@ -109,13 +98,22 @@ def _make_episode(
     success_slot: int,
     attempt: int,
     global_attempt: int,
+    split: str | None = None,
+    instruction_index: int = 0,
 ) -> tuple[EpisodeSpec, tuple[ExpertStep, ...], dict]:
     policy_id = str(policy["id"])
     sequence = tuple(str(v) for v in policy["sequence"])
     regime_name = str(policy["regime"])
+    split_name = str(split or dataset.get("split", "train"))
+    instruction = str(
+        task.get("instruction")
+        or task["instructions"][int(instruction_index)]
+    )
     seed = int(dataset["seed"])
     seq = np.random.SeedSequence([
         seed,
+        int(zlib.crc32(split_name.encode())),
+        int(zlib.crc32(instruction.encode("utf-8"))),
         int(zlib.crc32(policy_id.encode())),
         int(success_slot),
         int(attempt),
@@ -132,21 +130,22 @@ def _make_episode(
     handle_region = region_order.index("handle")
     wall_probe = _sample_probe(rng, task, wall_name)
     handle_probe = _sample_probe(rng, task, "handle")
-    wall_grasp = _sample_grasp(rng, dataset["grasp"]["wall"])
-    handle_grasp = _sample_grasp(rng, dataset["grasp"]["handle"])
+    wall_grasp = _sample_grasp(rng, GRASP_TARGETS["wall"])
+    handle_grasp = _sample_grasp(rng, GRASP_TARGETS["handle"])
 
-    probe_force = float(dataset["contact"]["probe_force_n"])
-    grasp_force = float(dataset["contact"]["grasp_force_n"])
-    hold_s = float(dataset["contact"]["contact_hold_s"])
+    execution = THERMAL_SAFE_EXECUTION
+    probe_force = float(execution["probe_force_n"])
+    grasp_force = float(execution["grasp_force_n"])
+    hold_s = float(execution["contact_hold_s"])
     grasp_options = {
-        "force_band_n": float(dataset["contact"]["force_band_n"]),
-        "force_width_step_m": float(dataset["contact"]["force_width_step_m"]),
-        "force_fast_width_step_m": float(dataset["contact"]["force_fast_width_step_m"]),
-        "force_fast_threshold_n": float(dataset["contact"]["force_fast_threshold_n"]),
-        "grasp_timeout_s": float(dataset["contact"]["grasp_timeout_s"]),
-        "lift_height_m": float(dataset["contact"]["lift_height_m"]),
-        "lift_success_height_m": float(dataset["contact"]["lift_success_height_m"]),
-        "lift_timeout_s": float(dataset["contact"]["lift_timeout_s"]),
+        "force_band_n": float(execution["force_band_n"]),
+        "force_width_step_m": float(execution["force_width_step_m"]),
+        "force_fast_width_step_m": float(execution["force_fast_width_step_m"]),
+        "force_fast_threshold_n": float(execution["force_fast_threshold_n"]),
+        "grasp_timeout_s": float(execution["grasp_timeout_s"]),
+        "lift_height_m": float(execution["lift_height_m"]),
+        "lift_success_height_m": float(task["success"]["min_lift_height_m"]),
+        "lift_timeout_s": float(execution["lift_timeout_s"]),
         "touch_force_n": probe_force,
         "touch_hold_s": hold_s,
     }
@@ -193,7 +192,9 @@ def _make_episode(
         merged_steps.append(step)
     steps = merged_steps
 
-    sensor_rc, sensor_noise, sensor_bias, sensor_quant = _sample_sensor(rng, dataset["sensor"])
+    sensor_rc, sensor_noise, sensor_bias, sensor_quant = _sample_sensor(
+        rng, task["sensor"]["nominal"], dataset["sensor_randomization"]
+    )
     object_cfg = task["object"]
     jitter_xy = float(object_cfg["xy_jitter_m"])
     cup_xy = (
@@ -203,9 +204,12 @@ def _make_episode(
     cup_yaw = float(rng.uniform(-float(object_cfg["yaw_jitter_rad"]), float(object_cfg["yaw_jitter_rad"])))
     first = steps[0]
     spec = EpisodeSpec(
-        episode_id=f"{dataset['dataset_version']}_{policy_id}_{success_slot:03d}",
+        episode_id=(
+            f"{dataset['dataset_version']}_{split_name}_ins{instruction_index:02d}_"
+            f"{policy_id}_{success_slot:06d}"
+        ),
         dataset_version=str(dataset["dataset_version"]),
-        split=str(dataset.get("split", "train")),
+        split=split_name,
         random_seed=random_seed,
         region_order=region_order,
         target_region=-2,
@@ -235,7 +239,7 @@ def _make_episode(
                 for k, v in task["object"]["material_properties"][task["object"]["material"]].items()
             )
         ),
-        instruction=str(dataset["instruction"]),
+        instruction=instruction,
         contact_order=(),
         contact_hold_s_by_region=(),
         probe_positions=(),
@@ -247,6 +251,7 @@ def _make_episode(
         "success_slot": int(success_slot),
         "attempt": int(attempt),
         "policy_id": policy_id,
+        "instruction_index": int(instruction_index),
         "policy_sequence": list(sequence),
         "execution_sequence": [
             {
@@ -272,97 +277,59 @@ def _make_episode(
     return spec, tuple(steps), metadata
 
 
-def _prune_failed(output: Path) -> int:
-    """Remove raw episodes written by an older generator that kept failures."""
-    import h5py
-
-    removed = 0
-    for path in output.rglob("*.hdf5"):
-        try:
-            with h5py.File(path, "r") as handle:
-                raw = handle.attrs.get("episode_metadata", "{}")
-                if isinstance(raw, bytes):
-                    raw = raw.decode("utf-8")
-                metadata = json.loads(str(raw))
-        except Exception:
-            continue
-        if (
-            metadata.get("termination_reason") != "pi05_expert_complete"
-            or not bool(metadata.get("success", False))
-        ):
-            path.unlink()
-            removed += 1
-    return removed
-
-
-def main() -> int:
-    args = build_parser().parse_args()
-    task = load_task_config(args.task)
-    dataset = load_dataset_config(args.dataset)
-    policies = list(dataset["policies"])
-    if args.policies:
-        wanted = set(args.policies)
-        policies = [policy for policy in policies if policy["id"] in wanted]
-        missing = wanted - {str(policy["id"]) for policy in policies}
-        if missing:
-            raise SystemExit(f"unknown policies: {sorted(missing)}")
-
-    output = Path(args.out) if args.out else Path(dataset["output_dir"])
-    if not output.is_absolute():
-        output = REPO_ROOT / output
-    output.mkdir(parents=True, exist_ok=True)
-    pruned = _prune_failed(output)
-    if pruned:
-        print(f"已自动删除旧的失败 episode：{pruned}")
-
+def generate_thermal_safe(
+    *, task: dict, dataset: dict, split: str, start: int, count: int,
+    instruction_index: int,
+    out_dir: Path, seed: int | None, skip_existing: bool,
+    max_attempts_per_episode: int,
+) -> dict[str, int]:
+    """Generate ``count`` total episodes, balanced round-robin over experts."""
+    if seed is not None:
+        dataset = {**dataset, "seed": int(seed)}
+    policies = [dict(policy) for policy in THERMAL_SAFE_POLICIES]
+    out_dir.mkdir(parents=True, exist_ok=True)
     bundle = build_scene(task, seed=0)
-    total = sum(
-        int(args.episodes_per_policy or policy["episodes"])
-        for policy in policies
-    )
     written = skipped = discarded = 0
-    global_attempt = 0
-    start = time.time()
-    if args.max_attempts_per_episode < 1:
+    started_at = time.time()
+    if max_attempts_per_episode < 1:
         raise SystemExit("--max-attempts-per-episode must be >= 1")
 
-    for policy in policies:
-        episode_count = int(args.episodes_per_policy or policy["episodes"])
-        policy_dir = output / str(policy["id"])
+    for offset, global_index in enumerate(range(start, start + count), start=1):
+        policy = policies[global_index % len(policies)]
+        success_slot = global_index // len(policies)
+        policy_dir = out_dir / str(policy["id"])
         policy_dir.mkdir(parents=True, exist_ok=True)
-        success_slot = 0
         attempt = 0
-        while success_slot < episode_count:
-            if attempt >= args.max_attempts_per_episode:
+        while True:
+            if attempt >= max_attempts_per_episode:
                 raise SystemExit(
-                    f"{policy['id']} 在 {attempt} 次尝试后只成功 {success_slot}/{episode_count} 集；"
-                    "请提高 --max-attempts-per-episode 或检查专家控制"
+                    f"{policy['id']} slot={success_slot} 连续失败 {attempt} 次；"
+                    "请提高 --max-attempts-per-episode 或检查专家控制。"
                 )
             spec, steps, expert_meta = _make_episode(
-                task, dataset, policy, success_slot, attempt, global_attempt
+                task, dataset, policy, success_slot, attempt,
+                global_index * max_attempts_per_episode + attempt,
+                split=split,
+                instruction_index=instruction_index,
             )
             path = policy_dir / f"{spec.episode_id}.hdf5"
-            if args.skip_existing and path.exists():
+            if skip_existing and path.exists():
                 skipped += 1
-                success_slot += 1
-                attempt = 0
-                global_attempt += 1
-                continue
+                break
 
             bundle.reset_episode(spec)
             controller = Pi05ExpertController(bundle, spec, steps)
             buffers, metadata, static = run_episode(bundle, spec, controller=controller)
             metadata.update(expert_meta)
-            metadata["success"] = metadata["termination_reason"] == "pi05_expert_complete"
+            metadata["success"] = bool(metadata["task_success"]["success"])
             if metadata["success"]:
                 write_episode(path, buffers, metadata, static)
                 written += 1
-                success_slot += 1
                 print(
-                    f"[{written + skipped}/{total}] {spec.episode_id} "
+                    f"[{offset}/{count}] {spec.episode_id} "
                     f"attempt={attempt} {metadata['control_frames']} control frames"
                 )
-                attempt = 0
+                break
             else:
                 discarded += 1
                 print(
@@ -370,14 +337,9 @@ def main() -> int:
                     f"{metadata['termination_reason']}"
                 )
                 attempt += 1
-            global_attempt += 1
 
-    print(
-        f"完成：成功 {written} 集，跳过 {skipped} 集，丢弃失败 {discarded} 集，"
-        f"自动清理旧失败 {pruned} 集，用时 {time.time() - start:.1f}s -> {output}"
-    )
-    return 0
+    print(f"热安全专家用时 {time.time() - started_at:.1f}s")
+    return {"written": written, "skipped": skipped, "discarded": discarded}
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+__all__ = ["_make_episode", "generate_thermal_safe"]

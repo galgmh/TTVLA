@@ -57,8 +57,15 @@ def write_episode(
         handle.attrs["format_version"] = FORMAT_VERSION
         for key in EPISODE_METADATA_KEYS:
             handle.attrs[key] = metadata[key]
+        # 顶层 attrs 是核心字段的唯一真源；JSON 只保存扩展元数据。
+        extension_metadata = {
+            key: value for key, value in metadata.items()
+            if key not in EPISODE_METADATA_KEYS
+        }
+        if "language_instruction" in extension_metadata:
+            raise ValueError("language_instruction 已移除；统一使用顶层 instruction attr")
         handle.attrs["episode_metadata"] = json.dumps(
-            dict(metadata), ensure_ascii=False, sort_keys=True, allow_nan=False,
+            extension_metadata, ensure_ascii=False, sort_keys=True, allow_nan=False,
             default=_json_default,
         )
 
@@ -78,6 +85,23 @@ def write_episode(
     return path
 
 
+def read_metadata(handle: Any) -> dict[str, Any]:
+    """Read extension JSON and merge the non-duplicated top-level attrs."""
+    raw = handle.attrs.get("episode_metadata", "{}")
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    metadata = json.loads(str(raw))
+    for key in EPISODE_METADATA_KEYS:
+        value = handle.attrs[key]
+        metadata[key] = (
+            value.decode("utf-8") if isinstance(value, bytes)
+            else value.item() if isinstance(value, np.generic)
+            else value
+        )
+    metadata["format_version"] = str(handle.attrs["format_version"])
+    return metadata
+
+
 def read_episode(path: str | Path) -> tuple[dict[str, np.ndarray], dict[str, Any], dict[str, np.ndarray]]:
     """读回 ``(all_arrays, metadata, static_arrays)``。"""
     import h5py
@@ -85,14 +109,7 @@ def read_episode(path: str | Path) -> tuple[dict[str, np.ndarray], dict[str, Any
     arrays: dict[str, np.ndarray] = {}
     static: dict[str, np.ndarray] = {}
     with h5py.File(path, "r") as handle:
-        raw = handle.attrs.get("episode_metadata", "{}")
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8")
-        metadata = json.loads(str(raw))
-        for key in EPISODE_METADATA_KEYS:
-            value = handle.attrs[key]
-            metadata[key] = value.decode("utf-8") if isinstance(value, bytes) else value.item() if isinstance(value, np.generic) else value
-        metadata["format_version"] = str(handle.attrs["format_version"])
+        metadata = read_metadata(handle)
         for name in FRAME_FIELDS:
             arrays[name] = np.asarray(handle[name][...])
         for name in STATIC_FIELDS:
@@ -102,4 +119,4 @@ def read_episode(path: str | Path) -> tuple[dict[str, np.ndarray], dict[str, Any
     return arrays, metadata, static
 
 
-__all__ = ["read_episode", "write_episode"]
+__all__ = ["read_episode", "read_metadata", "write_episode"]

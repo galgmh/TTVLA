@@ -10,6 +10,7 @@ dist/
 # 数据集与运行输出不入库
 datasets/*
 !datasets/README.md
+!datasets/export_hdf5_mp4.py
 *.hdf5
 *.npz
 *.pt

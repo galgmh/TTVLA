@@ -11,7 +11,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-FORMAT_VERSION = "thermalcontact-v2.0"
+FORMAT_VERSION = "thermalcontact-v2.1"
 REGION_ORDER = ("lower", "middle", "upper", "handle")
 COORDINATE_CONVENTION = (
     "right-handed; base=robot base frame; pose=[x,y,z,qw,qx,qy,qz]; "
@@ -83,7 +83,8 @@ EVENT_FIELDS: dict[str, FieldSpec] = {
 FRAME_FIELDS = {**SENSOR_FIELDS, **CONTROL_FIELDS, **EVENT_FIELDS}
 SCALAR_FIELDS = STATIC_FIELDS
 EPISODE_METADATA_KEYS = (
-    "episode_id", "random_seed", "split", "genesis_version", "coordinate_convention"
+    "episode_id", "random_seed", "split", "instruction",
+    "genesis_version", "coordinate_convention",
 )
 
 
@@ -193,7 +194,7 @@ def metadata_for_spec(
         "dataset_version": str(spec.dataset_version),
         "region_order": list(spec.region_order),
         "target_region": int(spec.target_region),
-        "language_instruction": str(getattr(spec, "instruction", "")),
+        "instruction": str(getattr(spec, "instruction", "")),
         "contact_order": [int(v) for v in getattr(spec, "contact_order", ())],
         "contact_hold_s_by_region": [
             float(v) for v in getattr(spec, "contact_hold_s_by_region", ())

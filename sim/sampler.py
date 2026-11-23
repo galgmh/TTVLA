@@ -1,6 +1,6 @@
 """确定性采样器：给定 (数据集种子, 划分, 序号) 生成一集规格。
 
-采样规则（``sim/configs/datasets/*.yaml``）只在这里落地，其他模块不抽随机数：
+采样规则（``sim/generation/presets/*.yaml``）只在这里落地，其他模块不抽随机数：
 
 * 目标区域：试生产按 4 区域均衡轮转，正式划分按均匀分布；
 * 四段 link 初始温度：从 ``region_temps_c`` 的 5 种情景里均匀抽一种，
@@ -62,6 +62,7 @@ class ThermalContactSampler:
         split: str,
         *,
         seed: int | None = None,
+        count: int | None = None,
     ):
         if split not in SPLITS:
             raise ValueError(f"未知划分 {split!r}；可用：{list(SPLITS)}")
@@ -69,7 +70,12 @@ class ThermalContactSampler:
         self.ds = dataset_cfg
         self.split = split
         self.seed = int(dataset_cfg["seed"] if seed is None else seed)
-        self.count = int(dataset_cfg["splits"].get(split, 0))
+        if count is None:
+            # 在线环境只需可复现地采一集；离线生成器必须显式传入数量。
+            count = 1
+        if int(count) < 1:
+            raise ValueError(f"count 必须为正整数，实为 {count}")
+        self.count = int(count)
         self.region_order = tuple(str(v) for v in task_cfg["object"]["region_order"])
         # 四段 link 的初始温度情景：每种情景给每个区域一个固定区间。
         self.region_temps: list[dict[str, tuple[float, float]]] = []
@@ -84,7 +90,10 @@ class ThermalContactSampler:
             )
         self._material = dict(task_cfg["object"]["material_properties"][task_cfg["object"]["material"]])
         self.multi_contact = bool(dataset_cfg.get("multi_contact", False))
-        self.instruction = str(dataset_cfg.get("instruction", ""))
+        self.instruction = str(
+            task_cfg.get("instruction")
+            or task_cfg.get("instructions", [""])[0]
+        )
         self.contact_orders = tuple(itertools.permutations(range(4)))
         self.duration_schedules = tuple(
             tuple(float(v) for v in row)
@@ -92,20 +101,13 @@ class ThermalContactSampler:
         )
         if self.multi_contact:
             expected = len(self.region_temps) * len(self.contact_orders) * len(self.duration_schedules)
-            if self.split == "train" and self.count != expected:
+            if self.count > expected:
                 raise ValueError(
-                    f"多接触 train 必须覆盖 {len(self.region_temps)}×{len(self.contact_orders)}×"
-                    f"{len(self.duration_schedules)}={expected} 集，配置为 {self.count}"
+                    f"多接触析因空间最多为 {len(self.region_temps)}×{len(self.contact_orders)}×"
+                    f"{len(self.duration_schedules)}={expected} 集，请求为 {self.count}"
                 )
         # 区域 z 范围：校验探测点抖动不越界。
         self._z_spans = {k: tuple(float(v) for v in span) for k, span in task_cfg["object"]["region_z_spans"].items()}
-        # 力档位必须与任务配置一致，否则“目标力”和“乘数”会各说各话。
-        levels = [float(v) for v in dataset_cfg["force_levels"]]
-        multipliers = [float(v) for v in task_cfg["contact"]["force_multipliers"]]
-        if sorted(levels) != sorted(multipliers):
-            raise ValueError(
-                f"数据集 force_levels {levels} 与任务 contact.force_multipliers {multipliers} 不一致"
-            )
 
     # ------------------------------------------------------------------ 采样
     def sample(self, index: int) -> EpisodeSpec:
@@ -175,7 +177,8 @@ class ThermalContactSampler:
             retreat = float(rng.uniform(*contact_cfg["fail_retreat_m"]))
 
         # ---- 传感器非理想性
-        sensor_cfg = self.ds["sensor"]
+        sensor_cfg = self.ds["sensor_randomization"]
+        nominal = self.task["sensor"]["nominal"]
         shift = self.split == "test_sensor_shift"
         if shift:
             ranges = sensor_cfg["shift_test"]
@@ -184,13 +187,13 @@ class ThermalContactSampler:
             quant_mult = rng.uniform(*ranges["quantization_multiplier_range"])
             bias = float(rng.uniform(*ranges["bias_absolute_range"]))
         else:
-            rc_mult = rng.uniform(*sensor_cfg["rc_s"]["multiplier_range"])
-            noise_mult = rng.uniform(*sensor_cfg["noise_c"]["multiplier_range"])
-            quant_mult = rng.uniform(*sensor_cfg["quantization_c"]["multiplier_range"])
-            bias = float(rng.uniform(*sensor_cfg["bias_c"]["absolute_range"]))
-        rc = float(sensor_cfg["rc_s"]["nominal"]) * float(rc_mult)
-        noise = float(sensor_cfg["noise_c"]["nominal"]) * float(noise_mult)
-        quantization = float(sensor_cfg["quantization_c"]["nominal"]) * float(quant_mult)
+            rc_mult = rng.uniform(*sensor_cfg["rc_multiplier_range"])
+            noise_mult = rng.uniform(*sensor_cfg["noise_multiplier_range"])
+            quant_mult = rng.uniform(*sensor_cfg["quantization_multiplier_range"])
+            bias = float(rng.uniform(*sensor_cfg["bias_absolute_range"]))
+        rc = float(nominal["rc_s"]) * float(rc_mult)
+        noise = float(nominal["noise_c"]) * float(noise_mult)
+        quantization = float(nominal["quantization_c"]) * float(quant_mult)
 
         # ---- 探测点（作者坐标系）+ 抖动
         base_probe = self.task["mixed_probe"] if mixed else self.task["regions"][self.region_order[target_region]]
@@ -297,13 +300,14 @@ class ThermalContactSampler:
         force_level = float(self.ds["force_levels"][int(rng.integers(0, len(self.ds["force_levels"])))])
         contact_cfg = self.task["contact"]
 
-        sensor_cfg = self.ds["sensor"]
-        rc = float(sensor_cfg["rc_s"]["nominal"]) * float(rng.uniform(*sensor_cfg["rc_s"]["multiplier_range"]))
-        noise = float(sensor_cfg["noise_c"]["nominal"]) * float(rng.uniform(*sensor_cfg["noise_c"]["multiplier_range"]))
-        quant = float(sensor_cfg["quantization_c"]["nominal"]) * float(
-            rng.uniform(*sensor_cfg["quantization_c"]["multiplier_range"])
+        sensor_cfg = self.ds["sensor_randomization"]
+        nominal = self.task["sensor"]["nominal"]
+        rc = float(nominal["rc_s"]) * float(rng.uniform(*sensor_cfg["rc_multiplier_range"]))
+        noise = float(nominal["noise_c"]) * float(rng.uniform(*sensor_cfg["noise_multiplier_range"]))
+        quant = float(nominal["quantization_c"]) * float(
+            rng.uniform(*sensor_cfg["quantization_multiplier_range"])
         )
-        bias = float(rng.uniform(*sensor_cfg["bias_c"]["absolute_range"]))
+        bias = float(rng.uniform(*sensor_cfg["bias_absolute_range"]))
 
         probes = [self._sample_probe(rng, i) for i in range(4)]
         object_cfg = self.task["object"]

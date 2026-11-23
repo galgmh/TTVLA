@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 import shutil
 
@@ -36,16 +35,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
     return parser
-
-
-def _metadata(handle_metadata: dict) -> dict:
-    raw = handle_metadata.get("episode_metadata")
-    if isinstance(raw, str):
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            return {}
-    return {}
 
 
 def _episode_action(state: np.ndarray, target_pose: np.ndarray, gripper: float) -> np.ndarray:
@@ -116,8 +105,7 @@ def main() -> int:
 
         arrays, metadata, _ = read_episode(path)
         meta = dict(metadata)
-        extra = _metadata(meta)
-        success = bool(extra.get("success", meta.get("termination_reason") == "pi05_expert_complete"))
+        success = bool(meta.get("success", False))
         if not args.include_failed and not success:
             skipped += 1
             continue
@@ -152,7 +140,7 @@ def main() -> int:
                 features=_features(height, width),
             )
 
-        prompt = str(meta.get("language_instruction") or "抓取杯子，并选择安全（非高温）的温度区域")
+        prompt = str(meta["instruction"])
         for frame_index in range(frames):
             state8 = np.concatenate(
                 [joint_position[frame_index, :7], [gripper_width[frame_index]]]

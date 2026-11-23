@@ -1,0 +1,11 @@
+task_id: lift_with_cup_wall
+instructions:
+  - "Lift the cup"
+  - "Pick up the cup"
+  - "Grasp the cup and raise it"
+  - "Take the cup and lift it up"
+
+success:
+  required_grasp_region: cup_wall
+  allowed_contact_regions: [lower, middle, upper]
+  min_lift_height_m: 0.06

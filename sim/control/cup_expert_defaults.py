@@ -1,0 +1,105 @@
+"""Cup expert geometry and low-level execution defaults.
+
+These values belong to the scripted expert pipeline.  They are deliberately
+kept out of task YAML files: a task declares the goal and success criterion,
+while an expert is only one way of producing a demonstration for that task.
+All positions are expressed in the cup asset authoring frame.
+"""
+
+from __future__ import annotations
+
+EXPERT_REGIONS = {
+    "lower": {
+        "pos": [0.0, 0.0, 0.020], "tool_dir": [-1.0, 0.0, 0.0],
+        "finger_dir": [0.0, -1.0, 0.0], "pre_dist": 0.06,
+        "xy_jitter_m": 0.002, "z_jitter_m": 0.0015,
+        "azimuth_jitter_rad": 0.35, "tilt_jitter_rad": 0.12,
+    },
+    "middle": {
+        "pos": [0.0, 0.0, 0.055], "tool_dir": [-1.0, 0.0, 0.0],
+        "finger_dir": [0.0, -1.0, 0.0], "pre_dist": 0.06,
+        "xy_jitter_m": 0.002, "z_jitter_m": 0.0015,
+        "azimuth_jitter_rad": 0.35, "tilt_jitter_rad": 0.12,
+    },
+    "upper": {
+        "pos": [0.0, 0.0, 0.088], "tool_dir": [0.0, 0.0, -1.0],
+        "finger_dir": [0.0, -1.0, 0.0], "pre_dist": 0.08,
+        "xy_jitter_m": 0.002, "z_jitter_m": 0.001,
+        "azimuth_jitter_rad": 0.35, "tilt_jitter_rad": 0.10,
+    },
+    "handle": {
+        "pos": [-0.057, 0.0, 0.056], "tool_dir": [1.0, 0.0, 0.0],
+        "finger_dir": [0.0, -1.0, 0.0], "pre_dist": 0.07,
+        "xy_jitter_m": 0.0008, "z_jitter_m": 0.0008,
+        "azimuth_jitter_rad": 0.0, "tilt_jitter_rad": 0.08,
+    },
+}
+
+MIXED_PROBE = {
+    "pos": [0.0, 0.0, 0.0733], "tool_dir": [-1.0, 0.0, 0.0],
+    "finger_dir": [0.0, -1.0, 0.0], "pre_dist": 0.06,
+    "xy_jitter_m": 0.0005, "z_jitter_m": 0.0003,
+}
+
+EXPERT_TIMING = {
+    "contact_s": 0.50,
+    "post_contact_s": 0.20,
+    "retract_open_timeout_s": 3.0,
+    "retract_move_timeout_s": 5.0,
+}
+
+EXPERT_CONTACT = {
+    "nominal_force_n": 2.0,
+    "force_band_n": 0.35,
+    "seek_timeout_s": 8.0,
+    "gain_m_per_n": 0.00015,
+    "brief_hold_s": [0.08, 0.18],
+    "fail_retreat_m": [0.002, 0.005],
+    "sample_every_sim_steps": 2,
+}
+
+# Scripted demonstrations for the thermal-safe task.  These are expert
+# implementation details, not task definitions.
+THERMAL_SAFE_POLICIES = (
+    {"id": "A_wall_handle_grasp_handle", "regime": "A", "sequence": ["probe_wall", "probe_handle", "grasp_handle"]},
+    {"id": "A_handle_grasp_handle", "regime": "A", "sequence": ["probe_handle", "grasp_handle"]},
+    {"id": "B_wall_grasp_wall", "regime": "B", "sequence": ["probe_wall", "grasp_wall"]},
+    {"id": "B_handle_wall_grasp_wall", "regime": "B", "sequence": ["probe_handle", "probe_wall", "grasp_wall"]},
+)
+
+GRASP_TARGETS = {
+    "wall": {
+        "x": 0.0, "y": 0.0, "z_range": [0.035, 0.075],
+        "tool_dir": [-1.0, 0.0, 0.0], "finger_dir": [0.0, -1.0, 0.0],
+        "pre_dist": 0.06, "xy_jitter_m": 0.001,
+    },
+    "handle": {
+        "x": -0.057, "y": 0.0, "z_range": [0.035, 0.075],
+        "tool_dir": [1.0, 0.0, 0.0], "finger_dir": [0.0, -1.0, 0.0],
+        "pre_dist": 0.07, "xy_jitter_m": 0.0008,
+    },
+    "rim": {
+        "x": 0.0, "y": 0.0, "z_range": [0.086, 0.096],
+        "tool_dir": [0.0, 0.0, -1.0], "finger_dir": [0.0, -1.0, 0.0],
+        "pre_dist": 0.08, "xy_jitter_m": 0.001,
+    },
+}
+
+THERMAL_SAFE_EXECUTION = {
+    "probe_force_n": 2.0,
+    "grasp_force_n": 15.0,
+    "contact_hold_s": 0.5,
+    "force_band_n": 1.0,
+    "force_width_step_m": 0.00002,
+    "force_fast_width_step_m": 0.0002,
+    "force_fast_threshold_n": 2.0,
+    "grasp_hold_s": 0.5,
+    "lift_height_m": 0.12,
+    "lift_timeout_s": 8.0,
+    "grasp_timeout_s": 10.0,
+}
+
+__all__ = [
+    "EXPERT_CONTACT", "EXPERT_REGIONS", "EXPERT_TIMING", "GRASP_TARGETS",
+    "MIXED_PROBE", "THERMAL_SAFE_EXECUTION", "THERMAL_SAFE_POLICIES",
+]

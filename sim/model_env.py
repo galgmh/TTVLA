@@ -102,6 +102,7 @@ class GenesisModelEnv:
         max_steps: int = 300,
         thermal_window_size: int = 25,
         thermal_hz: float = 50.0,
+        sampler_count: int = 1,
         show_viewer: bool = False,
     ):
         self.task_cfg = (
@@ -133,7 +134,10 @@ class GenesisModelEnv:
         self.thermal_interval = 1.0 / self.thermal_hz
 
         self.sampler = (
-            ThermalContactSampler(self.task_cfg, self.dataset_cfg, split, seed=seed)
+            ThermalContactSampler(
+                self.task_cfg, self.dataset_cfg, split,
+                seed=seed, count=int(sampler_count),
+            )
             if self.dataset_cfg is not None
             else None
         )

@@ -1,0 +1,18 @@
+object_id: red_box
+object_type: fixed_box
+
+geometry:
+  size: [0.07, 0.07, 0.06]
+
+# 位置相对桌面坐标定义；z=0 表示放在桌面顶面上。
+placement:
+  xy: [-0.08, 0.0]
+  z_above_table_m: 0.0
+
+appearance:
+  color: [0.78, 0.12, 0.10]
+
+thermal:
+  material: platform
+  materials:
+    platform: {conductivity: 0.2, density: 700.0, specific_heat: 1200.0, emissivity: 0.0}

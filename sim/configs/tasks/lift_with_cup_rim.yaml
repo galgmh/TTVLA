@@ -1,0 +1,12 @@
+task_id: lift_with_cup_rim
+instructions:
+  - "Lift the cup"
+  - "Pick up the cup"
+  - "Grasp the cup and raise it"
+  - "Take the cup and lift it up"
+
+success:
+  required_grasp_region: cup_rim
+  allowed_contact_regions: [upper]
+  contact_height_range_m: [0.080, 0.115]
+  min_lift_height_m: 0.06

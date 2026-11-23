@@ -100,8 +100,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run π0.5 closed-loop evaluation in Genesis")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--task-config", default="sim/configs/tasks/thermal_contact_probe.yaml")
-    parser.add_argument("--dataset-config", default="sim/configs/datasets/thermal_contact_v1.yaml")
+    parser.add_argument("--task-config", default="sim/configs/tasks/thermal_safe_grasp.yaml")
+    parser.add_argument("--dataset-config", default="sim/generation/presets/thermal_contact_v1.yaml")
     parser.add_argument("--split", default="train")
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--episodes", type=int, default=1)
@@ -242,6 +242,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         args.task_config,
         args.dataset_config,
         split=args.split,
+        sampler_count=args.start + args.episodes,
         max_steps=args.max_steps,
         show_viewer=args.show_viewer,
     )

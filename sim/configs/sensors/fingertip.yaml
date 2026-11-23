@@ -4,10 +4,10 @@
 # 由生成器逐集写入引擎共享的 link_temps 表。
 finger_grid: [1, 1, 1]
 object_grid: null
-# 室温：材料基准温度，也是 70% 集数的指尖初始温度。
+# 室温：材料基准温度；episode 的初始状态由生成预设决定。
 ambient_temp_c: 25.0
 
-# 名义值；每集的随机化范围在 datasets/thermal_contact_v1.yaml 里采样。
+# 名义值；每集随机化范围位于 sim/generation/presets/。
 nominal:
   rc_s: 0.05            # 一阶 RC 时间常数（秒）
   noise_c: 0.05         # 白噪声标准差（°C）

@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 from pathlib import Path
 import shutil
@@ -29,6 +28,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sim.config import REPO_ROOT  # noqa: E402
+from sim.recording import read_metadata  # noqa: E402
 
 
 def _repo_path(value: str) -> Path:
@@ -36,17 +36,10 @@ def _repo_path(value: str) -> Path:
     return path if path.is_absolute() else REPO_ROOT / path
 
 
-def _metadata(handle: h5py.File) -> dict:
-    raw = handle.attrs.get("episode_metadata", "{}")
-    if isinstance(raw, bytes):
-        raw = raw.decode("utf-8")
-    return json.loads(str(raw))
-
-
 def inspect_episode(path: Path) -> dict | None:
     """返回入选 episode 的清单记录；不符合严格成功条件则返回 ``None``。"""
     with h5py.File(path, "r") as handle:
-        metadata = _metadata(handle)
+        metadata = read_metadata(handle)
         if metadata.get("termination_reason") != "multi_contact_complete":
             return None
 

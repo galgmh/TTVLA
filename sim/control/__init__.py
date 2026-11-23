@@ -12,7 +12,7 @@ from sim.control.probe_controller import (
     ProbeController,
     ProbeOutcome,
 )
-from sim.control.grasp_controller import GraspLiftController, GraspPolicyConfig, load_grasp_policy_config
+from sim.control.grasp_controller import GraspLiftController, GraspPolicyConfig, grasp_policy_from_task
 
 __all__ = [
     "CONTACT_THRESHOLD_N",
@@ -21,7 +21,7 @@ __all__ = [
     "ProbeController",
     "GraspLiftController",
     "GraspPolicyConfig",
-    "load_grasp_policy_config",
+    "grasp_policy_from_task",
     "ProbeOutcome",
     "ProbePose",
     "point_world",

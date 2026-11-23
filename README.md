@@ -25,9 +25,8 @@ sim/
   model_env.py              π0.5 7 维动作接入 Genesis 的环境包装
   run_pi_simpler.py         models WebSocket 闭环评测
 
-  generate.py               生成原始 task episode
-  generate_grasp.py         生成抓取基线
-  generate_pi05_v1.py       生成 thermal-pi05-v1 的 80 集原始数据
+  generate.py               所有仿真专家数据的唯一生成入口
+  generation/               各 task 的专家管线和随机化预设
   export_pi05_lerobot.py    原始 HDF5 -> LeRobot 微调数据集
   select_episodes.py        筛选完整四接触 episode
 
@@ -40,8 +39,8 @@ sim/
   tools/                    episode 检查、图表和视频工具
 ```
 
-`sim/config.py` 只负责加载 YAML、解析相对路径和展开物体 manifest，不再维护
-一套逐字段的配置校验框架。具体字段由使用它的场景或生成流程检查。
+配置按 scene / object / sensor / task 分层。task YAML 只允许包含任务名、
+instructions 列表和成功标准；专家接触位姿与轨迹位于 `sim/control/`，不属于任务定义。
 
 ## models 结构
 
@@ -98,8 +97,8 @@ sim/configs + sim/assets
 
 ```python
 env = GenesisModelEnv(
-    "sim/configs/tasks/thermal_contact_probe.yaml",
-    "sim/configs/datasets/thermal_contact_v1.yaml",
+    "sim/configs/tasks/thermal_safe_grasp.yaml",
+    "sim/generation/presets/thermal_contact_v1.yaml",
     split="train",
 )
 
@@ -145,14 +144,16 @@ conda activate tempvla_pi05
 
 ## task 数据生成
 
-生成单个或部分 episode：
+所有 task 使用同一个生成入口：
 
 ```bash
 python -m sim.generate \
+  --task sim/configs/tasks/thermal_safe_grasp.yaml \
+  --scene sim/configs/scene/cup_on_table.yaml \
   --split train \
   --start 0 \
-  --count 10 \
-  --out datasets/thermal_contact_multi
+  --num_per_ins 10 \
+  --out datasets/
 ```
 
 校验：
@@ -182,20 +183,25 @@ python -m sim.select_episodes \
   --expect 90
 ```
 
-抓取基线：
+杯壁抓取基线：
 
 ```bash
-python -m sim.generate_grasp \
-  --policy sim/configs/policies/direct_lift.yaml \
+python -m sim.generate \
+  --task sim/configs/tasks/lift_with_cup_wall.yaml \
+  --scene sim/configs/scene/cup_on_table.yaml \
   --split train \
-  --count 100
+  --start 0 --num_per_ins 100 \
+  --out datasets/
 ```
 
-第一版 Pi0.5 数据：
+热安全抓取数据：
 
 ```bash
-# 80 集原始 HDF5
-python -m sim.generate_pi05_v1
+python -m sim.generate \
+  --task sim/configs/tasks/thermal_safe_grasp.yaml \
+  --scene sim/configs/scene/cup_on_table.yaml \
+  --split train --start 0 --num_per_ins 80 \
+  --out datasets/
 
 # 只导出成功 episode 到 LeRobot
 python -m sim.export_pi05_lerobot \
@@ -205,9 +211,10 @@ python -m sim.export_pi05_lerobot \
   --fps 20
 ```
 
-`generate_pi05_v1.py` 按每种专家 20 个成功 episode 计数。失败 episode 不写盘，
-会用新的确定性 attempt 自动重试；运行前还会清理旧输出目录中未成功的 HDF5。
-单个 episode 默认最多尝试 20 次，可通过 `--max-attempts-per-episode` 调整。
+`--num_per_ins` 表示每条 instruction 的 episode 数，总数为
+`instruction 数量 × num_per_ins`。热安全任务在每条 instruction 内部按专家管线轮转；
+失败 episode 不写盘，并用确定性 attempt 自动重试。单集默认最多尝试 20 次，
+可通过 `--max-attempts-per-episode` 调整。
 
 ## 热编码器
 

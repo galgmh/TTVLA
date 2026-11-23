@@ -2,6 +2,47 @@
 
 本目录**不入库**（见仓库根 `.gitignore`），只放生成物。
 
+## 从 HDF5 导出双相机 MP4
+
+脚本：[export_hdf5_mp4.py](/home/ca/TTVLA/datasets/export_hdf5_mp4.py)
+
+默认同时生成三段视频：固定相机、腕部相机，以及固定相机在左/腕部相机在右
+的拼接视频。帧率默认根据 HDF5 的 `control/time` 自动推导。
+
+```bash
+python datasets/export_hdf5_mp4.py \
+  datasets/thermal_safe_grasp/train/<expert>/<episode>.hdf5 \
+  --out-dir datasets/videos \
+  --mode all
+```
+
+只导出左右拼接视频：
+
+```bash
+python datasets/export_hdf5_mp4.py \
+  datasets/thermal_safe_grasp/train/<expert>/<episode>.hdf5 \
+  --out-dir datasets/videos \
+  --mode combined
+```
+
+分别导出两路相机并手动指定 20 FPS：
+
+```bash
+python datasets/export_hdf5_mp4.py \
+  datasets/thermal_safe_grasp/train/<expert>/<episode>.hdf5 \
+  --out-dir datasets/videos \
+  --mode separate \
+  --fps 20
+```
+
+`--mode all` 的输出文件为：
+
+```text
+<episode>_base_0_rgb.mp4
+<episode>_wrist_0_rgb.mp4
+<episode>_combined.mp4
+```
+
 约定：
 
 ```
@@ -27,7 +68,8 @@ attrs
   split                       # train/validation/test 等划分
   genesis_version             # Genesis 版本
   coordinate_convention       # 坐标系与四元数约定
-  episode_metadata            # JSON：指令、接触顺序/时长/姿态等可审计参数
+  episode_metadata            # JSON：仅保存接触顺序/时长/姿态等扩展参数
+  instruction                 # 本 episode 实际使用的自然语言指令
 
 sensor/
   time                        # [Ts]，100 Hz
@@ -77,6 +119,6 @@ contact_events/
 `contact_events` 中每条记录一次计划接触；小于 50 ms 的力触觉抖动由
 记录器滞回合并，真正离开杯子后才结束事件。所有位姿四元数均使用 `wxyz`。
 
-当前完整主集为 `5 温度情景 × 24 接触顺序 × 12 平衡时长方案 = 1440`
-episode。指令固定为“触碰杯子并感受其温度分布”，左右指尖每集均从 25°C
-开始。
+每个 task 可以定义多条同义 instruction。生成时每个 episode 只绑定其中一条，
+并且只写入顶层 `instruction` attr。`episode_metadata` 不重复保存任何顶层
+attr；左右指尖初始温度及其他随机化由对应生成预设决定。

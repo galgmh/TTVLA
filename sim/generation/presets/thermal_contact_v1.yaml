@@ -2,7 +2,6 @@
 dataset_version: thermalcontact-v1
 output_dir: datasets/thermal_contact_v1
 seed: 20261108
-instruction: "触碰杯子并感受其温度分布"
 multi_contact: true
 
 # 12 个严格平衡时长方案，列顺序固定为
@@ -51,15 +50,15 @@ fingertip:
 # 力档位：目标法向力 = nominal_force_n × 档位，实际力逐帧记录。
 force_levels: [0.7, 1.0, 1.3]
 
-# 接触质量：80% 稳定 / 10% 短暂或低力 / 10% 失败（未接触）。
+# 当前预设只生成稳定接触；需要视觉接触负样本时可显式调整这些概率。
 contact_quality_probabilities: {stable: 1.0, brief: 0.0, failed: 0.0}
 
 # 传感器随机化：乘性范围缩放名义值；偏置为加性 °C。
-sensor:
-  rc_s: {nominal: 0.05, multiplier_range: [0.8, 1.2]}
-  noise_c: {nominal: 0.05, multiplier_range: [0.8, 1.2]}
-  quantization_c: {nominal: 0.1, multiplier_range: [0.8, 1.2]}
-  bias_c: {nominal: 0.0, absolute_range: [-0.01, 0.01]}
+sensor_randomization:
+  rc_multiplier_range: [0.8, 1.2]
+  noise_multiplier_range: [0.8, 1.2]
+  quantization_multiplier_range: [0.8, 1.2]
+  bias_absolute_range: [-0.01, 0.01]
   # 传感器漂移测试集：范围明显更宽。
   shift_test:
     rc_multiplier_range: [0.6, 1.5]
@@ -67,13 +66,4 @@ sensor:
     quantization_multiplier_range: [0.6, 1.5]
     bias_absolute_range: [-0.05, 0.05]
 
-# 完整析因集：5 温度情景 × 24 接触顺序 × 12 时长方案 = 1440。
-# 先生成 train 主集，后续再按 episode 组合做无泄漏划分。
-splits:
-  train: 1440
-  validation: 0
-  test_id: 0
-  test_finger_history: 0
-  test_sensor_shift: 0
-  test_mixed_contact: 0
-  pilot: 0
+# 完整析因空间为 5×24×12=1440；每条指令的数量由 --num_per_ins 指定。

@@ -60,6 +60,23 @@ def validate_file(path: str | Path) -> list[str]:
     issues += [f"缺少 attr {key}" for key in EPISODE_METADATA_KEYS if key not in metadata]
     if metadata.get("format_version") != FORMAT_VERSION:
         issues.append(f"format_version={metadata.get('format_version')!r}，期望 {FORMAT_VERSION!r}")
+    if not str(metadata.get("instruction", "")).strip():
+        issues.append("instruction attr 不能为空")
+    try:
+        import h5py
+
+        with h5py.File(path, "r") as handle:
+            raw = handle.attrs.get("episode_metadata", "{}")
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            extension = json.loads(str(raw))
+        duplicated = sorted(set(extension).intersection(EPISODE_METADATA_KEYS))
+        if duplicated:
+            issues.append(f"episode_metadata 重复保存顶层 attrs：{duplicated}")
+        if "language_instruction" in extension:
+            issues.append("已废弃字段 language_instruction 仍存在")
+    except Exception as exc:
+        issues.append(f"episode_metadata 无法解析：{exc}")
     if not issues:
         issues += _check_rates(arrays)
         issues += _check_physics(arrays, metadata)

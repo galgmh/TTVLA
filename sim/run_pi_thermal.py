@@ -3,7 +3,7 @@
 `sim.run_pi_simpler` samples `ThermalContactSampler` datasets (the four-region
 *probing* task), so it cannot evaluate a policy trained on the raw_v4 grasp
 data. This evaluator rebuilds episodes from the policy-style dataset config
-used to generate that data (default: `sim/configs/datasets/pi05_v1.yaml`) and
+used to generate that data (default: `sim/generation/presets/pi05_v1.yaml`) and
 scores the policy on the same task distribution it was trained on.
 
 Usage
@@ -34,7 +34,8 @@ from pathlib import Path
 from typing import Any
 
 from sim.config import load_dataset_config, load_task_config
-from sim.generate_pi05_v1 import _make_episode
+from sim.generation.thermal_safe import _make_episode
+from sim.control.cup_expert_defaults import THERMAL_SAFE_POLICIES
 from sim.model_env import GenesisModelEnv
 from sim.run_pi_simpler import (
     _EpisodeVideoWriter,
@@ -54,10 +55,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
-        "--task-config", default="sim/configs/tasks/thermal_contact_probe.yaml"
+        "--task-config", default="sim/configs/tasks/thermal_safe_grasp.yaml"
     )
     parser.add_argument(
-        "--dataset-config", default="sim/configs/datasets/pi05_v1.yaml"
+        "--dataset-config", default="sim/generation/presets/pi05_v1.yaml"
     )
     parser.add_argument(
         "--policies",
@@ -68,8 +69,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--episodes-per-policy",
         type=int,
-        default=None,
-        help="Slots evaluated per policy (default: policy['episodes'], i.e. 20)",
+        required=True,
+        help="Number of episode slots evaluated per expert policy",
     )
     parser.add_argument("--start-slot", type=int, default=0)
     parser.add_argument(
@@ -118,7 +119,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     dataset = load_dataset_config(args.dataset_config)
     if args.seed is not None:
         dataset = {**dataset, "seed": int(args.seed)}
-    policies = list(dataset["policies"])
+    policies = [dict(policy) for policy in THERMAL_SAFE_POLICIES]
     if args.policies:
         wanted = set(args.policies)
         policies = [p for p in policies if str(p["id"]) in wanted]
@@ -144,13 +145,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     try:
         for policy in policies:
             policy_id = str(policy["id"])
-            total_slots = int(policy["episodes"])
-            start = min(args.start_slot, total_slots)
-            end = (
-                total_slots
-                if args.episodes_per_policy is None
-                else min(total_slots, start + args.episodes_per_policy)
-            )
+            start = args.start_slot
+            end = start + int(args.episodes_per_policy)
             for slot in range(start, end):
                 spec, _, _ = _make_episode(
                     task, dataset, policy, slot, args.attempt, attempt_counter

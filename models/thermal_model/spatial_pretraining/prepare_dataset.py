@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from sim.config import REPO_ROOT, load_task_config  # noqa: E402
+from sim.recording import read_metadata  # noqa: E402
 from sim.rotations import quat_conj, quat_normalize, quat_rotate  # noqa: E402
 from thermal_model.data.loader import compute_prepared_stats  # noqa: E402
 
@@ -65,13 +66,6 @@ def _episode_index(path: Path) -> int:
     if match is None:
         raise ValueError(f"无法从文件名解析 episode index：{path.name}")
     return int(match.group(1))
-
-
-def _metadata(handle: h5py.File) -> dict:
-    value = handle.attrs["episode_metadata"]
-    if isinstance(value, bytes):
-        value = value.decode("utf-8")
-    return json.loads(str(value))
 
 
 def _queries_base(metadata: dict, task_cfg: dict) -> tuple[np.ndarray, np.ndarray]:
@@ -140,7 +134,7 @@ def _build_split(
             link_temp = np.asarray(raw["privileged/link_temp"], dtype=np.float32)
             finger_valid = np.asarray(raw["privileged/contact_valid"], dtype=bool)
             contact_links = np.asarray(raw["privileged/contact_link_mask"], dtype=bool)
-            queries, regions = _queries_base(_metadata(raw), task_cfg)
+            queries, regions = _queries_base(read_metadata(raw), task_cfg)
 
         if np.any(endpoints < 0) or np.any(endpoints >= len(link_temp)):
             raise ValueError(f"{source.name} 中 episode {episode} 的末端下标越界")
@@ -194,7 +188,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", default="datasets/thermal_spatial")
     parser.add_argument(
         "--task",
-        default="sim/configs/tasks/thermal_contact_probe.yaml",
+        default="sim/configs/tasks/thermal_safe_grasp.yaml",
         help="用于读取机器人 base pose",
     )
     parser.add_argument("--overwrite", action="store_true")
