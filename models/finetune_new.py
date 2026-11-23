@@ -626,7 +626,11 @@ def train_loop(config: TrainConfig):
     cleanup_ddp()
 
 
-def main(config_name: str) -> None:
+def main(
+    config_name: str,
+    run_dir: str | None = None,
+    exp_name: str | None = None,
+) -> None:
     init_logging()
     from configs.configs import ALLCONFIGS
 
@@ -638,10 +642,16 @@ def main(config_name: str) -> None:
 
     bundle = ALLCONFIGS[config_name]
     train_config: TrainConfig = bundle["train_config"]
+    # Optional CLI overrides; checkpoint dir is <run_dir>/<exp_name>/checkpoints.
+    if run_dir is not None:
+        train_config.run_dir = run_dir
+    if exp_name is not None:
+        train_config.exp_name = exp_name
     train_config.data_config = bundle["data_config"]
     train_config.model_config = bundle["model_config"]
 
     logging.info(f"Loaded config {config_name!r} from configs.configs.ALLCONFIGS")
+    logging.info(f"Checkpoints -> {train_config.checkpoint_dir}")
     train_loop(train_config)
 
 
