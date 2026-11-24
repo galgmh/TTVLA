@@ -1,4 +1,4 @@
-"""Closed-loop evaluation for a models inference server.
+"""Closed-loop lift-task evaluation for a models inference server.
 
 The model server is expected to return already denormalized physical actions::
 
@@ -97,10 +97,10 @@ class _WebsocketClientPolicy:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run π0.5 closed-loop evaluation in Genesis")
+    parser = argparse.ArgumentParser(description="Run lift-task closed-loop evaluation in Genesis")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--task-config", default="sim/configs/tasks/thermal_safe_grasp.yaml")
+    parser.add_argument("--task-config", default="sim/configs/tasks/lift_with_cup_wall.yaml")
     parser.add_argument("--dataset-config", default="sim/generation/presets/thermal_contact_v1.yaml")
     parser.add_argument("--split", default="train")
     parser.add_argument("--start", type=int, default=0)

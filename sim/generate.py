@@ -3,7 +3,7 @@
 Example::
 
     python -m sim.generate \
-      --task sim/configs/tasks/thermal_safe_grasp.yaml \
+      --task sim/configs/tasks/lift_with_cup_wall.yaml \
       --scene sim/configs/scene/cup_on_table.yaml \
       --split train --start 0 --num_per_ins 100 --out datasets/
 """
@@ -16,14 +16,13 @@ import time
 
 from sim.config import REPO_ROOT, load_dataset_config, load_task_config
 from sim.generation.direct_grasp import generate_direct_grasp
-from sim.generation.thermal_safe import generate_thermal_safe
+from sim.generation.thermal_grasp import generate_thermal_grasp
 
-DIRECT_GRASP_GOALS = {"cup_wall", "handle", "cup_rim"}
 PRESET_BY_GOAL = {
     "cup_wall": "sim/generation/presets/thermal_contact_v1.yaml",
     "handle": "sim/generation/presets/thermal_contact_v1.yaml",
     "cup_rim": "sim/generation/presets/thermal_contact_v1.yaml",
-    "thermally_safe": "sim/generation/presets/pi05_v1.yaml",
+    "thermally_safe": "sim/generation/presets/thermal_grasp.yaml",
 }
 
 
@@ -98,13 +97,13 @@ def main() -> int:
             seed=args.seed,
             skip_existing=args.skip_existing,
         )
-        if goal in DIRECT_GRASP_GOALS:
-            result = generate_direct_grasp(**common)
-        else:
-            result = generate_thermal_safe(
+        if goal == "thermally_safe":
+            result = generate_thermal_grasp(
                 **common,
                 max_attempts_per_episode=args.max_attempts_per_episode,
             )
+        else:
+            result = generate_direct_grasp(**common)
         for key in summary:
             summary[key] += result[key]
 

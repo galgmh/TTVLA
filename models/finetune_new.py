@@ -1,9 +1,9 @@
 """
 Usage
 Single GPU:
-  python finetune_new.py --config_name test_run
+  python finetune_new.py --config_name lift_ft
 Multi-GPU (single node):
-  torchrun --standalone --nnodes=1 --nproc_per_node=3 finetune_new.py --config_name test_run
+  torchrun --standalone --nnodes=1 --nproc_per_node=3 finetune_new.py --config_name lift_ft
 """
 # Patches MUST be installed before any code touches `transformers`.
 from pi05_model._patches import install as install_transformers_patches

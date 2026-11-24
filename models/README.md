@@ -70,22 +70,22 @@ These are reasonable design choices for productionization, but they get in the w
 
 ## Quick start
 
-End-to-end walkthrough using the simplest example, **`svla_so101_pickplace`** (the `test_run` config in [configs/configs.py](configs/configs.py)). All paths below are placeholders — replace them with your own.
+The active configs use the locally converted `lift` dataset.
 
 ### Step 0. Download assets
 
 You will need three things on disk:
 
-1. **The LeRobot dataset** — e.g. `lerobot/svla_so101_pickplace`. Download it via the `lerobot` CLI / `huggingface_hub`, then point `DataConfig.local_root` at the directory.
-2. **The Pi0.5 JAX checkpoint** — e.g. `pi05_base` from the official openpi release. Used as the starting point for fine-tuning.
-3. **The PaliGemma tokenizer** — `paligemma_tokenizer.model` (a SentencePiece file). Path goes into `DataConfig.tokenizer_path`.
+1. **The LeRobot dataset** — convert HDF5 episodes with `datasets/convert_hdf5_to_lerobot.py`.
+2. **The Pi0.5 PyTorch checkpoint** — the converted `pi05_base` directory.
+3. **The PaliGemma tokenizer** — `paligemma_tokenizer.model`.
 
 ### Step 1. Install the environment
 
 See [Requirements](Requirements) for the full list. Key constraints:
 
-* `python=3.12`, with `ffmpeg` from conda-forge
-* `lerobot` installed from source (`pip install -e .`), plus `lerobot[dataset]`
+* `python=3.11`, with `ffmpeg` from conda-forge
+* `lerobot==0.4.3` installed from PyPI (`pip install "lerobot==0.4.3"`)
 * **`transformers==4.53.2`** — this is required, the `pi05_model._patches` monkey-patches are written against this exact version
 * `jax==0.9.2` — **only** needed for Step 2 (weight conversion); not used at training / inference time
 * `wandb`, `tyro`, `sentencepiece`, `numpydantic`
@@ -105,69 +105,62 @@ The resulting `pi05_base_torch` directory is what `TrainConfig.pytorch_weight_pa
 
 ```bash
 python compute_norm_stats.py \
-    --args.repo_id        lerobot/svla_so101_pickplace \
-    --args.local_root     /path/to/svla_so101_pickplace \
-    --args.asset_id       svla_so101_pickplace_norm_stats+action_horizon_10 \
-    --args.output_dir     /path/to/Assets \
+    --args.repo_id        thermtacvla/lift \
+    --args.local_root     /home/ca/TTVLA/datasets/lerobot/lift \
+    --args.asset_id       lift_norm_stats \
+    --args.output_dir     /home/ca/TTVLA/assets \
     --args.action-horizon 10
 ```
 
 Writes `norm_stats.json` to `<output_dir>/<asset_id>/`. Point `DataConfig.norm_stats_dir` at that directory.
 
-### Step 4. Sanity-check scripts
+### Step 4. Fine-tune
 
-Once the dataset, weights, tokenizer and norm stats are in place, run the self-checks:
-
-```bash
-python TestData.py        # dataset & repack transform — also writes TestData_batch_preview.png
-python TestTokenizer.py   # paligemma tokenizer loads & encodes correctly
-python Testpi05Model.py   # PI0Pytorch builds + forward / sample passes
-```
-
-All three should run cleanly before proceeding.
-
-### Step 5. Fine-tune
-
-Edit / add an entry in [configs/configs.py](configs/configs.py) (the `test_run` entry is the template), then:
+Current configs are `lift_ft` and `lift_lora`.
 
 ```bash
 # Single-GPU
-python finetune_new.py --config_name test_run
+python finetune_new.py --config_name lift_ft
 
 # Single-node multi-GPU
-torchrun --standalone --nnodes=1 --nproc_per_node=3 finetune_new.py --config_name test_run
+torchrun --standalone --nnodes=1 --nproc_per_node=3 finetune_new.py --config_name lift_ft
 ```
 
 For native PyTorch LoRA fine-tuning:
 
 ```bash
-python finetune_new.py --config_name thermal_v4_lora
+python finetune_new.py --config_name lift_lora
 ```
 
 Adapters are injected after loading the dense base weights. LoRA checkpoints
 store `adapter_model.safetensors`, trainable action heads, and optimizer state;
-serve them with the same `server_policy.py` and `--config_name thermal_v4_lora`.
+serve them with the same `server_policy.py` and `--config_name lift_lora`.
+
+`lift_lora` follows the OpenPI split-rank defaults:
+
+```text
+PaliGemma 2B attention/FFN: rank 16, alpha 16
+Action Expert 300M attention/FFN: rank 32, alpha 32
+dropout: 0.0
+vision encoder: frozen
+action heads: trainable
+training steps: 30000
+```
 
 Training metrics are pushed to **wandb** (toggle with `TrainConfig.wandb_enabled`). Checkpoints land under `<run_dir>/<exp_name>/checkpoints/<step>/`.
 
-### Step 6. Serve and verify
+### Step 5. Serve and verify
 
 Launch the inference server against a trained checkpoint:
 
 ```bash
 python server_policy.py \
-    --config_name     test_run \
-    --checkpoint_dir  ./runs/test_run/checkpoints/30000 \
+    --config_name     lift_ft \
+    --checkpoint_dir  ./runs/lift_ft/checkpoints/30000 \
     --port            8000
 ```
 
-Verify the server is healthy with the websocket smoke test:
-
-```bash
-python TestServer.py --host 127.0.0.1 --port 8000
-```
-
-After this passes, any openpi-client based runtime (DROID / ALOHA / sim evaluators) can connect to the same port.
+Any openpi-client based runtime can connect to the same port.
 
 ---
 

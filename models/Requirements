@@ -1,7 +1,6 @@
-conda install python=3.12
+conda install python=3.11
 conda install ffmpeg -c conda-forge
-git clone https://github.com/huggingface/lerobot.git
-pip install -e .
+pip install "lerobot==0.4.3"
 pip install jax==0.9.2
 pip install transformers==4.53.2
 pip install numpydantic

@@ -54,41 +54,6 @@ EXPERT_CONTACT = {
     "sample_every_sim_steps": 2,
 }
 
-# Scripted demonstrations for the thermal-safe task.  These are expert
-# implementation details, not task definitions.
-THERMAL_SAFE_POLICIES = (
-    {"id": "A_wall_handle_grasp_handle", "regime": "A", "sequence": ["probe_wall", "probe_handle", "grasp_handle"]},
-    {"id": "A_handle_grasp_handle", "regime": "A", "sequence": ["probe_handle", "grasp_handle"]},
-    {"id": "B_wall_grasp_wall", "regime": "B", "sequence": ["probe_wall", "grasp_wall"]},
-    {"id": "B_handle_wall_grasp_wall", "regime": "B", "sequence": ["probe_handle", "probe_wall", "grasp_wall"]},
-)
-
-GRASP_TARGETS = {
-    "wall": {
-        "x": 0.0, "y": 0.0, "z_range": [0.035, 0.075],
-        "tool_dir": [-1.0, 0.0, 0.0], "finger_dir": [0.0, -1.0, 0.0],
-        "pre_dist": 0.06, "xy_jitter_m": 0.001,
-    },
-    "handle": {
-        "x": -0.057, "y": 0.0, "z_range": [0.035, 0.075],
-        "tool_dir": [1.0, 0.0, 0.0], "finger_dir": [0.0, -1.0, 0.0],
-        "pre_dist": 0.07, "xy_jitter_m": 0.0008,
-    },
-    "rim": {
-        "x": 0.0, "y": 0.0, "z_range": [0.086, 0.096],
-        "tool_dir": [0.0, 0.0, -1.0], "finger_dir": [0.0, -1.0, 0.0],
-        "pre_dist": 0.08, "xy_jitter_m": 0.001,
-    },
-}
-
-THERMAL_SAFE_EXECUTION = {
-    "contact_hold_s": 0.5,
-    "grasp_hold_s": 0.5,
-    "lift_height_m": 0.12,
-    "grasp_timeout_s": 10.0,
-}
-
 __all__ = [
-    "EXPERT_CONTACT", "EXPERT_REGIONS", "EXPERT_TIMING", "GRASP_TARGETS",
-    "MIXED_PROBE", "THERMAL_SAFE_EXECUTION", "THERMAL_SAFE_POLICIES",
+    "EXPERT_CONTACT", "EXPERT_REGIONS", "EXPERT_TIMING", "MIXED_PROBE",
 ]

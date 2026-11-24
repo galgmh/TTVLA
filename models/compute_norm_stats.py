@@ -10,10 +10,10 @@ Running mean/std/q01/q99 are accumulated and saved as
 Example:
 the file will be save to output_dir/asset_id/norm_stats.json:
 python compute_norm_stats.py \
-    --args.repo_id lerobot/svla_so101_pickplace+my_own_label \
-    --args.local_root /media/sunhao/T71/svla_so101_pickplace \
-    --args.asset_id svla_so101_pickplace_norm_stats+action_horizon_10 \
-    --args.output_dir /media/sunhao/T71/Assets \
+    --args.repo_id thermtacvla/lift_manipulation \
+    --args.local_root /home/ca/TTVLA/datasets/lerobot/lift_manipulation \
+    --args.asset_id lift_manipulation_norm_stats \
+    --args.output_dir /home/ca/TTVLA/assets \
     --args.action-horizon 10
 """
 
@@ -41,6 +41,7 @@ from data.data_loader import (
 from utils.normalize import RunningStats, save as save_norm_stats
 
 logger = logging.getLogger(__name__)
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 # ---------------------------------------------------------------------------
@@ -125,16 +126,16 @@ def _build_dataset(data_config: DataConfig, action_horizon: int) -> _StatsDatase
 @dataclasses.dataclass
 class Args:
     # Dataset identification. `repo_id` is a label only when `local_root` is set.
-    repo_id: str = "lerobot/svla_so101_pickplace+my_own_label"
-    local_root: str | None = "/media/sunhao/T71/svla_so101_pickplace"
+    repo_id: str = "thermtacvla/lift_manipulation"
+    local_root: str | None = str(REPO_ROOT / "datasets/lerobot/lift_manipulation")
 
     # Directory name used under `output_dir` for the saved norm_stats.json.
     # Must match the `asset_id` of the DataConfig used at training time.
-    asset_id: str = "svla_so101_pickplace_my_own_label"
+    asset_id: str = "lift_manipulation_norm_stats"
 
     # Where to write `<asset_id>/norm_stats.json`. Point training's
     # `DataConfig.norm_stats_dir` at the resulting subdirectory.
-    output_dir: str = "./assets"
+    output_dir: str = str(REPO_ROOT / "assets")
 
     # Should match `model_config.action_horizon` used at training time
     # (pi0.5 default is 10; pi0 default is 50).
@@ -151,7 +152,7 @@ class Args:
 def main(args: Args) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    # Matches the repack used in TestData.py but drops `images` (not needed
+    # Matches the training repack but drops `images` (not needed
     # for state/action norm_stats and would needlessly decode video frames).
     data_config = DataConfig(
         repo_id=args.repo_id,

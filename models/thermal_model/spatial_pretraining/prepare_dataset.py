@@ -184,11 +184,11 @@ def _write(path: Path, rows: dict[str, np.ndarray], attrs: dict) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="构建 thermal-spatial-v2 数据")
     parser.add_argument("--source", default="datasets/thermal_encoder")
-    parser.add_argument("--raw-source", default="datasets/thermal_contact_1_copy/train")
+    parser.add_argument("--raw-source", required=True)
     parser.add_argument("--out", default="datasets/thermal_spatial")
     parser.add_argument(
         "--task",
-        default="sim/configs/tasks/thermal_safe_grasp.yaml",
+        required=True,
         help="用于读取机器人 base pose",
     )
     parser.add_argument("--overwrite", action="store_true")

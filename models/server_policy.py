@@ -7,8 +7,8 @@ evaluators, etc.) can talk to it unchanged.
 Usage
 -----
   python server_policy.py \
-      --config_name test_run \
-      --checkpoint_dir ./runs/test_run/checkpoints/30000 \
+      --config_name lift_ft \
+      --checkpoint_dir ./runs/lift_manipulation_ft/checkpoints/30000 \
       --port 8000
 
 The config name is looked up in `configs.configs.ALLCONFIGS` so it shares the

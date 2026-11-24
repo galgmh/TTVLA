@@ -392,11 +392,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="构建 thermal-encoder-v3 固定组数据")
     parser.add_argument(
         "--source",
-        default="datasets/thermal_contact_1_copy/train",
+        required=True,
         help="包含 90 个 ThermalContact episode 的目录",
     )
     parser.add_argument("--out", default="datasets/thermal_encoder")
-    parser.add_argument("--dataset", default="sim/generation/presets/thermal_contact_v1.yaml")
+    parser.add_argument("--dataset", required=True)
     parser.add_argument("--overwrite", action="store_true")
     return parser
 

@@ -42,10 +42,14 @@ class LoRAConfig:
 @dataclasses.dataclass(frozen=True)
 class LoRATrainingConfig:
     enabled: bool = False
-    attn_rank: int = 16
-    ffn_rank: int = 16
-    attn_alpha: float = 16.0
-    ffn_alpha: float = 16.0
+    paligemma_attn_rank: int = 16
+    paligemma_ffn_rank: int = 16
+    paligemma_attn_alpha: float = 16.0
+    paligemma_ffn_alpha: float = 16.0
+    expert_attn_rank: int = 32
+    expert_ffn_rank: int = 32
+    expert_attn_alpha: float = 32.0
+    expert_ffn_alpha: float = 32.0
     dropout: float = 0.0
     use_rslora: bool = False
     apply_to: Literal[
@@ -63,11 +67,43 @@ class LoRATrainingConfig:
         "state_proj", "action_time_mlp_in", "action_time_mlp_out",
     )
 
-    def configs(self) -> dict[str, LoRAConfig]:
+    def __post_init__(self) -> None:
+        ranks = (
+            self.paligemma_attn_rank,
+            self.paligemma_ffn_rank,
+            self.expert_attn_rank,
+            self.expert_ffn_rank,
+        )
+        if any(rank < 1 for rank in ranks):
+            raise ValueError("All LoRA ranks must be >= 1")
+
+    def configs(self) -> dict[str, dict[str, LoRAConfig]]:
         common = {"dropout": self.dropout, "rslora": self.use_rslora}
         return {
-            "attn": LoRAConfig(self.attn_rank, self.attn_alpha, **common),
-            "ffn": LoRAConfig(self.ffn_rank, self.ffn_alpha, **common),
+            "paligemma": {
+                "attn": LoRAConfig(
+                    self.paligemma_attn_rank,
+                    self.paligemma_attn_alpha,
+                    **common,
+                ),
+                "ffn": LoRAConfig(
+                    self.paligemma_ffn_rank,
+                    self.paligemma_ffn_alpha,
+                    **common,
+                ),
+            },
+            "expert": {
+                "attn": LoRAConfig(
+                    self.expert_attn_rank,
+                    self.expert_attn_alpha,
+                    **common,
+                ),
+                "ffn": LoRAConfig(
+                    self.expert_ffn_rank,
+                    self.expert_ffn_alpha,
+                    **common,
+                ),
+            },
         }
 
 
@@ -116,20 +152,28 @@ _ATTN = {"q_proj", "k_proj", "v_proj", "o_proj"}
 _FFN = {"gate_proj", "up_proj", "down_proj"}
 
 
-def _selected(full_name: str, leaf: str, config: LoRATrainingConfig) -> bool:
+def _target_backbone(
+    full_name: str,
+    leaf: str,
+    config: LoRATrainingConfig,
+) -> str | None:
     if leaf not in config.target_modules:
-        return False
+        return None
     if "vision_tower" in full_name or "vision_model" in full_name:
-        return False
+        return None
     paligemma = "paligemma" in full_name and "language_model" in full_name
     expert = "gemma_expert" in full_name
     if config.apply_to in {"paligemma_attn", "expert_attn"} and leaf not in _ATTN:
-        return False
+        return None
     if config.apply_to in {"all"}:
-        return paligemma or expert
+        if paligemma:
+            return "paligemma"
+        if expert:
+            return "expert"
+        return None
     if config.apply_to in {"paligemma_only", "paligemma_attn"}:
-        return paligemma
-    return expert
+        return "paligemma" if paligemma else None
+    return "expert" if expert else None
 
 
 def inject_lora(model: nn.Module, config: LoRATrainingConfig) -> list[str]:
@@ -142,14 +186,19 @@ def inject_lora(model: nn.Module, config: LoRATrainingConfig) -> list[str]:
         if not isinstance(module, nn.Linear) or isinstance(module, LoRALinear):
             continue
         leaf = name.rsplit(".", 1)[-1]
-        if not _selected(name, leaf, config):
+        backbone = _target_backbone(name, leaf, config)
+        if backbone is None:
             continue
         kind = "attn" if leaf in _ATTN else "ffn" if leaf in _FFN else None
         if kind is None:
             continue
         parent_name, _, attribute = name.rpartition(".")
         parent = model.get_submodule(parent_name) if parent_name else model
-        setattr(parent, attribute, LoRALinear.from_linear(module, layer_configs[kind]))
+        setattr(
+            parent,
+            attribute,
+            LoRALinear.from_linear(module, layer_configs[backbone][kind]),
+        )
         replaced.append(name)
     if not replaced:
         raise ValueError("LoRA did not match any linear layers; check apply_to/target_modules")

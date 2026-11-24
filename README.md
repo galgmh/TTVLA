@@ -23,12 +23,10 @@ sim/
   recording.py              HDF5 读写
   validate.py               数据和物理一致性校验
   model_env.py              π0.5 7 维动作接入 Genesis 的环境包装
-  run_pi_simpler.py         models WebSocket 闭环评测
+  lift_test.py              lift 任务 WebSocket 闭环评测
 
   generate.py               所有仿真专家数据的唯一生成入口
   generation/               各 task 的专家管线和随机化预设
-  export_pi05_lerobot.py    原始 HDF5 -> LeRobot 微调数据集
-  select_episodes.py        筛选完整四接触 episode
 
   control/                  接近、接触、抓取和 IK 控制
   sensors/                  指尖触觉、温度和指垫布局
@@ -80,7 +78,7 @@ sim/configs + sim/assets
   -> 受控接近、零宽度夹爪闭合、接触保持、退回/抬升
   -> 100 Hz 热触觉 + 20 Hz 控制/RGB
   -> sim.dataset / sim.recording
-  -> sim.export_pi05_lerobot
+  -> datasets/convert_hdf5_to_lerobot.py
   -> models data loader
   -> pi05_model
 ```
@@ -93,11 +91,11 @@ sim/configs + sim/assets
 
 [model_env.py](/home/ca/TTVLA/sim/model_env.py:1) 把动作作用到当前 TCP 位姿，
 通过 IK 控制机械臂，并把 7 个关节角和夹爪宽度组成 8 维 state。它同时维护
-模型所需的 25 帧、12 通道热触觉窗口：
+模型所需的 26 帧、12 通道热触觉窗口：
 
 ```python
 env = GenesisModelEnv(
-    "sim/configs/tasks/thermal_safe_grasp.yaml",
+    "sim/configs/tasks/lift_with_cup_wall.yaml",
     "sim/generation/presets/thermal_contact_v1.yaml",
     split="train",
 )
@@ -118,13 +116,13 @@ python server_policy.py \
 
 # 终端 2：在 Genesis 环境中执行闭环
 cd ..
-python -m sim.run_pi_simpler \
+python -m sim.lift_test \
   --host 127.0.0.1 --port 8000 \
   --split train --start 0 --episodes 10 \
   --replan-steps 5 \
   --success-kind cup-lift \
   --success-threshold 0.06 \
-  --output datasets/pi_simpler_eval.json
+  --output datasets/lift_test_eval.json
 ```
 
 ## 环境
@@ -140,6 +138,13 @@ export LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH
 conda activate tempvla_pi05
 ```
 
+HDF5 转 LeRobot v3 的数据转换使用：
+
+```bash
+conda activate tempvla
+python -m pip install "lerobot==0.4.3"
+```
+
 项目使用 Python 3.11，不使用 `.venv`。
 
 ## task 数据生成
@@ -148,7 +153,7 @@ conda activate tempvla_pi05
 
 ```bash
 python -m sim.generate \
-  --task sim/configs/tasks/thermal_safe_grasp.yaml \
+  --task sim/configs/tasks/lift_with_cup_wall.yaml \
   --scene sim/configs/scene/cup_on_table.yaml \
   --split train \
   --start 0 \
@@ -162,7 +167,7 @@ python -m sim.generate \
 python - <<'PY'
 from sim.validate import validate_directory
 
-issues = validate_directory("datasets/thermal_contact_multi/train")
+issues = validate_directory("datasets/lift_with_cup_wall/train")
 print(issues or "0 issues")
 PY
 ```
@@ -171,16 +176,7 @@ PY
 
 ```bash
 python -m sim.tools.inspect_episode \
-  datasets/thermal_contact_multi/train/<episode>.hdf5
-```
-
-筛选完整四接触 episode：
-
-```bash
-python -m sim.select_episodes \
-  --source datasets/thermal_contact_multi/train \
-  --out datasets/thermal_contact_1/train \
-  --expect 90
+  datasets/lift_with_cup_wall/train/<episode>.hdf5
 ```
 
 杯壁抓取基线：
@@ -194,27 +190,41 @@ python -m sim.generate \
   --out datasets/
 ```
 
-热安全抓取数据：
+生成三种抓取任务数据：
 
 ```bash
 python -m sim.generate \
-  --task sim/configs/tasks/thermal_safe_grasp.yaml \
+  --task sim/configs/tasks/lift_with_cup_rim.yaml \
   --scene sim/configs/scene/cup_on_table.yaml \
-  --split train --start 0 --num_per_ins 80 \
+  --split train --start 0 --num_per_ins 40 \
   --out datasets/
 
-# 只导出成功 episode 到 LeRobot
-python -m sim.export_pi05_lerobot \
-  --source datasets/thermal_pi05_v1/raw \
-  --root datasets/lerobot/thermal_pi05_v1 \
-  --repo-id thermtacvla/thermal_pi05_v1 \
-  --fps 20
+# 将多个已生成任务的 HDF5 合并转换为一个 LeRobot 数据集
+python datasets/convert_hdf5_to_lerobot.py \
+  --source datasets/lift_with_cup_rim/train datasets/lift_with_cup_wall/train \
+  --root datasets/lerobot/lift \
+  --repo-id thermtacvla/lift \
+  --fps 20 \
+  --overwrite
 ```
 
+生成热安全探索+抓取数据：
+
+```bash
+python -m sim.generate \
+  --task sim/configs/tasks/thermal_grasp.yaml \
+  --scene sim/configs/scene/cup_on_table.yaml \
+  --split train \
+  --start 0 \
+  --num_per_ins 80 \
+  --out datasets/
+```
+
+该入口每 4 集在四种专家策略之间轮转，因此 `--num_per_ins 80`
+对应每种专家 20 集。失败 episode 不写盘，并使用确定性 attempt 重试。
+
 `--num_per_ins` 表示每条 instruction 的 episode 数，总数为
-`instruction 数量 × num_per_ins`。热安全任务在每条 instruction 内部按专家管线轮转；
-失败 episode 不写盘，并用确定性 attempt 自动重试。单集默认最多尝试 20 次，
-可通过 `--max-attempts-per-episode` 调整。
+`instruction 数量 × num_per_ins`。
 
 ## 热编码器
 
@@ -224,7 +234,8 @@ python -m sim.export_pi05_lerobot \
 cd /home/ca/TTVLA
 
 PYTHONPATH=models python -m thermal_model.encoder_pretraining.prepare_dataset \
-  --source datasets/thermal_contact_1_copy/train \
+  --source /path/to/source_hdf5 \
+  --dataset /path/to/dataset_config.yaml \
   --out datasets/thermal_encoder \
   --overwrite
 ```
@@ -256,7 +267,8 @@ PYTHONPATH=models python -m thermal_model.encoder_pretraining.evaluate \
 ```bash
 PYTHONPATH=models python -m thermal_model.spatial_pretraining.prepare_dataset \
   --source datasets/thermal_encoder \
-  --raw-source datasets/thermal_contact_1_copy/train \
+  --raw-source /path/to/source_hdf5 \
+  --task /path/to/task.yaml \
   --out datasets/thermal_spatial \
   --overwrite
 

@@ -70,22 +70,22 @@
 
 ## 快速上手
 
-以最简单的 **`svla_so101_pickplace`**（即 [configs/configs.py](configs/configs.py) 中的 `test_run`）为例完整走一遍流程。下面所有路径都是占位，请替换成你自己的本地路径。
+当前配置使用本地转换得到的 `lift` 数据集。
 
 ### Step 0. 下载所需资产
 
 需要把以下三样东西准备好：
 
-1. **LeRobot 数据集** — 例如 `lerobot/svla_so101_pickplace`。通过 `lerobot` CLI / `huggingface_hub` 下载到本地，路径填到 `DataConfig.local_root`。
-2. **Pi0.5 JAX 权重** — 例如官方 openpi release 中的 `pi05_base`，用作微调起点。
-3. **PaliGemma tokenizer** — `paligemma_tokenizer.model`（SentencePiece 文件），路径填到 `DataConfig.tokenizer_path`。
+1. **LeRobot 数据集** — 使用 `datasets/convert_hdf5_to_lerobot.py` 从 HDF5 转换。
+2. **Pi0.5 PyTorch 权重** — 转换后的 `pi05_base` 目录。
+3. **PaliGemma tokenizer** — `paligemma_tokenizer.model`。
 
 ### Step 1. 安装环境
 
 完整依赖见 [Requirements](Requirements)，关键约束：
 
-* `python=3.12`，并通过 conda-forge 装 `ffmpeg`
-* `lerobot` 源码安装（`pip install -e .`），并安装 `lerobot[dataset]`
+* `python=3.11`，并通过 conda-forge 装 `ffmpeg`
+* `lerobot==0.4.3`，通过 PyPI 安装（`pip install "lerobot==0.4.3"`）
 * **`transformers==4.53.2`** — 必须是这个版本，`pi05_model._patches` 的 monkey-patch 是针对它写的
 * `jax==0.9.2` — **仅** Step 2 权重转换时需要，训练 / 推理过程都不会用到
 * `wandb`、`tyro`、`sentencepiece`、`numpydantic`
@@ -105,69 +105,62 @@ python convert/convert_jax_to_torch.py \
 
 ```bash
 python compute_norm_stats.py \
-    --args.repo_id        lerobot/svla_so101_pickplace \
-    --args.local_root     /path/to/svla_so101_pickplace \
-    --args.asset_id       svla_so101_pickplace_norm_stats+action_horizon_10 \
-    --args.output_dir     /path/to/Assets \
+    --args.repo_id        thermtacvla/lift \
+    --args.local_root     /home/ca/TTVLA/datasets/lerobot/lift \
+    --args.asset_id       lift_norm_stats \
+    --args.output_dir     /home/ca/TTVLA/assets \
     --args.action-horizon 10
 ```
 
 会在 `<output_dir>/<asset_id>/` 下生成 `norm_stats.json`。把该目录路径填到 `DataConfig.norm_stats_dir`。
 
-### Step 4. 自检脚本
+### Step 4. 微调训练
 
-数据集、权重、tokenizer、norm stats 都到位后，先跑三个自检脚本：
-
-```bash
-python TestData.py        # 数据集 & repack transform — 同时会生成 TestData_batch_preview.png
-python TestTokenizer.py   # paligemma tokenizer 加载与编码是否正常
-python Testpi05Model.py   # PI0Pytorch 构建 + 前向 / 采样是否能跑通
-```
-
-三个都通过后再继续。
-
-### Step 5. 微调训练
-
-在 [configs/configs.py](configs/configs.py) 中编辑或新增一个配置（`test_run` 是模板），然后：
+当前提供 `lift_ft` 和 `lift_lora` 两个配置。
 
 ```bash
 # 单卡
-python finetune_new.py --config_name test_run
+python finetune_new.py --config_name lift_ft
 
 # 单机多卡
-torchrun --standalone --nnodes=1 --nproc_per_node=3 finetune_new.py --config_name test_run
+torchrun --standalone --nnodes=1 --nproc_per_node=3 finetune_new.py --config_name lift_ft
 ```
 
 纯 PyTorch LoRA 微调使用内置配置：
 
 ```bash
-python finetune_new.py --config_name thermal_v4_lora
+python finetune_new.py --config_name lift_lora
 ```
 
 LoRA 会在加载基础权重后注入 PaliGemma/Action Expert 的注意力与 FFN 投影；
 checkpoint 保存 `adapter_model.safetensors`、可训练动作头和优化器状态。推理时
-仍使用同一个 `server_policy.py`，并传入 `--config_name thermal_v4_lora`。
+仍使用同一个 `server_policy.py`，并传入 `--config_name lift_lora`。
+
+`lift_lora` 对齐 OpenPI 的分层 rank 默认值：
+
+```text
+PaliGemma 2B attention/FFN: rank 16, alpha 16
+Action Expert 300M attention/FFN: rank 32, alpha 32
+dropout: 0.0
+vision encoder: frozen
+action heads: trainable
+training steps: 30000
+```
 
 训练指标会推送到 **wandb**（开关在 `TrainConfig.wandb_enabled`）。Checkpoint 保存在 `<run_dir>/<exp_name>/checkpoints/<step>/`。
 
-### Step 6. 部署 & 验证
+### Step 5. 部署 & 验证
 
 用训练好的 checkpoint 启动推理服务：
 
 ```bash
 python server_policy.py \
-    --config_name     test_run \
-    --checkpoint_dir  ./runs/test_run/checkpoints/30000 \
+    --config_name     lift_ft \
+    --checkpoint_dir  ./runs/lift_ft/checkpoints/30000 \
     --port            8000
 ```
 
-用 websocket smoke test 验证服务是否正常：
-
-```bash
-python TestServer.py --host 127.0.0.1 --port 8000
-```
-
-走通这一步后，所有基于 openpi-client 的运行环境（DROID / ALOHA / sim evaluator 等）都可以直接连这个端口。
+所有基于 openpi-client 的运行环境都可以直接连这个端口。
 
 ---
 
