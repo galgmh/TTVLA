@@ -7,9 +7,10 @@
 3. 训练热觉模块、PrefixAdapter 与 Action Expert；
 5. 可选：仅解冻 PaliGemma 最后1～2层。
 
-说明：PyTorch 版 openpi 目前没有 LoRA 实现（``openpi/models/lora.py`` 只服务
-JAX 路径），因此阶段 5 用「最后 N 层全量微调」代替规格中的 PaliGemma LoRA；
-学习率仍按规格分三组：新模块 1e-4、Action Expert 5e-5、PaliGemma 1e-5。
+说明：项目现已在 ``pi05_model/lora.py`` 提供纯 PyTorch LoRA；本文件的分阶段
+thermal 训练规则仍保留「最后 N 层全量微调」作为阶段 5 的默认策略。若使用
+LoRA 基线，应通过 ``finetune_new.py`` 的 ``TrainConfig.lora`` 注入，不能再同时
+调用这里的阶段 5 解冻规则。
 
 冻结只改 ``requires_grad``，不动 ``state_dict``：任何阶段保存的 checkpoint 都能
 被未冻结/已冻结的模型按 ``load_state_dict_compat`` 原样加载。

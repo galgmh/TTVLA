@@ -11,7 +11,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-FORMAT_VERSION = "thermalcontact-v2.1"
+FORMAT_VERSION = "thermalcontact-v2.2"
 REGION_ORDER = ("lower", "middle", "upper", "handle")
 COORDINATE_CONVENTION = (
     "right-handed; base=robot base frame; pose=[x,y,z,qw,qx,qy,qz]; "
@@ -58,7 +58,6 @@ CONTROL_FIELDS: dict[str, FieldSpec] = {
     "control/sensor_index": FieldSpec((), "i8", "不晚于控制时刻的最新 sensor 索引"),
     "control/eef_target": FieldSpec((7,), "f4", "限速后实际送入 IK 的 TCP 绝对位姿"),
     "control/gripper_target": FieldSpec((), "f4", "夹爪宽度指令 (m)"),
-    "control/target_force": FieldSpec((), "f4", "目标法向力 (N)"),
     "robot/eef_pose": FieldSpec((7,), "f4", "实测 TCP 位姿"),
     "robot/joint_position": FieldSpec((9,), "f4", "7 臂关节 (rad) + 2 指关节 (m)"),
     "robot/joint_velocity": FieldSpec((9,), "f4", "7 臂关节 (rad/s) + 2 指关节 (m/s)"),
@@ -215,7 +214,6 @@ def metadata_for_spec(
         "sensor_noise": float(spec.sensor_noise_c),
         "sensor_bias": float(spec.sensor_bias_c),
         "quantization": float(spec.sensor_quantization_c),
-        "target_force_n": float(spec.target_force_n),
         "initial_finger_temperature": [float(v) for v in spec.fingertip_temps_c],
         "initial_link_temperature": [float(v) for v in spec.link_temps_c],
         "contact_quality": str(spec.contact_quality),

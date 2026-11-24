@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from sim.control.actions import tcp_pose
+from sim.control.controller import tcp_pose
 from sim.rotations import quat_conj, quat_rotate
 from sim.sensors.tactile import read_all
 from sim.thermal.link_temperature import read_region_temperatures

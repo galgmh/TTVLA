@@ -49,12 +49,8 @@ EXPERT_TIMING = {
 }
 
 EXPERT_CONTACT = {
-    "nominal_force_n": 2.0,
-    "force_band_n": 0.35,
     "seek_timeout_s": 8.0,
-    "gain_m_per_n": 0.00015,
     "brief_hold_s": [0.08, 0.18],
-    "fail_retreat_m": [0.002, 0.005],
     "sample_every_sim_steps": 2,
 }
 
@@ -86,16 +82,9 @@ GRASP_TARGETS = {
 }
 
 THERMAL_SAFE_EXECUTION = {
-    "probe_force_n": 2.0,
-    "grasp_force_n": 15.0,
     "contact_hold_s": 0.5,
-    "force_band_n": 1.0,
-    "force_width_step_m": 0.00002,
-    "force_fast_width_step_m": 0.0002,
-    "force_fast_threshold_n": 2.0,
     "grasp_hold_s": 0.5,
     "lift_height_m": 0.12,
-    "lift_timeout_s": 8.0,
     "grasp_timeout_s": 10.0,
 }
 

@@ -7,12 +7,11 @@
                                      \\-> FAILED（未建立接触）
 
 * RESET      同步控制器到实测位姿，指位保持张开；随后直接进入 APPROACH；
-* APPROACH   分四段到位：先升到杯口以上（姿态不变）→ 原地转到探测姿态 →
-             水平移到预接触位正上方 → 下降到预接触位；到达后直接开始插入；
+* APPROACH   episode 首帧前预计算整条接近轨迹及其 IK；运行时只顺序播放
+             关节目标，不在 waypoint 处等待。姿态变化与高位平移同步完成；
 * SEEK_CONTACT 先沿接近方向直线插入到接触位，再按
-             ``controller.finger_speed_m_per_s`` 闭合手指，直到任一指尖法向力
-             超过 ``CONTACT_THRESHOLD_N``；失败档只闭合 ``fail_retreat_m``；
-* HOLD       把法向力误差积分为指位修正，稳定在 ``spec.target_force_n``；
+             ``controller.finger_speed_m_per_s`` 向零宽度闭合手指，直到检测到接触；
+* HOLD       保持 TCP 不动，并持续下发零宽度夹爪目标；
 * RETRACT_OPEN   保持 TCP 不动，先张开手指；
 * RETRACT_MOVE   仅在夹爪完全张开后，退回预接触位；
 * RETRACT_SETTLE 在预接触位停留 ``timing.post_contact_s``。
@@ -27,10 +26,8 @@ from typing import Callable
 
 import numpy as np
 
-from sim.control.actions import DeltaPoseController, ProbePose, point_world, tcp_pose
+from sim.control.controller import DeltaPoseController, ProbePose, point_world, tcp_pose
 
-# 判定“碰到”的法向力阈值（N）：明显高于传感器噪声，又远低于目标力。
-CONTACT_THRESHOLD_N = 0.2
 # 插入阶段沿接近方向的线速度（m/s）。
 SEEK_INSERT_SPEED_M_PER_S = 0.08
 # 接近路径先升到杯口以上这么高，再水平移动、再下降——避免手臂扫过杯口。
@@ -77,23 +74,10 @@ class ProbeController:
         )
         self.controller = DeltaPoseController(bundle)
 
-        # 四段接近路径：先升到杯口以上（姿态不变），原地转到探测姿态，
-        # 再水平移到预接触位正上方，最后下降到预接触位。姿态转换必须在
-        # 远离杯子的高点上做，否则手指扫过杯口。
         cup_pos, _ = bundle.cup_pose()
-        cup_top = float(cup_pos[2]) + float(bundle.cup_spec.aabb_max[2])
-        start_pos, start_quat = tcp_pose(bundle)
-        hover_z = max(float(start_pos[2]), cup_top + HOVER_CLEARANCE_M)
-        self.approach_waypoints = (
-            (np.array([start_pos[0], start_pos[1], hover_z], dtype=np.float64), start_quat),
-            (np.array([start_pos[0], start_pos[1], hover_z], dtype=np.float64), self.pose.quat),
-            (np.array([self.pose.pre_pos[0], self.pose.pre_pos[1], hover_z], dtype=np.float64), self.pose.quat),
-            (np.asarray(self.pose.pre_pos, dtype=np.float64).copy(), self.pose.quat),
-        )
-        # 第一段只走位置（姿态保持复位姿态），第二段只转姿态，后两段位姿都已
-        # 对齐，只需看位置。
-        self._approach_check_rot = (False, True, False, False)
-        self._approach_stage = 0
+        self.cup_top_z = float(cup_pos[2]) + float(bundle.cup_spec.aabb_max[2])
+        self.approach_trajectory = None
+        self._approach_cursor = 0
 
         # 手指法向投影方向（link 系）与接触力传感器名。
         self.inner_dirs = [np.asarray(lay.inner_dir, dtype=np.float64) for lay in bundle.layouts]
@@ -115,11 +99,8 @@ class ProbeController:
 
         self.width_start = float(2.0 * task["robot"]["open_finger_pos"])
         self.width_floor = float(2.0 * task["robot"]["closed_finger_pos"])
-        # 失败档的闭合预算：只允许闭合 fail_retreat_m（每根手指）。
-        if spec.contact_quality == "failed":
-            self.close_stop_width = self.width_start - 2.0 * float(spec.fail_retreat_m)
-        else:
-            self.close_stop_width = self.width_floor
+        # 所有触碰和抓取统一使用零宽度目标；物体阻挡决定实际夹爪宽度。
+        self.close_stop_width = self.width_floor
 
         self._insert_from: np.ndarray | None = None
         self._insert_steps = 0
@@ -191,11 +172,16 @@ class ProbeController:
     def _begin(self) -> None:
         self.controller.reset()
         self.controller.set_width_target(self.width_start)
+        self.approach_trajectory = self.controller.plan_approach(
+            self.pose,
+            cup_top_z=self.cup_top_z,
+            hover_clearance_m=HOVER_CLEARANCE_M,
+        )
         self.phase = "APPROACH"
         self.phase_steps = 0
         self.step_index = 0
         self.sim_step = 0
-        self._approach_stage = 0
+        self._approach_cursor = 0
         self._insert_done = False
 
     def _set_phase(self, phase: str) -> None:
@@ -216,24 +202,37 @@ class ProbeController:
     def _command(self) -> None:
         ctrl = self.controller
         if self.phase == "APPROACH":
-            wp_pos, wp_quat = self.approach_waypoints[self._approach_stage]
-            ctrl.set_pose_target(wp_pos, wp_quat)
-            ctrl.set_width_target(self.width_start)
+            if self.approach_trajectory is None:
+                raise RuntimeError("approach trajectory was not planned")
+            self.last_command = ctrl.approach(
+                self.approach_trajectory,
+                self._approach_cursor,
+                open_width=self.width_start,
+            )
+            return
         elif self.phase == "SEEK_CONTACT":
-            ctrl.set_pose_target(self._insert_target(), self.pose.quat)
-            if self._insert_done:
-                ctrl.set_width_target(self.close_stop_width)
+            width = self.close_stop_width if self._insert_done else self.width_start
+            self.last_command = ctrl.seek_contact(
+                self._insert_target(), self.pose.quat, width=width
+            )
+            return
         elif self.phase == "HOLD":
-            ctrl.set_pose_target(self.pose.pos, self.pose.quat)
+            self.last_command = ctrl.hold(
+                self.pose.pos, self.pose.quat, closed_width=self.width_floor
+            )
+            return
         elif self.phase == "RETRACT_OPEN":
             pos_now, quat_now = tcp_pose(self.bundle)
-            ctrl.set_pose_target(pos_now, quat_now)
-            ctrl.set_width_target(self.width_start)
+            self.last_command = ctrl.retract_open(
+                pos_now, quat_now, open_width=self.width_start
+            )
+            return
         elif self.phase in ("RETRACT_MOVE", "RETRACT_SETTLE"):
-            ctrl.set_pose_target(self.pose.pre_pos, self.pose.quat)
-            ctrl.set_width_target(self.width_start)
+            self.last_command = ctrl.retract_move(
+                self.pose.pre_pos, self.pose.quat, open_width=self.width_start
+            )
+            return
         # DONE / FAILED 保持最后指令。
-        self.last_command = ctrl.apply()
 
     def _insert_target(self) -> np.ndarray:
         """插入阶段的 TCP 目标：从预接触位线性推进到接触位。"""
@@ -245,22 +244,24 @@ class ProbeController:
 
     def _update(self, normal: np.ndarray, touching: np.ndarray) -> None:
         self.peak_force = max(self.peak_force, float(normal.max()))
-        any_contact = bool(touching.any()) or bool((normal > CONTACT_THRESHOLD_N).any())
+        any_contact = bool(touching.any())
 
         if self.phase == "APPROACH":
-            wp_pos, wp_quat = self.approach_waypoints[self._approach_stage]
-            check_rot = self._approach_check_rot[self._approach_stage]
-            if self.controller.at_pose(
-                wp_pos,
-                wp_quat if check_rot else None,
-                pos_tol=0.006,
-                rot_tol=0.08,
-            ) and self.controller.settled():
-                if self._approach_stage + 1 < len(self.approach_waypoints):
-                    self._approach_stage += 1
-                    self.phase_steps = 0
+            if self.approach_trajectory is None:
+                self._fail("approach_not_planned")
+                return
+            self._approach_cursor += 1
+            if self._approach_cursor >= len(self.approach_trajectory):
+                # 轨迹按时间结束后直接插入，不再等待 at_pose/settled。
+                # 跟踪误差过大时直接判失败，不能重新引入无限等待。
+                if not self.controller.at_pose(
+                    self.pose.pre_pos,
+                    self.pose.quat,
+                    pos_tol=0.03,
+                    rot_tol=0.35,
+                ):
+                    self._fail("approach_tracking_error")
                     return
-                # 已到预接触位：直接开始插入，不再额外停留。
                 self._insert_from = np.asarray(self.controller.cmd_pos, dtype=np.float64).copy()
                 distance = float(np.linalg.norm(self.pose.pos - self._insert_from))
                 self._insert_steps = max(
@@ -268,8 +269,6 @@ class ProbeController:
                 )
                 self._insert_done = False
                 self._set_phase("SEEK_CONTACT")
-            elif self.phase_steps * self.dt >= float(self.contact_cfg["seek_timeout_s"]):
-                self._fail("approach_timeout")
             return
 
         if self.phase == "SEEK_CONTACT":
@@ -278,7 +277,7 @@ class ProbeController:
                     self._insert_done = True
                     self.phase_steps = 0
                 return
-            if any_contact and float(normal.max()) >= CONTACT_THRESHOLD_N:
+            if any_contact:
                 self.contact_start_s = self.step_index * self.dt
                 self._set_phase("HOLD")
                 return
@@ -290,9 +289,6 @@ class ProbeController:
             return
 
         if self.phase == "HOLD":
-            err = float(normal.max()) - float(self.spec.target_force_n)
-            gain = float(self.contact_cfg["gain_m_per_n"])
-            self.controller.set_width_target(self.controller.width_target + 2.0 * gain * err)
             if self.phase_steps * self.dt >= float(self.spec.contact_hold_s):
                 self.contact_end_s = self.step_index * self.dt
                 self._set_phase("RETRACT_OPEN")
@@ -396,7 +392,6 @@ class MultiProbeController:
 
 
 __all__ = [
-    "CONTACT_THRESHOLD_N",
     "MAX_POLICY_STEPS",
     "MultiProbeController",
     "ProbeController",

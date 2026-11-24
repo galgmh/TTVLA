@@ -24,7 +24,7 @@ from typing import Any
 import numpy as np
 
 from sim.config import load_dataset_config, load_task_config
-from sim.control.actions import DeltaPoseController, tcp_pose
+from sim.control.controller import DeltaPoseController, tcp_pose
 from sim.episode import EpisodeSpec
 from sim.obs import get_policy_observation, get_robot_observation
 from sim.rotations import quat_apply_delta

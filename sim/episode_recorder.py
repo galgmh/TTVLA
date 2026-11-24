@@ -82,7 +82,6 @@ class EpisodeRecorder:
         sim_time: float,
         sensor_index: int,
         command: tuple[np.ndarray, float],
-        target_force_n: float,
         robot: Mapping[str, np.ndarray],
         camera: Mapping[str, np.ndarray],
     ) -> None:
@@ -95,7 +94,6 @@ class EpisodeRecorder:
         b["control/sensor_index"].append(int(sensor_index))
         b["control/eef_target"].append(np.asarray(eef_target, dtype=np.float32))
         b["control/gripper_target"].append(float(gripper_target))
-        b["control/target_force"].append(float(target_force_n))
         b["robot/eef_pose"].append(np.asarray(robot["eef_pose"], dtype=np.float32))
         b["robot/joint_position"].append(np.asarray(robot["joint_position"], dtype=np.float32))
         b["robot/joint_velocity"].append(np.asarray(robot["joint_velocity"], dtype=np.float32))

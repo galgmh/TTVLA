@@ -47,9 +47,6 @@ fingertip:
   pair_delta_c: [0.0, 0.0]
   physical_range_c: [25.0, 25.0]
 
-# 力档位：目标法向力 = nominal_force_n × 档位，实际力逐帧记录。
-force_levels: [0.7, 1.0, 1.3]
-
 # 当前预设只生成稳定接触；需要视觉接触负样本时可显式调整这些概率。
 contact_quality_probabilities: {stable: 1.0, brief: 0.0, failed: 0.0}
 

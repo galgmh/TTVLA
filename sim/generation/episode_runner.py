@@ -34,7 +34,6 @@ def run_episode(bundle, spec, *, controller=None) -> tuple[dict, dict, dict]:
             sim_time=float(sim_step) * sim_dt,
             sensor_index=recorder.sensor_frames - 1,
             command=command,
-            target_force_n=float(spec.target_force_n),
             robot=get_robot_observation(bundle),
             camera=bundle.camera_observation(),
         )

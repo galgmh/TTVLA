@@ -38,7 +38,7 @@ def main() -> int:
     print("\n元数据:")
     keys = (
         "episode_id", "split", "target_region", "regime", "finger_mode",
-        "contact_quality", "target_force_n", "initial_finger_temperature",
+        "contact_quality", "initial_finger_temperature",
         "initial_link_temperature", "termination_reason", "policy_steps",
         "peak_normal_force_n", "sensor_frames", "control_frames", "contact_events",
     )

@@ -161,20 +161,15 @@ class ThermalContactSampler:
                 float(v) for v in np.clip([left, right], *finger_cfg["physical_range_c"])
             )
 
-        # ---- 力档位与接触质量
-        levels = [float(v) for v in self.ds["force_levels"]]
-        force_level = float(levels[int(rng.integers(0, len(levels)))])
+        # ---- 接触质量；夹爪宽度目标统一为 0，不采样目标力档位。
         contact_quality = _categorical(rng, self.ds["contact_quality_probabilities"])
         contact_cfg = self.task["contact"]
         if contact_quality == "stable":
             hold = float(self.task["timing"]["contact_s"])
-            retreat = 0.0
         elif contact_quality == "brief":
             hold = float(rng.uniform(*contact_cfg["brief_hold_s"]))
-            retreat = 0.0
         else:
             hold = 0.0
-            retreat = float(rng.uniform(*contact_cfg["fail_retreat_m"]))
 
         # ---- 传感器非理想性
         sensor_cfg = self.ds["sensor_randomization"]
@@ -228,11 +223,8 @@ class ThermalContactSampler:
             finger_mode=finger_mode,
             link_temps_c=tuple(float(v) for v in temps),
             fingertip_temps_c=fingertip,
-            force_level=force_level,
-            target_force_n=float(contact_cfg["nominal_force_n"]) * force_level,
             contact_quality=contact_quality,
             contact_hold_s=hold,
-            fail_retreat_m=retreat,
             sensor_rc_s=rc,
             sensor_noise_c=noise,
             sensor_bias_c=bias,
@@ -297,8 +289,6 @@ class ThermalContactSampler:
 
         ambient = float(self.task["sensor"]["ambient_temp_c"])
         fingertip = (ambient, ambient)
-        force_level = float(self.ds["force_levels"][int(rng.integers(0, len(self.ds["force_levels"])))])
-        contact_cfg = self.task["contact"]
 
         sensor_cfg = self.ds["sensor_randomization"]
         nominal = self.task["sensor"]["nominal"]
@@ -322,10 +312,8 @@ class ThermalContactSampler:
             random_seed=random_seed, region_order=self.region_order,
             target_region=-2, mixed=False, regime=f"case_{case_index + 1}", finger_mode="ambient",
             link_temps_c=temps, fingertip_temps_c=fingertip,
-            force_level=force_level,
-            target_force_n=float(contact_cfg["nominal_force_n"]) * force_level,
             contact_quality="stable", contact_hold_s=float(self.duration_schedules[schedule_index][first]),
-            fail_retreat_m=0.0, sensor_rc_s=rc, sensor_noise_c=noise,
+            sensor_rc_s=rc, sensor_noise_c=noise,
             sensor_bias_c=bias, sensor_quantization_c=quant,
             probe_pos=probes[first][0], probe_tool_dir=probes[first][1],
             probe_finger_dir=probes[first][2],

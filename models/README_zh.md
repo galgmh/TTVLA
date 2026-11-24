@@ -138,6 +138,16 @@ python finetune_new.py --config_name test_run
 torchrun --standalone --nnodes=1 --nproc_per_node=3 finetune_new.py --config_name test_run
 ```
 
+纯 PyTorch LoRA 微调使用内置配置：
+
+```bash
+python finetune_new.py --config_name thermal_v4_lora
+```
+
+LoRA 会在加载基础权重后注入 PaliGemma/Action Expert 的注意力与 FFN 投影；
+checkpoint 保存 `adapter_model.safetensors`、可训练动作头和优化器状态。推理时
+仍使用同一个 `server_policy.py`，并传入 `--config_name thermal_v4_lora`。
+
 训练指标会推送到 **wandb**（开关在 `TrainConfig.wandb_enabled`）。Checkpoint 保存在 `<run_dir>/<exp_name>/checkpoints/<step>/`。
 
 ### Step 6. 部署 & 验证

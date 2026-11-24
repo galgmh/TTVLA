@@ -2,24 +2,176 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Callable, Sequence
 import time
 import zlib
 
 import numpy as np
 
-from sim.control.pi05_expert import ExpertStep, Pi05ExpertController
 from sim.control.cup_expert_defaults import (
     GRASP_TARGETS,
     THERMAL_SAFE_EXECUTION,
     THERMAL_SAFE_POLICIES,
 )
+from sim.control.grasp_controller import GraspLiftController, GraspPolicyConfig
+from sim.control.probe_controller import ProbeController, ProbeOutcome
 from sim.episode import EpisodeSpec
 from sim.generation.episode_runner import run_episode
 from sim.recording import write_episode
 from sim.scene import build_scene
 
 WALL_REGIONS = ("lower", "middle", "upper")
+
+
+@dataclass(frozen=True)
+class ThermalStep:
+    """One probe or grasp operation in a thermal-safe demonstration."""
+
+    kind: str  # "probe" or "grasp"
+    region: int
+    position: tuple[float, float, float]
+    tool_dir: tuple[float, float, float]
+    finger_dir: tuple[float, float, float]
+    pre_dist: float
+    hold_s: float
+    grasp_timeout_s: float = 10.0
+    lift_height_m: float = 0.12
+    lift_success_height_m: float = 0.06
+    touch_hold_s: float = 0.0
+
+
+class ThermalSequenceController:
+    """Run the thermal task's probe/grasp steps in one continuous episode."""
+
+    def __init__(
+        self,
+        bundle,
+        spec: EpisodeSpec,
+        steps: Sequence[ThermalStep],
+    ):
+        if not steps:
+            raise ValueError("thermal sequence needs at least one step")
+        self.bundle = bundle
+        self.spec = spec
+        self.steps = tuple(steps)
+        self.last_command: tuple[np.ndarray, float] | None = None
+        self.phase = "RESET"
+        self.current_step = 0
+        self.current_controller: ProbeController | None = None
+
+    def _child_spec(self, step: ThermalStep) -> EpisodeSpec:
+        contact_hold_s = (
+            float(step.touch_hold_s) if step.kind == "grasp" else float(step.hold_s)
+        )
+        return replace(
+            self.spec,
+            target_region=int(step.region),
+            mixed=False,
+            contact_order=(),
+            contact_hold_s_by_region=(),
+            contact_hold_s=contact_hold_s,
+            contact_quality="stable",
+            probe_pos=tuple(float(v) for v in step.position),
+            probe_tool_dir=tuple(float(v) for v in step.tool_dir),
+            probe_finger_dir=tuple(float(v) for v in step.finger_dir),
+            probe_pre_dist=float(step.pre_dist),
+            probe_positions=(),
+            probe_tool_dirs=(),
+            probe_finger_dirs=(),
+        )
+
+    def _controller_for(self, step: ThermalStep):
+        child_spec = self._child_spec(step)
+        if step.kind == "probe":
+            return ProbeController(self.bundle, child_spec)
+        if step.kind == "grasp":
+            policy = GraspPolicyConfig(
+                policy_id="thermal_safe_grasp",
+                instruction=str(self.spec.instruction),
+                grasp_region=str(self.spec.region_order[int(step.region)]),
+                lift_height_m=float(step.lift_height_m),
+                lift_success_height_m=float(step.lift_success_height_m),
+                grasp_timeout_s=float(step.grasp_timeout_s),
+                lift_hold_s=float(step.hold_s),
+                touch_hold_s=float(step.touch_hold_s),
+                grasp_hold_s=float(step.hold_s),
+            )
+            return GraspLiftController(self.bundle, child_spec, policy)
+        raise ValueError(f"unknown thermal step kind: {step.kind}")
+
+    def run(
+        self,
+        on_sample: Callable[[int], None] | None = None,
+        on_control: Callable[[int], None] | None = None,
+    ) -> ProbeOutcome:
+        global_sim_step = 0
+        total_policy_steps = 0
+        peak_force = 0.0
+        first_contact: float | None = None
+        last_contact: float | None = None
+        failure = ""
+        sim_dt = float(self.bundle.cfg["controller"]["sim_dt"])
+
+        for sequence_index, step in enumerate(self.steps):
+            self.current_step = sequence_index
+            controller = self._controller_for(step)
+            self.current_controller = controller
+
+            def sample_callback(local_step: int) -> None:
+                if sequence_index > 0 and local_step == 0:
+                    return
+                if on_sample is not None:
+                    on_sample(global_sim_step + local_step)
+
+            def control_callback(local_step: int) -> None:
+                self.last_command = controller.last_command
+                self.phase = controller.phase
+                if on_control is not None:
+                    on_control(global_sim_step + local_step)
+
+            outcome = controller.run(
+                on_sample=sample_callback,
+                on_control=control_callback,
+            )
+            if outcome.contact_start_s is not None:
+                offset_s = global_sim_step * sim_dt
+                start = offset_s + outcome.contact_start_s
+                end = offset_s + float(
+                    outcome.contact_end_s or outcome.contact_start_s
+                )
+                if first_contact is None:
+                    first_contact = start
+                last_contact = end
+
+            expected = (
+                "contact_stable" if step.kind == "probe" else "grasp_lift_complete"
+            )
+            if outcome.termination_reason != expected:
+                failure = (
+                    f"{step.kind}_{sequence_index}:"
+                    f"{outcome.termination_reason}"
+                )
+            global_sim_step += int(controller.sim_step)
+            total_policy_steps += int(outcome.policy_steps)
+            peak_force = max(peak_force, float(outcome.peak_normal_force_n))
+            if failure:
+                break
+
+        self.phase = "DONE" if not failure else "FAILED"
+        return ProbeOutcome(
+            termination_reason=(
+                "thermal_sequence_complete"
+                if not failure
+                else f"thermal_sequence_partial:{failure}"
+            ),
+            contact_detected=first_contact is not None,
+            contact_start_s=first_contact,
+            contact_end_s=last_contact,
+            policy_steps=total_policy_steps,
+            peak_normal_force_n=peak_force,
+        )
 
 
 def _rotate_about_axis(vector: np.ndarray, axis: np.ndarray, angle: float) -> np.ndarray:
@@ -100,7 +252,7 @@ def _make_episode(
     global_attempt: int,
     split: str | None = None,
     instruction_index: int = 0,
-) -> tuple[EpisodeSpec, tuple[ExpertStep, ...], dict]:
+) -> tuple[EpisodeSpec, tuple[ThermalStep, ...], dict]:
     policy_id = str(policy["id"])
     sequence = tuple(str(v) for v in policy["sequence"])
     regime_name = str(policy["regime"])
@@ -134,53 +286,45 @@ def _make_episode(
     handle_grasp = _sample_grasp(rng, GRASP_TARGETS["handle"])
 
     execution = THERMAL_SAFE_EXECUTION
-    probe_force = float(execution["probe_force_n"])
-    grasp_force = float(execution["grasp_force_n"])
     hold_s = float(execution["contact_hold_s"])
     grasp_options = {
-        "force_band_n": float(execution["force_band_n"]),
-        "force_width_step_m": float(execution["force_width_step_m"]),
-        "force_fast_width_step_m": float(execution["force_fast_width_step_m"]),
-        "force_fast_threshold_n": float(execution["force_fast_threshold_n"]),
         "grasp_timeout_s": float(execution["grasp_timeout_s"]),
         "lift_height_m": float(execution["lift_height_m"]),
         "lift_success_height_m": float(task["success"]["min_lift_height_m"]),
-        "lift_timeout_s": float(execution["lift_timeout_s"]),
-        "touch_force_n": probe_force,
         "touch_hold_s": hold_s,
     }
-    steps: list[ExpertStep] = []
+    steps: list[ThermalStep] = []
     for action in sequence:
         if action == "probe_wall":
             pos, tool, finger = wall_probe
-            steps.append(ExpertStep(
+            steps.append(ThermalStep(
                 "probe", wall_region, pos, tool, finger,
-                float(task["regions"][wall_name]["pre_dist"]), probe_force, hold_s,
+                float(task["regions"][wall_name]["pre_dist"]), hold_s,
             ))
         elif action == "probe_handle":
             pos, tool, finger = handle_probe
-            steps.append(ExpertStep(
+            steps.append(ThermalStep(
                 "probe", handle_region, pos, tool, finger,
-                float(task["regions"]["handle"]["pre_dist"]), probe_force, hold_s,
+                float(task["regions"]["handle"]["pre_dist"]), hold_s,
             ))
         elif action == "grasp_wall":
             pos, tool, finger, pre_dist = wall_grasp
-            steps.append(ExpertStep(
+            steps.append(ThermalStep(
                 "grasp", wall_region, pos, tool, finger,
-                pre_dist, grasp_force, hold_s, **grasp_options,
+                pre_dist, hold_s, **grasp_options,
             ))
         elif action == "grasp_handle":
             pos, tool, finger, pre_dist = handle_grasp
-            steps.append(ExpertStep(
+            steps.append(ThermalStep(
                 "grasp", handle_region, pos, tool, finger,
-                pre_dist, grasp_force, hold_s, **grasp_options,
+                pre_dist, hold_s, **grasp_options,
             ))
         else:
             raise ValueError(f"unknown policy action {action!r}")
 
-    # The final touch and grasp use the same point. Keep TCP there, hold the
-    # probe force, then increase force to the grasp target without retracting.
-    merged_steps: list[ExpertStep] = []
+    # The final touch and grasp use the same point. Keep TCP there and continue
+    # commanding zero gripper width without retracting.
+    merged_steps: list[ThermalStep] = []
     for step in steps:
         if (
             step.kind == "grasp"
@@ -218,11 +362,8 @@ def _make_episode(
         finger_mode="ambient",
         link_temps_c=temps,
         fingertip_temps_c=(25.0, 25.0),
-        force_level=1.0,
-        target_force_n=probe_force,
         contact_quality="stable",
         contact_hold_s=hold_s,
-        fail_retreat_m=0.0,
         sensor_rc_s=sensor_rc,
         sensor_noise_c=sensor_noise,
         sensor_bias_c=sensor_bias,
@@ -258,15 +399,14 @@ def _make_episode(
                 "kind": step.kind,
                 "region": region_order[step.region],
                 "position": list(step.position),
-                "force_n": float(step.touch_force_n if step.kind == "grasp" and step.touch_force_n is not None else step.force_n),
+                "gripper_width_target_m": 0.0,
                 "hold_s": float(step.touch_hold_s if step.kind == "grasp" else step.hold_s),
             }
             for step in steps
         ],
         "regime": regime_name,
         "wall_region": wall_name,
-        "probe_force_n": probe_force,
-        "grasp_force_n": grasp_force,
+        "gripper_width_target_m": 0.0,
         "contact_hold_s": hold_s,
         "grasp_points": [
             {"kind": step.kind, "region": region_order[step.region], "position": list(step.position)}
@@ -318,7 +458,7 @@ def generate_thermal_safe(
                 break
 
             bundle.reset_episode(spec)
-            controller = Pi05ExpertController(bundle, spec, steps)
+            controller = ThermalSequenceController(bundle, spec, steps)
             buffers, metadata, static = run_episode(bundle, spec, controller=controller)
             metadata.update(expert_meta)
             metadata["success"] = bool(metadata["task_success"]["success"])
@@ -342,4 +482,9 @@ def generate_thermal_safe(
     return {"written": written, "skipped": skipped, "discarded": discarded}
 
 
-__all__ = ["_make_episode", "generate_thermal_safe"]
+__all__ = [
+    "ThermalSequenceController",
+    "ThermalStep",
+    "_make_episode",
+    "generate_thermal_safe",
+]

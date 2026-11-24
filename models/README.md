@@ -138,6 +138,16 @@ python finetune_new.py --config_name test_run
 torchrun --standalone --nnodes=1 --nproc_per_node=3 finetune_new.py --config_name test_run
 ```
 
+For native PyTorch LoRA fine-tuning:
+
+```bash
+python finetune_new.py --config_name thermal_v4_lora
+```
+
+Adapters are injected after loading the dense base weights. LoRA checkpoints
+store `adapter_model.safetensors`, trainable action heads, and optimizer state;
+serve them with the same `server_policy.py` and `--config_name thermal_v4_lora`.
+
 Training metrics are pushed to **wandb** (toggle with `TrainConfig.wandb_enabled`). Checkpoints land under `<run_dir>/<exp_name>/checkpoints/<step>/`.
 
 ### Step 6. Serve and verify

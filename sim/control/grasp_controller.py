@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from sim.control.probe_controller import CONTACT_THRESHOLD_N, ProbeController
+from sim.control.probe_controller import ProbeController
 
 
 @dataclass(frozen=True)
@@ -18,9 +18,9 @@ class GraspPolicyConfig:
     lift_height_m: float
     lift_success_height_m: float
     grasp_timeout_s: float
-    lift_timeout_s: float
     lift_hold_s: float
-    bilateral_force_n: float
+    touch_hold_s: float = 0.0
+    grasp_hold_s: float = 0.0
 
 
 def grasp_policy_from_task(task: dict[str, Any]) -> GraspPolicyConfig:
@@ -37,9 +37,7 @@ def grasp_policy_from_task(task: dict[str, Any]) -> GraspPolicyConfig:
         lift_height_m=max(0.12, min_lift + 0.03),
         lift_success_height_m=min_lift,
         grasp_timeout_s=6.0,
-        lift_timeout_s=5.0,
         lift_hold_s=0.50,
-        bilateral_force_n=0.30,
     )
 
 
@@ -52,6 +50,21 @@ class GraspLiftController(ProbeController):
         self.initial_cup_z = float(bundle.cup_pose()[0][2])
         self.lift_target = np.asarray(self.pose.pos, dtype=np.float64).copy()
         self.lift_target[2] += float(policy.lift_height_m)
+        self.lift_trajectory = None
+        self.lift_cursor = 0
+        self.grasp_hold_steps = max(1, int(round(float(policy.grasp_hold_s) / self.dt)))
+        self.contact_hold_count = 0
+
+    def _begin(self) -> None:
+        super()._begin()
+        if self.approach_trajectory is None:
+            raise RuntimeError("approach trajectory was not planned")
+        self.lift_trajectory = self.controller.plan_lift(
+            self.pose,
+            self.lift_target,
+            initial_arm_q=self.approach_trajectory.arm_q[-1],
+        )
+        self.lift_cursor = 0
 
     @property
     def termination_reason(self) -> str:
@@ -61,13 +74,23 @@ class GraspLiftController(ProbeController):
 
     def _command(self) -> None:
         if self.phase == "GRASP":
-            self.controller.set_pose_target(self.pose.pos, self.pose.quat)
-            self.controller.set_width_target(self.width_floor)
-            self.last_command = self.controller.apply()
+            self.last_command = self.controller.grasp(
+                self.pose.pos, self.pose.quat, closed_width=self.width_floor
+            )
             return
-        if self.phase in ("LIFT", "HOLD_LIFT"):
-            self.controller.set_pose_target(self.lift_target, self.pose.quat)
-            self.last_command = self.controller.apply()
+        if self.phase == "LIFT":
+            if self.lift_trajectory is None:
+                raise RuntimeError("lift trajectory was not planned")
+            self.last_command = self.controller.lift_trajectory(
+                self.lift_trajectory,
+                self.lift_cursor,
+                closed_width=self.width_floor,
+            )
+            return
+        if self.phase == "HOLD_LIFT":
+            self.last_command = self.controller.hold(
+                self.lift_target, self.pose.quat, closed_width=self.width_floor
+            )
             return
         super()._command()
 
@@ -81,14 +104,21 @@ class GraspLiftController(ProbeController):
             "RETRACT_SETTLE",
         ):
             super()._update(normal, touching)
-            # 父类在建立接触后进入 HOLD；纯抓取改为继续双指夹紧。
             if self.phase == "HOLD":
+                self.contact_hold_count = 0
+            return
+
+        if self.phase == "HOLD":
+            if self.phase_steps * self.dt >= float(self.policy.touch_hold_s):
+                self.contact_hold_count = 0
                 self._set_phase("GRASP")
             return
 
         if self.phase == "GRASP":
-            bilateral = bool(np.all(touching)) and bool(np.all(normal >= float(self.policy.bilateral_force_n)))
-            if bilateral:
+            bilateral = bool(np.all(touching))
+            self.contact_hold_count = self.contact_hold_count + 1 if bilateral else 0
+            if self.contact_hold_count >= self.grasp_hold_steps:
+                self.lift_cursor = 0
                 self._set_phase("LIFT")
                 return
             if self.bundle.gripper_width() <= self.width_floor + 1e-6:
@@ -99,11 +129,21 @@ class GraspLiftController(ProbeController):
             return
 
         if self.phase == "LIFT":
-            if self.controller.at_pose(self.lift_target, self.pose.quat, pos_tol=0.008, rot_tol=0.10):
+            if self.lift_trajectory is None:
+                self._fail("lift_not_planned")
+                return
+            self.lift_cursor += 1
+            if self.lift_cursor >= len(self.lift_trajectory):
+                if not self.controller.at_pose(
+                    self.lift_target,
+                    self.pose.quat,
+                    pos_tol=0.03,
+                    rot_tol=0.35,
+                ):
+                    self._fail("lift_tracking_error")
+                    return
                 self._set_phase("HOLD_LIFT")
                 return
-            if self.phase_steps * self.dt >= float(self.policy.lift_timeout_s):
-                self._fail("lift_timeout")
             return
 
         if self.phase == "HOLD_LIFT":

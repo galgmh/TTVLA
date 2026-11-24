@@ -1,5 +1,6 @@
 from data.data_loader import DataConfig
 from pi05_model.config import Pi0Config
+from pi05_model.lora import LoRATrainingConfig
 from finetune_new import TrainConfig
 from data.data_loader import RepackTransform
 
@@ -216,4 +217,30 @@ ALLCONFIGS = {
             data_config=None,
         ),
     },
+}
+
+# Pure-PyTorch LoRA counterpart of ``thermal_v4_ft``.  Dense base weights are
+# loaded once, while checkpoints contain adapters and the small action heads.
+_thermal_v4_lora_base = ALLCONFIGS["thermal_v4_ft"]
+ALLCONFIGS["thermal_v4_lora"] = {
+    "data_config": _thermal_v4_lora_base["data_config"],
+    "model_config": _thermal_v4_lora_base["model_config"],
+    "train_config": dataclasses.replace(
+        _thermal_v4_lora_base["train_config"],
+        exp_name="thermal_v4_lora",
+        freeze_stage=None,
+        peak_lr=1.0e-4,
+        end_lr=1.0e-5,
+        lora=LoRATrainingConfig(
+            enabled=True,
+            attn_rank=16,
+            ffn_rank=16,
+            attn_alpha=16.0,
+            ffn_alpha=16.0,
+            dropout=0.05,
+            apply_to="all",
+            train_vision_encoder=False,
+            train_non_lora_layers=True,
+        ),
+    ),
 }

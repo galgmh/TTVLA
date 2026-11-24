@@ -7,7 +7,7 @@
 规格里的字段分三类：
 
 * 仿真输入 —— 杯子位姿抖动、四段 link 温度、指尖初始温度、传感器参数、
-  探测点（作者坐标系下的位置与接近方向）、目标力与接触质量；
+  探测点（作者坐标系下的位置与接近方向）与接触质量；
 * 标签口径 —— 目标区域；
 * 记录用元数据 —— 数据集版本、划分、随机种子等。
 
@@ -43,12 +43,9 @@ class EpisodeSpec:
     link_temps_c: tuple[float, ...]  # 按 region_order 的四段温度
     fingertip_temps_c: tuple[float, float]  # (左, 右)
 
-    # ---- 仿真输入：力与接触质量
-    force_level: float
-    target_force_n: float
+    # ---- 仿真输入：接触质量
     contact_quality: str  # stable / brief / failed
     contact_hold_s: float  # 稳定接触的保持时长；failed 为 0
-    fail_retreat_m: float  # 仅 failed 非零：停在接触点前方这么远
 
     # ---- 仿真输入：传感器非理想性
     sensor_rc_s: float
@@ -92,8 +89,6 @@ class EpisodeSpec:
             raise ValueError(f"未知接触质量 {self.contact_quality!r}")
         if self.contact_hold_s < 0.0:
             raise ValueError(f"contact_hold_s 必须 >= 0，实为 {self.contact_hold_s}")
-        if self.target_force_n <= 0.0:
-            raise ValueError(f"target_force_n 必须为正，实为 {self.target_force_n}")
         if not 0.0 <= self.sensor_rc_s < 5.0:
             raise ValueError(f"sensor_rc_s 超出合理范围：{self.sensor_rc_s}")
         if self.sensor_quantization_c < 0.0 or self.sensor_noise_c < 0.0:
@@ -131,11 +126,8 @@ class EpisodeSpec:
             "finger_mode": self.finger_mode,
             "link_temps_c": [float(v) for v in self.link_temps_c],
             "fingertip_temps_c": [float(v) for v in self.fingertip_temps_c],
-            "force_level": float(self.force_level),
-            "target_force_n": float(self.target_force_n),
             "contact_quality": self.contact_quality,
             "contact_hold_s": float(self.contact_hold_s),
-            "fail_retreat_m": float(self.fail_retreat_m),
             "sensor_rc_s": float(self.sensor_rc_s),
             "sensor_noise_c": float(self.sensor_noise_c),
             "sensor_bias_c": float(self.sensor_bias_c),

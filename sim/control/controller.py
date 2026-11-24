@@ -5,20 +5,21 @@
 * ``point_world`` 把“杯子作者坐标系里的探测位姿”换算成世界系 TCP 目标。
   探测点的 z 轴是接近方向 ``tool_dir``，y 轴是两指闭合方向 ``finger_dir``，
   x 轴取 ``y × z``；这点决定了指尖垫面覆盖杯子哪一段热区。
-* ``DeltaPoseController`` 每个策略步把*指令位姿*朝目标位姿推进有限的一步
-  （位置限速 + 姿态限速），再用阻尼最小二乘 IK 解出关节指令，指关节按
-  限速逼近目标开口。限速是必须的：IK 直接吃远处目标会跳到另一个解支
+* ``DeltaPoseController`` 对 APPROACH 和 LIFT 预先生成限速连续轨迹并顺序
+  求出全部 IK；仿真运行时只播放关节目标。SEEK_CONTACT 保持事件驱动。
+  限速是必须的：IK 直接吃远处目标会跳到另一个解支
   （例如腕部拧转 90°），关节指令突变会让手臂甩出去。IK 只用当前状态作
   初值（``max_samples=1``）并从实测 q 重锚，因此策略步之间不会累积位姿
   漂移。
 
-手指开合不做位置伺服之外的力控制：力闭环在 ``probe_controller`` 里，通过
-修正指位目标实现（指 PD 刚度把“多压多少”变成“多大法向力”）。
+手指开合只做带速率限制的位置控制。触碰/抓取时上层统一给出零宽度目标；
+接触力只用于记录和接触真值判定，不反馈修改夹爪宽度指令。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 
 import numpy as np
 
@@ -43,6 +44,53 @@ class ProbePose:
     quat: np.ndarray  # (4,) wxyz 手 link 朝向
     pre_pos: np.ndarray  # (3,) 沿接近方向退回 pre_dist 的预接触位
     approach_dir: np.ndarray  # (3,) 世界系单位接近方向
+
+
+@dataclass(frozen=True)
+class JointTrajectory:
+    """A time-indexed Cartesian path and its pre-solved arm joint targets."""
+
+    positions: np.ndarray  # [T, 3]
+    quaternions: np.ndarray  # [T, 4], wxyz
+    arm_q: np.ndarray  # [T, 7]
+
+    def __len__(self) -> int:
+        return int(self.arm_q.shape[0])
+
+
+def _smoothstep5(t: float) -> float:
+    return t * t * t * (10.0 + t * (-15.0 + 6.0 * t))
+
+
+def interpolate_waypoints(
+    waypoints: Sequence[tuple[np.ndarray, np.ndarray]],
+    *,
+    max_pos_step: float,
+    max_rot_step: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Create a smooth pose path without duplicate waypoint frames."""
+    if len(waypoints) < 2:
+        raise ValueError("trajectory needs at least two waypoints")
+    positions: list[np.ndarray] = []
+    quaternions: list[np.ndarray] = []
+    for (p0, q0), (p1, q1) in zip(waypoints, waypoints[1:]):
+        p0 = np.asarray(p0, dtype=np.float64).reshape(3)
+        p1 = np.asarray(p1, dtype=np.float64).reshape(3)
+        q0 = quat_normalize(q0)
+        q1 = quat_normalize(q1)
+        rotvec = quat_error_rotvec(q1, q0)
+        # Quintic time scaling peaks at ds/dt=1.875.
+        peak_scale = 1.875
+        steps = max(
+            1,
+            int(np.ceil(peak_scale * np.linalg.norm(p1 - p0) / max_pos_step)),
+            int(np.ceil(peak_scale * np.linalg.norm(rotvec) / max_rot_step)),
+        )
+        for index in range(1, steps + 1):
+            s = _smoothstep5(float(index) / float(steps))
+            positions.append(p0 + s * (p1 - p0))
+            quaternions.append(quat_apply_delta(q0, s * rotvec))
+    return np.asarray(positions), np.asarray(quaternions)
 
 
 def _unit(vec, where: str) -> np.ndarray:
@@ -218,6 +266,113 @@ class DeltaPoseController:
         eef = np.concatenate([self.cmd_pos, self.cmd_quat])
         return eef, self.width_cmd
 
+    def plan_joint_trajectory(self, waypoints, *, initial_arm_q=None) -> JointTrajectory:
+        """Precompute a pose path and all of its IK solutions."""
+        positions, quaternions = interpolate_waypoints(
+            waypoints,
+            max_pos_step=self.max_pos_step,
+            max_rot_step=self.max_rot_step,
+        )
+        return solve_joint_trajectory(
+            self, positions, quaternions, initial_arm_q=initial_arm_q
+        )
+
+    def plan_approach(
+        self,
+        pose: ProbePose,
+        *,
+        cup_top_z: float,
+        hover_clearance_m: float,
+    ) -> JointTrajectory:
+        """Plan RESET→APPROACH as one continuous, pre-solved trajectory."""
+        start_pos, start_quat = tcp_pose(self.bundle)
+        hover_z = max(float(start_pos[2]), float(cup_top_z) + float(hover_clearance_m))
+        waypoints = (
+            (start_pos, start_quat),
+            (np.array([start_pos[0], start_pos[1], hover_z]), start_quat),
+            (np.array([pose.pre_pos[0], pose.pre_pos[1], hover_z]), pose.quat),
+            (pose.pre_pos, pose.quat),
+        )
+        return self.plan_joint_trajectory(waypoints)
+
+    def plan_lift(
+        self,
+        pose: ProbePose,
+        lift_target,
+        *,
+        initial_arm_q,
+    ) -> JointTrajectory:
+        """Pre-solve nominal SEEK continuation and the vertical LIFT path."""
+        # First obtain the joint branch at the nominal contact pose. This
+        # connector is not played here: SEEK_CONTACT remains event-driven.
+        connector = self.plan_joint_trajectory(
+            ((pose.pre_pos, pose.quat), (pose.pos, pose.quat)),
+            initial_arm_q=initial_arm_q,
+        )
+        return self.plan_joint_trajectory(
+            ((pose.pos, pose.quat), (np.asarray(lift_target), pose.quat)),
+            initial_arm_q=connector.arm_q[-1],
+        )
+
+    def apply_trajectory_sample(self, trajectory, index: int, *, width: float) -> tuple[np.ndarray, float]:
+        """Play one precomputed joint target and rate-limit the fingers only."""
+        q_arm = np.asarray(trajectory.arm_q[index], dtype=np.float64)
+        self.bundle.robot.control_dofs_position(q_arm, dofs_idx_local=self.arm_dofs)
+        self.last_q_command = q_arm.copy()
+        self.cmd_pos = np.asarray(trajectory.positions[index], dtype=np.float64).copy()
+        self.cmd_quat = np.asarray(trajectory.quaternions[index], dtype=np.float64).copy()
+        self.goal_pos = self.cmd_pos.copy()
+        self.goal_quat = self.cmd_quat.copy()
+
+        self.set_width_target(width)
+        delta = np.clip(
+            self.width_target - self.width_cmd,
+            -self.max_width_step,
+            self.max_width_step,
+        )
+        self.width_cmd = float(np.clip(self.width_cmd + delta, self.width_min, self.width_max))
+        half = 0.5 * self.width_cmd
+        finger_cmd = np.full(len(self.finger_dofs), half, dtype=np.float64)
+        self.bundle.robot.control_dofs_position(finger_cmd, dofs_idx_local=self.finger_dofs)
+        return np.concatenate([self.cmd_pos, self.cmd_quat]), self.width_cmd
+
+    # ---------------------------------------------------------- behavior API
+    # Task controllers select behaviors and decide when they finish.  All
+    # low-level target construction and command application lives here.
+    def approach(self, trajectory: JointTrajectory, index: int, *, open_width: float):
+        return self.apply_trajectory_sample(trajectory, index, width=open_width)
+
+    def seek_contact(self, pos, quat, *, width: float):
+        return self._pose_behavior(pos, quat, width)
+
+    def hold(self, pos, quat, *, closed_width: float):
+        return self._pose_behavior(pos, quat, closed_width)
+
+    def grasp(self, pos, quat, *, closed_width: float):
+        return self._pose_behavior(pos, quat, closed_width)
+
+    def lift_trajectory(
+        self,
+        trajectory: JointTrajectory,
+        index: int,
+        *,
+        closed_width: float,
+    ):
+        return self.apply_trajectory_sample(
+            trajectory, index, width=closed_width
+        )
+
+    def retract_open(self, pos, quat, *, open_width: float):
+        return self._pose_behavior(pos, quat, open_width)
+
+    def retract_move(self, pos, quat, *, open_width: float):
+        return self._pose_behavior(pos, quat, open_width)
+
+    def _pose_behavior(self, pos, quat, width: float):
+        self.set_pose_target(pos, quat)
+        self.set_width_target(width)
+        return self.apply()
+
     def at_pose(self, pos, quat=None, *, pos_tol: float = 0.01, rot_tol: float = 0.1) -> bool:
         """实测 TCP 是否已到指定位姿（位置 m / 角度 rad；quat 为 None 时只看位置）。"""
         p, q = tcp_pose(self.bundle)
@@ -235,10 +390,61 @@ class DeltaPoseController:
         )
 
 
+def solve_joint_trajectory(
+    controller: DeltaPoseController,
+    positions: np.ndarray,
+    quaternions: np.ndarray,
+    *,
+    initial_arm_q=None,
+) -> JointTrajectory:
+    """Solve every path sample, seeding IK from the previous solution."""
+    robot = controller.bundle.robot
+    seed = np.asarray(controller.bundle.joint_state(), dtype=np.float64).copy()
+    if initial_arm_q is not None:
+        seed[controller.arm_dofs] = np.asarray(initial_arm_q, dtype=np.float64)
+    arm_q: list[np.ndarray] = []
+    for index, (pos, quat) in enumerate(zip(positions, quaternions)):
+        q_sol, err = robot.inverse_kinematics(
+            link=robot.get_link(controller.bundle.hand_link_name),
+            pos=pos,
+            quat=quat,
+            local_point=controller.tcp_offset,
+            init_qpos=seed,
+            respect_joint_limit=True,
+            max_samples=controller.max_samples,
+            max_solver_iters=controller.max_iters,
+            damping=controller.damping,
+            max_step_size=controller.ik_step,
+            seed=0,
+            dofs_idx_local=controller.arm_dofs,
+            return_error=True,
+        )
+        q_all = np.asarray(q_sol.detach().cpu(), dtype=np.float64).reshape(-1)
+        q_arm = q_all[controller.arm_dofs]
+        ik_error = np.asarray(err.detach().cpu(), dtype=np.float64).reshape(-1)[:6]
+        if not np.all(np.isfinite(q_arm)) or not np.all(np.isfinite(ik_error)):
+            raise RuntimeError(f"trajectory IK produced non-finite values at sample {index}")
+        arm_q.append(q_arm.copy())
+        seed[controller.arm_dofs] = q_arm
+    q_array = np.asarray(arm_q)
+    if len(q_array) > 1:
+        jump = np.max(np.abs(np.diff(q_array, axis=0)), axis=1)
+        worst = float(np.max(jump))
+        if worst > 0.35:
+            index = int(np.argmax(jump)) + 1
+            raise RuntimeError(
+                f"trajectory IK branch jump at sample {index}: {worst:.3f} rad"
+            )
+    return JointTrajectory(positions, quaternions, q_array)
+
+
 __all__ = [
     "MAX_JOINT_STEP_RAD",
     "DeltaPoseController",
+    "JointTrajectory",
     "ProbePose",
+    "interpolate_waypoints",
     "point_world",
+    "solve_joint_trajectory",
     "tcp_pose",
 ]

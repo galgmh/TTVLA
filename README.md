@@ -77,7 +77,7 @@ models/
 sim/configs + sim/assets
   -> EpisodeSpec
   -> Genesis scene.reset
-  -> 受控接近、接触、力闭环、退回
+  -> 受控接近、零宽度夹爪闭合、接触保持、退回/抬升
   -> 100 Hz 热触觉 + 20 Hz 控制/RGB
   -> sim.dataset / sim.recording
   -> sim.export_pi05_lerobot

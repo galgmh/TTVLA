@@ -30,6 +30,13 @@ import tyro
 from pi05_model.config import Pi0Config
 from pi05_model.model import PI0Pytorch
 from pi05_model.observation import Observation
+from pi05_model.lora import (
+    LoRATrainingConfig,
+    configure_lora_training,
+    inject_lora,
+    load_lora_adapter,
+    save_lora_adapter,
+)
 from data.data_loader import DataConfig, create_data_loader
 
 
@@ -55,6 +62,7 @@ class TrainConfig:
     model_config: Pi0Config = None
     pytorch_weight_path: str = None # Optional path to a PyTorch checkpoint to load weights from, for finetuning
     freeze_stage: str = None #  vlm, vlm_action_expert
+    lora: LoRATrainingConfig = dataclasses.field(default_factory=LoRATrainingConfig)
 
     # Training hyperparameters.
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16" # Precision for PyTorch training.
@@ -190,10 +198,15 @@ def save_checkpoint(model, optimizer, global_step, config: TrainConfig, is_main,
     if (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps - 1:
         # Create temporary directory for atomic checkpoint saving
         ckpt_dir = config.checkpoint_dir / f"{global_step}"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
         
-        # Save model state using safetensors
+        # LoRA checkpoints contain only the adapters; ordinary training keeps
+        # the existing full-model checkpoint format.
         model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-        safetensors.torch.save_model(model_to_save, ckpt_dir / "model.safetensors")
+        if config.lora.enabled:
+            save_lora_adapter(model_to_save, ckpt_dir, config.lora)
+        else:
+            safetensors.torch.save_model(model_to_save, ckpt_dir / "model.safetensors")
         
         # Save optimizer state using PyTorch format
         torch.save(optimizer.state_dict(), ckpt_dir / "optimizer.pt")        
@@ -237,10 +250,14 @@ def load_checkpoint(model, optimizer, load_checkpoint_dir, device):
     try:
         # Load model state with error handling
         logging.info("Loading model state...")
+        model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
         safetensors_path = ckpt_dir / "model.safetensors"
+        adapter_path = ckpt_dir / "adapter_model.safetensors"
 
-        if safetensors_path.exists():
-            model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        if adapter_path.exists():
+            load_lora_adapter(model_to_load, ckpt_dir)
+            logging.info("Loaded LoRA adapter checkpoint")
+        elif safetensors_path.exists():
             safetensors.torch.load_model(model_to_load, safetensors_path, device=str(device))
             logging.info("Loaded model state from safetensors format")
         else:
@@ -397,8 +414,25 @@ def train_loop(config: TrainConfig):
     object.__setattr__(config.model_config, "dtype", config.pytorch_training_precision)
     model = PI0Pytorch(config.model_config).to(device)
 
-    # Freeze BEFORE DDP wrap so the Reducer only tracks truly trainable params.
-    freeze_model(model, config)
+    # Always load the dense base before replacing Linear modules with LoRA
+    # wrappers.  A base checkpoint intentionally has no adapter tensors.
+    if config.pytorch_weight_path is not None:
+        logging.info(f"Loading weights from: {config.pytorch_weight_path}")
+        safetensors.torch.load_model(
+            model,
+            os.path.join(config.pytorch_weight_path, "model.safetensors"),
+            device=str(device),
+        )
+        logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
+
+    # Configure trainability BEFORE DDP so its reducer sees only parameters
+    # that participate in backward.
+    if config.lora.enabled:
+        replaced = inject_lora(model, config.lora)
+        counts = configure_lora_training(model, config.lora)
+        logging.info(f"Injected LoRA into {len(replaced)} linear layers: {counts}")
+    else:
+        freeze_model(model, config)
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -431,16 +465,6 @@ def train_loop(config: TrainConfig):
             static_graph=world_size >= 8,  # Enable for 8+ GPUs
         )
     logging.info("End DDP setup (if applicable)")
-
-    if config.pytorch_weight_path is not None:
-        logging.info(f"Loading weights from: {config.pytorch_weight_path}")
-        model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-        safetensors.torch.load_model(
-            model_to_load,
-            os.path.join(config.pytorch_weight_path, "model.safetensors"),
-            device=str(device),
-        )
-        logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
     # Log sample images to wandb on first batch, to help verify data loading and for visual reference.
     # Run this AFTER DDP wrap so it doesn't make rank 1 wait at the param-verify collective.

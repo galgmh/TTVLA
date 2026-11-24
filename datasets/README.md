@@ -89,7 +89,6 @@ control/
   sensor_index                # [Tc]，不晚于当前时刻的最新传感器帧
   eef_target                  # [Tc,7]，[x,y,z,qw,qx,qy,qz]
   gripper_target              # [Tc]，m
-  target_force                # [Tc]，N
 
 robot/
   eef_pose                    # [Tc,7]，实测 TCP 位姿

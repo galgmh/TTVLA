@@ -12,9 +12,9 @@ Usage
       --port 8000
 
 The config name is looked up in `configs.configs.ALLCONFIGS` so it shares the
-exact same DataConfig / Pi0Config that the matching training run used. The
-checkpoint directory must contain `model.safetensors` written by
-`finetune_new.save_checkpoint`.
+exact same DataConfig / Pi0Config that the matching training run used. Dense
+runs load `model.safetensors`; LoRA runs load the configured base model plus
+`adapter_model.safetensors`.
 """
 # Patches MUST be installed before any code touches `transformers`.
 from pi05_model._patches import install as install_transformers_patches
@@ -41,6 +41,7 @@ import websockets.frames
 
 from pi05_model.config import Pi0Config
 from pi05_model.model import PI0Pytorch
+from pi05_model.lora import inject_lora, load_lora_adapter
 from pi05_model.observation import Observation
 from pi05_model.preprocessing import IMAGE_RESOLUTION
 from data.data_loader import (
@@ -349,6 +350,7 @@ def load_policy(
     bundle = ALLCONFIGS[config_name]
     data_config: DataConfig = bundle["data_config"]
     model_config: Pi0Config = bundle["model_config"]
+    train_config = bundle["train_config"]
 
     # Training-time `create_data_loader` hydrates norm stats from `norm_stats_dir`;
     # the server uses `data_config.norm_stats` directly, so load them here.
@@ -381,11 +383,29 @@ def load_policy(
     logging.info(f"Building PI0Pytorch on {torch_device} (dtype={model_config.dtype})")
     model = PI0Pytorch(model_config).to(torch_device)
 
-    weights_path = pathlib.Path(checkpoint_dir) / "model.safetensors"
-    if not weights_path.is_file():
-        raise FileNotFoundError(f"No model.safetensors found at {weights_path}")
-    logging.info(f"Loading weights from {weights_path}")
-    safetensors.torch.load_model(model, str(weights_path), device=str(torch_device))
+    checkpoint_dir = pathlib.Path(checkpoint_dir)
+    weights_path = checkpoint_dir / "model.safetensors"
+    adapter_path = checkpoint_dir / "adapter_model.safetensors"
+    if adapter_path.is_file():
+        if not train_config.lora.enabled:
+            raise ValueError(
+                f"{adapter_path} is a LoRA checkpoint but config {config_name!r} has LoRA disabled"
+            )
+        base_path = pathlib.Path(train_config.pytorch_weight_path) / "model.safetensors"
+        if not base_path.is_file():
+            raise FileNotFoundError(f"LoRA base model not found at {base_path}")
+        logging.info(f"Loading LoRA base weights from {base_path}")
+        safetensors.torch.load_model(model, str(base_path), device=str(torch_device))
+        inject_lora(model, train_config.lora)
+        load_lora_adapter(model, checkpoint_dir)
+        logging.info(f"Loaded LoRA adapter from {adapter_path}")
+    elif weights_path.is_file():
+        logging.info(f"Loading weights from {weights_path}")
+        safetensors.torch.load_model(model, str(weights_path), device=str(torch_device))
+    else:
+        raise FileNotFoundError(
+            f"No model.safetensors or adapter_model.safetensors found in {checkpoint_dir}"
+        )
     model.eval()
 
     input_transforms = build_input_transforms(data_config, model_config)
@@ -417,7 +437,7 @@ class Args:
     # Config name in `configs.configs.ALLCONFIGS` (defines data/model config).
     config_name: str
 
-    # Directory holding `model.safetensors`. Typically
+    # Directory holding `model.safetensors` or `adapter_model.safetensors`. Typically
     # `./runs/<exp>/checkpoints/<step>` written by `finetune_new.save_checkpoint`.
     checkpoint_dir: str
 
