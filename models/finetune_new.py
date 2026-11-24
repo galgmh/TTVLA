@@ -66,6 +66,7 @@ class TrainConfig:
 
     # Training hyperparameters.
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16" # Precision for PyTorch training.
+    enable_gradient_checkpointing: bool = True
     # The parameters below should be tuned based on tasks.
     # Refer to Pi0.5/OriginalCodes/openpi/src/openpi/training/config.py for some detailed examples
     warmup_steps: int = 1_000
@@ -434,13 +435,16 @@ def train_loop(config: TrainConfig):
     else:
         freeze_model(model, config)
 
-    if hasattr(model, "gradient_checkpointing_enable"):
-        enable_gradient_checkpointing = True
+    enable_gradient_checkpointing = bool(config.enable_gradient_checkpointing)
+    if enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
         logging.info("Enabled gradient checkpointing for memory optimization")
     else:
         enable_gradient_checkpointing = False
-        logging.info("Gradient checkpointing is not supported for this model")
+        if config.enable_gradient_checkpointing:
+            logging.info("Gradient checkpointing is not supported for this model")
+        else:
+            logging.info("Gradient checkpointing is disabled by config")
 
     # Log initial memory usage after model creation
     if is_main and torch.cuda.is_available():
