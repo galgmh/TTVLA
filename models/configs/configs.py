@@ -37,7 +37,7 @@ class ZeroRightWrist:
 
 DATA_CONFIG = DataConfig(
     repo_id="thermtacvla/lift",
-    local_root=str(REPO_ROOT / "datasets/lerobot/lift"),
+    local_root=str("/root/autodl-fs/datasets/lerobot/lift"),
     asset_id="lift_norm_stats",
     norm_stats_dir=str(REPO_ROOT / "assets/lift_norm_stats"),
     use_quantile_norm=True,
@@ -60,7 +60,7 @@ DATA_CONFIG = DataConfig(
     prompt_from_task=True,
     default_prompt=None,
     tokenizer_path=str(
-        Path.home() / ".cache/openpi/big_vision/paligemma_tokenizer.model"
+        "/root/autodl-tmp/openpi-cache/big_vision/paligemma_tokenizer.model"
     ),
 )
 
@@ -69,7 +69,7 @@ MODEL_CONFIG = Pi0Config(pi05=True)
 FULL_FINETUNE = TrainConfig(
     project_name="pi",
     exp_name="lift_ft",
-    run_dir=str(REPO_ROOT / "runs"),
+    run_dir=str("/root/autodl-fs/runs"),
     log_interval=10,
     save_interval=5_000,
     resume=False,
@@ -77,8 +77,7 @@ FULL_FINETUNE = TrainConfig(
     wandb_enabled=False,
     model_config=None,
     pytorch_weight_path=str(
-        Path.home()
-        / ".cache/openpi/openpi-assets/checkpoints/pi05_base_pytorch"
+        "/root/autodl-fs/openpi/openpi-assets/checkpoints/pi05_base_pytorch"
     ),
     freeze_stage="vlm",
     pytorch_training_precision="bfloat16",
