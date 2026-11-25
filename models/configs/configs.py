@@ -71,7 +71,7 @@ FULL_FINETUNE = TrainConfig(
     exp_name="lift_ft",
     run_dir=str("/root/autodl-fs/runs"),
     log_interval=10,
-    save_interval=4_000,
+    save_interval=2_000,
     resume=False,
     load_checkpoint_dir=None,
     wandb_enabled=True,
@@ -81,16 +81,16 @@ FULL_FINETUNE = TrainConfig(
     ),
     freeze_stage="vlm",
     pytorch_training_precision="bfloat16",
-    warmup_steps=1,
+    warmup_steps=500,
     peak_lr=2.5e-5,
-    decay_steps=15_000,
+    decay_steps=10_000,
     end_lr=2.5e-6,
     optimizer_b1=0.9,
     optimizer_b2=0.95,
     optimizer_eps=1e-8,
     optimizer_weight_decay=1e-10,
     optimizer_clip_gradient_norm=1.0,
-    num_train_steps=15_000,
+    num_train_steps=10_000,
     seed=42,
     batch_size=32,
     num_workers=4,
@@ -104,8 +104,9 @@ LORA_FINETUNE = dataclasses.replace(
     freeze_stage=None,
     peak_lr=1.4e-4,
     end_lr=1.4e-5,
-    batch_size=16,
-    num_train_steps=15_000,
+    batch_size=8,
+    num_train_steps=10_000,
+    enable_gradient_checkpointing=True,
     lora=LoRATrainingConfig(
         enabled=True,
         paligemma_attn_rank=16,
@@ -123,6 +124,71 @@ LORA_FINETUNE = dataclasses.replace(
     ),
 )
 
+
+
+
+
+
+LIBERO_OBJECT_DATA_CONFIG = DataConfig(
+    repo_id="local/libero_object",
+    local_root="/root/autodl-fs/datasets/lerobot/libero_object",
+    asset_id="libero_object",
+    norm_stats_dir="/root/autodl-fs/assets/libero_object",
+    use_quantile_norm=True,
+    video_backend="pyav",
+    repack_transforms=(
+        RepackTransform(
+            {
+                "images": {
+                    "base_0_rgb": "image",
+                    "left_wrist_0_rgb": "wrist_image",
+                },
+                "state": "state",
+                "actions": "actions",
+                "task_index": "task_index",
+            }
+        ),
+    ),
+    data_transforms=(ZeroRightWrist(),),
+    action_sequence_keys=("actions",),
+    prompt_from_task=True,
+    default_prompt=None,
+    tokenizer_path=str(
+        "/root/autodl-tmp/openpi-cache/big_vision/paligemma_tokenizer.model"
+    ),
+)
+
+LIBERO_OBJECT_MODEL_CONFIG = Pi0Config(
+    pi05=True,
+    action_horizon=10,
+    action_dim=32,
+)
+
+
+LIBERO_OBJECT_LORA_TRAIN = dataclasses.replace(
+    LORA_FINETUNE,
+    exp_name="libero_object_lora",
+    run_dir="/root/autodl-fs/runs_libero",
+    pytorch_weight_path=(
+        "/root/autodl-fs/openpi/openpi-assets/checkpoints/pi05_base_pytorch"
+    ),
+    batch_size=8,
+    num_train_steps=5_000,
+    save_interval=1_000,
+    wandb_enabled=True,
+)
+
+
+
+
+
+
+
+
+
+
+
+
 ALLCONFIGS = {
     "lift_ft": {
         "data_config": DATA_CONFIG,
@@ -133,6 +199,11 @@ ALLCONFIGS = {
         "data_config": DATA_CONFIG,
         "model_config": MODEL_CONFIG,
         "train_config": LORA_FINETUNE,
+    },
+    "libero_object_lora": {
+        "data_config": LIBERO_OBJECT_DATA_CONFIG,
+        "model_config": LIBERO_OBJECT_MODEL_CONFIG,
+        "train_config": LIBERO_OBJECT_LORA_TRAIN,
     },
 }
 
