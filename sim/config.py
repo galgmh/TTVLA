@@ -9,7 +9,6 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TaskConfig = dict[str, Any]
-DEFAULT_SCENE_CONFIG = "sim/configs/scene/cup_on_table.yaml"
 
 
 def project_path(path: str | Path) -> Path:
@@ -54,12 +53,8 @@ def load_sensor_config(path: str | Path) -> dict[str, Any]:
     return load_yaml(path)
 
 
-def _legacy_cup_view(cup: dict[str, Any], support: dict[str, Any]) -> dict[str, Any]:
-    """Expose the existing simulator keys while the runtime is refactored.
-
-    The YAML source remains clean and nested.  This adapter prevents scene and
-    recording code from depending on task-specific trajectory configuration.
-    """
+def _cup_runtime_view(cup: dict[str, Any], support: dict[str, Any]) -> dict[str, Any]:
+    """Flatten object fields consumed by the simulator runtime."""
     placement = dict(cup["placement"])
     thermal = dict(cup["thermal"])
     support_thermal = dict(support["thermal"])
@@ -78,7 +73,7 @@ def _legacy_cup_view(cup: dict[str, Any], support: dict[str, Any]) -> dict[str, 
     }
 
 
-def load_scene_config(path: str | Path = DEFAULT_SCENE_CONFIG) -> TaskConfig:
+def load_scene_config(path: str | Path) -> TaskConfig:
     """Load one reusable scene and expand its object/sensor references."""
     scene_path = project_path(path)
     scene = dict(load_yaml(scene_path))
@@ -89,7 +84,7 @@ def load_scene_config(path: str | Path = DEFAULT_SCENE_CONFIG) -> TaskConfig:
 
     cup = load_object_config(cup_path)
     support = load_yaml(support_path)
-    cup_runtime = _legacy_cup_view(cup, support)
+    cup_runtime = _cup_runtime_view(cup, support)
     support_size = list(support["geometry"]["size"])
     support_placement = dict(support["placement"])
 
@@ -113,16 +108,8 @@ def load_scene_config(path: str | Path = DEFAULT_SCENE_CONFIG) -> TaskConfig:
     return scene
 
 
-def load_task_config(
-    path: str | Path,
-    scene_path: str | Path = DEFAULT_SCENE_CONFIG,
-) -> TaskConfig:
-    """Combine a goal-only task with a reusable scene.
-
-    A task YAML is intentionally limited to ``task_id``, ``instructions`` and
-    ``success``.  Scripted expert geometry is code-owned and injected only as a
-    temporary compatibility view for the existing controllers.
-    """
+def load_task_config(path: str | Path) -> TaskConfig:
+    """Load a task together with the scene path declared in that task."""
     from sim.control.cup_expert_defaults import (
         EXPERT_CONTACT,
         EXPERT_REGIONS,
@@ -132,13 +119,17 @@ def load_task_config(
 
     task_path = project_path(path)
     task = load_yaml(task_path)
-    expected = {"task_id", "instructions", "success"}
+    expected = {"task_id", "scene_config", "instructions", "success"}
     if set(task) != expected:
         raise ValueError(
             f"{task_path} 只能包含 {sorted(expected)}，实为 {sorted(task)}"
         )
+    scene_path = task["scene_config"]
+    if not isinstance(scene_path, str) or not scene_path.strip():
+        raise ValueError(f"{task_path} scene_config 必须是非空路径")
     cfg = load_scene_config(scene_path)
     cfg.update(task)
+    cfg["scene_config"] = cfg["config_paths"]["scene"]
     instructions = cfg["instructions"]
     if not isinstance(instructions, list) or not instructions:
         raise ValueError(f"{task_path} instructions 必须是非空列表")
@@ -162,7 +153,6 @@ def load_dataset_config(path: str | Path) -> dict[str, Any]:
 __all__ = [
     "REPO_ROOT",
     "TaskConfig",
-    "DEFAULT_SCENE_CONFIG",
     "load_dataset_config",
     "load_object_config",
     "load_sensor_config",

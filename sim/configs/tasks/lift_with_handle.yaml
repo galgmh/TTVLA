@@ -1,4 +1,5 @@
 task_id: lift_with_handle
+scene_config: sim/configs/scene/cup_on_table.yaml
 instructions:
   - "Lift the cup"
   - "Pick up the cup"

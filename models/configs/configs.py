@@ -106,7 +106,6 @@ LORA_FINETUNE = dataclasses.replace(
     end_lr=1.4e-5,
     batch_size=16,
     num_train_steps=15_000,
-    enable_gradient_checkpointing=False,
     lora=LoRATrainingConfig(
         enabled=True,
         paligemma_attn_rank=16,

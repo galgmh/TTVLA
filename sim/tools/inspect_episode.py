@@ -2,7 +2,8 @@
 
 用法::
 
-    python -m sim.tools.inspect_episode datasets/thermal_contact_v1/pilot/<id>.hdf5
+    python -m sim.tools.inspect_episode \
+        datasets/lift_with_cup_wall/train/lift_with_cup_wall_ins00_000000.hdf5
 """
 
 from __future__ import annotations

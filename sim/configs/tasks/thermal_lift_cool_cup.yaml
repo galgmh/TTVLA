@@ -1,4 +1,5 @@
-task_id: thermal_grasp
+task_id: thermal_lift_cool_cup
+scene_config: sim/configs/scene/cool_cup_on_table.yaml
 instructions:
   - "Grasp the cup at a thermally safe region and lift it"
   - "Probe the cup temperature, then grasp a safe area and raise the cup"

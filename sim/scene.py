@@ -269,6 +269,37 @@ class SceneBundle:
         self.robot.set_dofs_position(q, zero_velocity=True)
         self.robot.control_dofs_position(q)
 
+    def set_temperature(
+        self,
+        temperatures_c: Sequence[float] | None = None,
+        *,
+        rng: np.random.Generator | None = None,
+    ) -> tuple[float, ...]:
+        """Assign the four cup link temperatures for the current episode."""
+        if temperatures_c is None:
+            ranges = self.cfg["object"]["thermal"][
+                "initial_region_temperature_ranges_c"
+            ]
+            if set(ranges) != set(self.cfg["object"]["region_order"]):
+                raise ValueError(
+                    "initial_region_temperature_ranges_c must match region_order"
+                )
+            generator = np.random.default_rng() if rng is None else rng
+            temperatures_c = tuple(
+                float(generator.uniform(*ranges[name]))
+                for name in self.cfg["object"]["region_order"]
+            )
+
+        values = tuple(float(v) for v in temperatures_c)
+        if len(values) != len(self.regions):
+            raise ValueError(
+                f"expected {len(self.regions)} region temperatures, got {len(values)}"
+            )
+        if not np.all(np.isfinite(values)):
+            raise ValueError("region temperatures must be finite")
+        seed_region_temperatures(self.temperatures[0], self.regions, values)
+        return values
+
     # ---------------------------------------------------------------- 单集复位
     def reset_episode(self, spec: EpisodeSpec) -> None:
         """reset -> 机器人初始位姿 -> 杯子位姿 -> 传感器参数 -> 温度播种。
@@ -300,10 +331,7 @@ class SceneBundle:
         # 指尖初始温度：左右各一个值（70% 常温、30% 上一段接触的余温）；
         # 真值与测量通道一起初始化，读数从第一帧起就是该值。
         seed_fingertip_temperatures(self.temperatures, list(spec.fingertip_temps_c))
-        # 杯子四段的初始温度，按 region_order 顺序。
-        seed_region_temperatures(
-            self.temperatures[0], self.regions, list(spec.link_temps_c)
-        )
+        self.set_temperature(spec.link_temps_c)
 
 
 def _resolve_robot_dofs(robot, cfg: TaskConfig) -> tuple[np.ndarray, np.ndarray, list[str]]:

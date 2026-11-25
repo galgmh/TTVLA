@@ -96,7 +96,7 @@ sim/configs + sim/assets
 ```python
 env = GenesisModelEnv(
     "sim/configs/tasks/lift_with_cup_wall.yaml",
-    "sim/generation/presets/thermal_contact_v1.yaml",
+    "sim/generation/presets/lift.yaml",
     split="train",
 )
 
@@ -154,7 +154,6 @@ python -m pip install "lerobot==0.4.3"
 ```bash
 python -m sim.generate \
   --task sim/configs/tasks/lift_with_cup_wall.yaml \
-  --scene sim/configs/scene/cup_on_table.yaml \
   --split train \
   --start 0 \
   --num_per_ins 10 \
@@ -176,7 +175,17 @@ PY
 
 ```bash
 python -m sim.tools.inspect_episode \
-  datasets/lift_with_cup_wall/train/<episode>.hdf5
+  datasets/lift_with_cup_wall/train/lift_with_cup_wall_ins00_000000.hdf5
+```
+
+检查关节限位余量：
+
+```bash
+python -m sim.tools.check_joint_limits \
+  datasets/lift_with_cup_wall/train \
+  --arm-margin-rad 0.10 \
+  --finger-margin-m 0.002 \
+  --json datasets/lift_with_cup_wall/joint_limits.json
 ```
 
 杯壁抓取基线：
@@ -184,7 +193,6 @@ python -m sim.tools.inspect_episode \
 ```bash
 python -m sim.generate \
   --task sim/configs/tasks/lift_with_cup_wall.yaml \
-  --scene sim/configs/scene/cup_on_table.yaml \
   --split train \
   --start 0 --num_per_ins 100 \
   --out datasets/
@@ -195,7 +203,6 @@ python -m sim.generate \
 ```bash
 python -m sim.generate \
   --task sim/configs/tasks/lift_with_cup_rim.yaml \
-  --scene sim/configs/scene/cup_on_table.yaml \
   --split train --start 0 --num_per_ins 40 \
   --out datasets/
 
@@ -211,17 +218,30 @@ python datasets/convert_hdf5_to_lerobot.py \
 生成热安全探索+抓取数据：
 
 ```bash
-python -m sim.generate \
-  --task sim/configs/tasks/thermal_grasp.yaml \
-  --scene sim/configs/scene/cup_on_table.yaml \
-  --split train \
-  --start 0 \
-  --num_per_ins 80 \
-  --out datasets/
+for task in \
+  sim/configs/tasks/thermal_lift_cool_cup.yaml \
+  sim/configs/tasks/thermal_lift_hot_cup.yaml \
+  sim/configs/tasks/thermal_lift_hot_handle_cup.yaml
+do
+  python -m sim.generate \
+    --task "$task" \
+    --split train \
+    --start 0 \
+    --num_per_ins 20 \
+    --out datasets/
+done
 ```
 
-该入口每 4 集在四种专家策略之间轮转，因此 `--num_per_ins 80`
-对应每种专家 20 集。失败 episode 不写盘，并使用确定性 attempt 重试。
+每个 task 生成 80 集，三个场景共 240 集。每集随机选择首个探测
+区域，随后按空间最近原则完成其余区域；首个区域不是 handle 时，
+handle 固定最后探测。每次接触保持 0.5 秒并读取当前真实温度：
+不安全则原地张开并前往下一区域，安全则直接在接触位置抓取抬升。
+相邻 wall 区域之间通常直接从当前接触位移动到下一接触位。
+`middle ↔ upper` 例外：先沿杯外退开 3cm，再抬到杯沿上方 2cm，
+完成腕部转向后下降到 upper pre_pos。wall 与 handle 之间仍使用
+杯口上方 6cm 的全局安全高度。upper 每集在 horizontal 和 vertical
+两种接近方向中等概率选择；vertical 使用更高的杯沿握点。middle 与
+upper 之间只有 vertical 使用 rim 过渡，horizontal 直接移动。
 
 `--num_per_ins` 表示每条 instruction 的 episode 数，总数为
 `instruction 数量 × num_per_ins`。

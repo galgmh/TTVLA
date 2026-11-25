@@ -7,6 +7,7 @@ from typing import Any
 
 import numpy as np
 
+from sim.control.controller import tcp_pose
 from sim.control.probe_controller import ProbeController
 
 
@@ -48,8 +49,10 @@ class GraspLiftController(ProbeController):
         super().__init__(bundle, spec)
         self.policy = policy
         self.initial_cup_z = float(bundle.cup_pose()[0][2])
-        self.lift_target = np.asarray(self.pose.pos, dtype=np.float64).copy()
-        self.lift_target[2] += float(policy.lift_height_m)
+        self.grasp_pos = np.asarray(self.pose.pos, dtype=np.float64).copy()
+        self.grasp_quat = np.asarray(self.pose.quat, dtype=np.float64).copy()
+        self.lift_target: np.ndarray | None = None
+        self.lift_quat: np.ndarray | None = None
         self.lift_trajectory = None
         self.lift_cursor = 0
         self.grasp_hold_steps = max(1, int(round(float(policy.grasp_hold_s) / self.dt)))
@@ -57,12 +60,37 @@ class GraspLiftController(ProbeController):
 
     def _begin(self) -> None:
         super()._begin()
-        if self.approach_trajectory is None:
-            raise RuntimeError("approach trajectory was not planned")
-        self.lift_trajectory = self.controller.plan_lift(
-            self.pose,
-            self.lift_target,
-            initial_arm_q=self.approach_trajectory.arm_q[-1],
+        # The cup can move during contact and closure.  Plan LIFT only after
+        # bilateral grasp confirmation, from the then-measured TCP pose.
+        self.lift_trajectory = None
+        self.lift_cursor = 0
+
+    def _begin_at_contact(self) -> None:
+        """Continue from an existing closed contact without re-approaching."""
+        self.controller.reset()
+        self.controller.set_width_target(self.width_floor)
+        self.grasp_pos, self.grasp_quat = tcp_pose(self.bundle)
+        self.lift_trajectory = None
+        self.lift_cursor = 0
+        self.phase = "GRASP"
+        self.phase_steps = 0
+        self.step_index = 0
+        self.sim_step = 0
+        self.contact_hold_count = 0
+
+    def _plan_lift_from_current(self) -> None:
+        """Plan a vertical lift from the measured post-grasp TCP pose."""
+        start_pos, start_quat = tcp_pose(self.bundle)
+        self.lift_target = np.asarray(start_pos, dtype=np.float64).copy()
+        self.lift_target[2] += float(self.policy.lift_height_m)
+        self.lift_quat = np.asarray(start_quat, dtype=np.float64).copy()
+        arm_q = self.bundle.joint_state()[self.bundle.arm_dofs]
+        self.lift_trajectory = self.controller.plan_joint_trajectory(
+            (
+                (start_pos, start_quat),
+                (self.lift_target, self.lift_quat),
+            ),
+            initial_arm_q=arm_q,
         )
         self.lift_cursor = 0
 
@@ -75,7 +103,7 @@ class GraspLiftController(ProbeController):
     def _command(self) -> None:
         if self.phase == "GRASP":
             self.last_command = self.controller.grasp(
-                self.pose.pos, self.pose.quat, closed_width=self.width_floor
+                self.grasp_pos, self.grasp_quat, closed_width=self.width_floor
             )
             return
         if self.phase == "LIFT":
@@ -88,8 +116,10 @@ class GraspLiftController(ProbeController):
             )
             return
         if self.phase == "HOLD_LIFT":
+            if self.lift_target is None or self.lift_quat is None:
+                raise RuntimeError("lift target was not planned")
             self.last_command = self.controller.hold(
-                self.lift_target, self.pose.quat, closed_width=self.width_floor
+                self.lift_target, self.lift_quat, closed_width=self.width_floor
             )
             return
         super()._command()
@@ -100,6 +130,7 @@ class GraspLiftController(ProbeController):
             "APPROACH",
             "SEEK_CONTACT",
             "RETRACT_OPEN",
+            "RELEASE_SETTLE",
             "RETRACT_MOVE",
             "RETRACT_SETTLE",
         ):
@@ -110,6 +141,7 @@ class GraspLiftController(ProbeController):
 
         if self.phase == "HOLD":
             if self.phase_steps * self.dt >= float(self.policy.touch_hold_s):
+                self.grasp_pos, self.grasp_quat = tcp_pose(self.bundle)
                 self.contact_hold_count = 0
                 self._set_phase("GRASP")
             return
@@ -118,7 +150,7 @@ class GraspLiftController(ProbeController):
             bilateral = bool(np.all(touching))
             self.contact_hold_count = self.contact_hold_count + 1 if bilateral else 0
             if self.contact_hold_count >= self.grasp_hold_steps:
-                self.lift_cursor = 0
+                self._plan_lift_from_current()
                 self._set_phase("LIFT")
                 return
             if self.bundle.gripper_width() <= self.width_floor + 1e-6:
@@ -134,9 +166,12 @@ class GraspLiftController(ProbeController):
                 return
             self.lift_cursor += 1
             if self.lift_cursor >= len(self.lift_trajectory):
+                if self.lift_target is None or self.lift_quat is None:
+                    self._fail("lift_target_missing")
+                    return
                 if not self.controller.at_pose(
                     self.lift_target,
-                    self.pose.quat,
+                    self.lift_quat,
                     pos_tol=0.03,
                     rot_tol=0.35,
                 ):

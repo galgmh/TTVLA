@@ -28,7 +28,7 @@ from sim.control.controller import DeltaPoseController, tcp_pose
 from sim.episode import EpisodeSpec
 from sim.obs import get_policy_observation, get_robot_observation
 from sim.rotations import quat_apply_delta
-from sim.sampler import ThermalContactSampler
+from sim.sampler import LiftSampler
 from sim.scene import SceneBundle, build_scene
 
 RATE_SMOOTH_S = 0.1
@@ -134,9 +134,12 @@ class GenesisModelEnv:
         self.thermal_interval = 1.0 / self.thermal_hz
 
         self.sampler = (
-            ThermalContactSampler(
-                self.task_cfg, self.dataset_cfg, split,
-                seed=seed, count=int(sampler_count),
+            LiftSampler(
+                self.task_cfg,
+                self.dataset_cfg,
+                split,
+                seed=seed,
+                count=int(sampler_count),
             )
             if self.dataset_cfg is not None
             else None

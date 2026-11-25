@@ -12,7 +12,7 @@ from sim.control.grasp_controller import (
     GraspLiftController,
     grasp_policy_from_task,
 )
-from sim.sampler import ThermalContactSampler
+from sim.sampler import LiftSampler
 from sim.scene import build_scene
 
 
@@ -27,13 +27,18 @@ def generate_direct_grasp(
     instruction_seed = (
         base_seed + int(zlib.crc32(instruction.encode("utf-8")))
     ) % (2**32)
-    sampler = ThermalContactSampler(
-        task, dataset, split, seed=instruction_seed, count=start + count
-    )
     try:
         region = tuple(task["object"]["region_order"]).index(policy.grasp_region)
     except ValueError as exc:
         raise SystemExit(f"未知 grasp_region: {policy.grasp_region}") from exc
+    sampler = LiftSampler(
+        task,
+        dataset,
+        split,
+        seed=instruction_seed,
+        count=start + count,
+        region=region,
+    )
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -42,27 +47,12 @@ def generate_direct_grasp(
     written = skipped = 0
     for offset, index in enumerate(range(start, start + count), start=1):
         base = sampler.sample(index)
-        # multi-contact 采样器已为四个区域生成各自的抖动位姿；只取本策略的抓取区。
-        if len(base.probe_positions) != len(task["object"]["region_order"]):
-            raise RuntimeError("纯抓取生成器需要 multi_contact 数据配置提供四区域抖动位姿")
         spec = replace(
             base,
             episode_id=(
-                f"{policy.policy_id}_{split}_ins{instruction_index:02d}_{index:06d}"
+                f"{policy.policy_id}_ins{instruction_index:02d}_{index:06d}"
             ),
-            target_region=region,
-            mixed=False,
-            contact_quality="stable",
-            contact_order=(),
-            contact_hold_s_by_region=(),
-            probe_positions=(),
-            probe_tool_dirs=(),
-            probe_finger_dirs=(),
             instruction=instruction,
-            probe_pos=base.probe_positions[region],
-            probe_tool_dir=base.probe_tool_dirs[region],
-            probe_finger_dir=base.probe_finger_dirs[region],
-            probe_pre_dist=float(task["regions"][policy.grasp_region]["pre_dist"]),
         )
         path = out_dir / f"{spec.episode_id}.hdf5"
         if skip_existing and path.exists():

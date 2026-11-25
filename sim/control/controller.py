@@ -34,6 +34,8 @@ from sim.rotations import (
 # 每个策略步允许的最大关节增量（rad）：目标突变时不会甩飞，也保护 IK 的
 # 线性化假设。
 MAX_JOINT_STEP_RAD = 0.25
+RIM_RETREAT_M = 0.03
+RIM_CLEARANCE_M = 0.02
 
 
 @dataclass(frozen=True)
@@ -283,16 +285,59 @@ class DeltaPoseController:
         *,
         cup_top_z: float,
         hover_clearance_m: float,
+        transition_mode: str = "global",
     ) -> JointTrajectory:
-        """Plan RESET→APPROACH as one continuous, pre-solved trajectory."""
+        """Plan a global safe approach or a direct wall-to-wall transfer."""
         start_pos, start_quat = tcp_pose(self.bundle)
-        hover_z = max(float(start_pos[2]), float(cup_top_z) + float(hover_clearance_m))
-        waypoints = (
-            (start_pos, start_quat),
-            (np.array([start_pos[0], start_pos[1], hover_z]), start_quat),
-            (np.array([pose.pre_pos[0], pose.pre_pos[1], hover_z]), pose.quat),
-            (pose.pre_pos, pose.quat),
-        )
+        if transition_mode == "global":
+            hover_z = max(
+                float(start_pos[2]),
+                float(cup_top_z) + float(hover_clearance_m),
+            )
+            waypoints = [(start_pos, start_quat)]
+            if hover_z > float(start_pos[2]) + 1e-9:
+                waypoints.append(
+                    (np.array([start_pos[0], start_pos[1], hover_z]), start_quat)
+                )
+            waypoints.extend((
+                (np.array([pose.pre_pos[0], pose.pre_pos[1], hover_z]), pose.quat),
+                (pose.pre_pos, pose.quat),
+            ))
+        elif transition_mode == "direct":
+            waypoints = [
+                (start_pos, start_quat),
+                (pose.pos, pose.quat),
+            ]
+        elif transition_mode == "rim":
+            cup_pos, _ = self.bundle.cup_pose()
+            outward = np.asarray(start_pos, dtype=np.float64) - np.asarray(
+                cup_pos, dtype=np.float64
+            )
+            outward[2] = 0.0
+            norm = float(np.linalg.norm(outward))
+            if norm < 1e-9:
+                raise ValueError("cannot derive rim transition direction")
+            outward /= norm
+            retreat_pos = np.asarray(start_pos, dtype=np.float64) + (
+                RIM_RETREAT_M * outward
+            )
+            clear_z = max(
+                float(start_pos[2]),
+                float(pose.pos[2]),
+                float(pose.pre_pos[2]),
+            ) + RIM_CLEARANCE_M
+            waypoints = [
+                (start_pos, start_quat),
+                (retreat_pos, start_quat),
+                (np.array([retreat_pos[0], retreat_pos[1], clear_z]), start_quat),
+                (
+                    np.array([pose.pre_pos[0], pose.pre_pos[1], clear_z]),
+                    pose.quat,
+                ),
+                (pose.pre_pos, pose.quat),
+            ]
+        else:
+            raise ValueError(f"unknown approach transition mode: {transition_mode}")
         return self.plan_joint_trajectory(waypoints)
 
     def plan_lift(

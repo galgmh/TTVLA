@@ -18,6 +18,11 @@ thermal:
     middle: ceramic
     upper: ceramic
     handle: ceramic
+  initial_region_temperature_ranges_c:
+    lower: [65.0, 70.0]
+    middle: [55.0, 60.0]
+    upper: [50.0, 55.0]
+    handle: [30.0, 40.0]
   materials:
     ceramic: {conductivity: 1.5, density: 2300.0, specific_heat: 900.0, emissivity: 0.008}
     water_filled: {conductivity: 1.5, density: 1000.0, specific_heat: 4180.0, emissivity: 0.002}

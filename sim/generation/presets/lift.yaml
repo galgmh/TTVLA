@@ -1,0 +1,8 @@
+dataset_version: lift-v1
+seed: 20261124
+
+sensor_randomization:
+  rc_multiplier_range: [0.8, 1.2]
+  noise_multiplier_range: [0.8, 1.2]
+  quantization_multiplier_range: [0.8, 1.2]
+  bias_absolute_range: [-0.01, 0.01]

@@ -15,6 +15,7 @@ import functools
 import inspect
 import json
 import logging
+import math
 from pathlib import Path
 import time
 from typing import Any
@@ -101,19 +102,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--task-config", default="sim/configs/tasks/lift_with_cup_wall.yaml")
-    parser.add_argument("--dataset-config", default="sim/generation/presets/thermal_contact_v1.yaml")
+    parser.add_argument("--dataset-config", default="sim/generation/presets/lift.yaml")
     parser.add_argument("--split", default="train")
     parser.add_argument("--start", type=int, default=0)
-    parser.add_argument("--episodes", type=int, default=1)
+    parser.add_argument("--episodes", type=int, default=50)
     parser.add_argument("--max-steps", type=int, default=300)
     parser.add_argument("--replan-steps", type=int, default=5)
     parser.add_argument("--num-sample-steps", type=int, default=10)
     parser.add_argument("--task-index", type=int, default=0)
     parser.add_argument("--action-dim", type=int, default=7)
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Seed for scene construction and initial-state sampling",
+    )
+    parser.add_argument(
         "--success-kind",
         choices=("none", "contact", "cup-move", "cup-lift"),
-        default="none",
+        default="cup-lift",
+        help="Success criterion; 'none' always reports zero and is only for debugging",
     )
     parser.add_argument(
         "--success-threshold",
@@ -168,6 +176,28 @@ def _action_chunk(result: dict[str, Any], *, action_dim: int) -> np.ndarray:
 
 def _cup_position(env: GenesisModelEnv) -> np.ndarray:
     return np.asarray(env.bundle.cup_pose()[0], dtype=np.float64).reshape(3)
+
+
+def _wilson_confidence_interval(
+    successes: int,
+    total: int,
+    z: float = 1.959963984540054,
+) -> tuple[float, float]:
+    """Return a two-sided 95% Wilson score interval for a success rate."""
+    if total < 1:
+        return 0.0, 0.0
+    proportion = successes / total
+    denominator = 1.0 + z * z / total
+    centre = (proportion + z * z / (2.0 * total)) / denominator
+    margin = (
+        z
+        * math.sqrt(
+            proportion * (1.0 - proportion) / total
+            + z * z / (4.0 * total * total)
+        )
+        / denominator
+    )
+    return max(0.0, centre - margin), min(1.0, centre + margin)
 
 
 def _is_success(
@@ -242,6 +272,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         args.task_config,
         args.dataset_config,
         split=args.split,
+        seed=args.seed,
         sampler_count=args.start + args.episodes,
         max_steps=args.max_steps,
         show_viewer=args.show_viewer,
@@ -264,6 +295,10 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         action_plan: deque[np.ndarray] = deque()
         inferred_chunks = 0
         success = False
+        first_success_policy_step: int | None = None
+        max_cup_lift = 0.0
+        contact_steps = 0
+        action_norm_sum = 0.0
 
         while not env.done:
             if not action_plan:
@@ -277,15 +312,23 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 action_plan.extend(chunk[: args.replan_steps])
                 inferred_chunks += 1
 
-            obs, done, info = env.step(action_plan.popleft())
+            action = action_plan.popleft()
+            action_norm_sum += float(np.linalg.norm(action))
+            obs, done, info = env.step(action)
             if video is not None:
                 video.add(_video_frame(obs))
+            cup_lift = float(_cup_position(env)[2] - initial_cup_position[2])
+            max_cup_lift = max(max_cup_lift, cup_lift)
+            if bool(get_policy_observation(env.bundle)["contact_mask"].any()):
+                contact_steps += 1
             success = _is_success(
                 args.success_kind,
                 env,
                 initial_cup_position=initial_cup_position,
                 threshold=args.success_threshold,
             )
+            if success and first_success_policy_step is None:
+                first_success_policy_step = int(env.policy_step)
             if success or done:
                 break
 
@@ -298,6 +341,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "policy_steps": int(env.policy_step),
             "sim_time_s": float(env.sim_time),
             "inferred_chunks": inferred_chunks,
+            "first_success_policy_step": first_success_policy_step,
+            "max_cup_lift_m": max_cup_lift,
+            "contact_steps": contact_steps,
+            "mean_action_norm": (
+                action_norm_sum / env.policy_step if env.policy_step else 0.0
+            ),
             "initial_cup_position": initial_cup_position.tolist(),
             "final_cup_position": _cup_position(env).tolist(),
         }
@@ -309,15 +358,26 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     client.close()
 
     successes = sum(int(episode["success"]) for episode in episodes)
+    success_rate = successes / len(episodes)
+    success_rate_ci95 = _wilson_confidence_interval(successes, len(episodes))
     summary = {
         "host": args.host,
         "port": args.port,
+        "server_metadata": client.server_metadata,
+        "task_config": str(args.task_config),
+        "dataset_config": str(args.dataset_config),
         "split": args.split,
         "start": args.start,
+        "episodes_requested": args.episodes,
+        "seed": args.seed,
+        "max_steps": args.max_steps,
+        "replan_steps": args.replan_steps,
+        "num_sample_steps": args.num_sample_steps,
         "episodes": episodes,
         "total_episodes": len(episodes),
         "successes": successes,
-        "success_rate": successes / len(episodes),
+        "success_rate": success_rate,
+        "success_rate_ci95": list(success_rate_ci95),
         "success_kind": args.success_kind,
         "success_threshold": args.success_threshold,
     }

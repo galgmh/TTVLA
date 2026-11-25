@@ -4,7 +4,6 @@ Example::
 
     python -m sim.generate \
       --task sim/configs/tasks/lift_with_cup_wall.yaml \
-      --scene sim/configs/scene/cup_on_table.yaml \
       --split train --start 0 --num_per_ins 100 --out datasets/
 """
 
@@ -19,17 +18,16 @@ from sim.generation.direct_grasp import generate_direct_grasp
 from sim.generation.thermal_grasp import generate_thermal_grasp
 
 PRESET_BY_GOAL = {
-    "cup_wall": "sim/generation/presets/thermal_contact_v1.yaml",
-    "handle": "sim/generation/presets/thermal_contact_v1.yaml",
-    "cup_rim": "sim/generation/presets/thermal_contact_v1.yaml",
-    "thermally_safe": "sim/generation/presets/thermal_grasp.yaml",
+    "cup_wall": "sim/generation/presets/lift.yaml",
+    "handle": "sim/generation/presets/lift.yaml",
+    "cup_rim": "sim/generation/presets/lift.yaml",
+    "thermally_safe": "sim/generation/presets/thermal_lift.yaml",
 }
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="统一生成 Genesis 专家示范 HDF5")
     parser.add_argument("--task", required=True, help="任务 YAML")
-    parser.add_argument("--scene", required=True, help="场景 YAML")
     parser.add_argument("--split", required=True, help="train/validation/test")
     parser.add_argument("--start", type=int, default=0, help="每条 instruction 的起始轨迹编号")
     parser.add_argument(
@@ -59,7 +57,7 @@ def main() -> int:
     if not args.split.strip():
         raise SystemExit("--split 不能为空")
 
-    task = load_task_config(args.task, scene_path=args.scene)
+    task = load_task_config(args.task)
     goal = str(task["success"]["required_grasp_region"])
     try:
         preset_path = PRESET_BY_GOAL[goal]

@@ -1,0 +1,23 @@
+dataset_version: thermal-grasp-v2
+seed: 20261124
+
+sensor_randomization:
+  rc_multiplier_range: [0.8, 1.2]
+  noise_multiplier_range: [0.8, 1.2]
+  quantization_multiplier_range: [0.8, 1.2]
+  bias_absolute_range: [-0.01, 0.01]
+
+execution:
+  contact_hold_s: 0.5
+  grasp_timeout_s: 10.0
+  lift_height_m: 0.12
+
+upper_probe_orientations:
+  horizontal:
+    pos: [0.0, 0.0, 0.088]
+    tool_dir: [-1.0, 0.0, 0.0]
+    pre_dist: 0.06
+  vertical:
+    pos: [0.0, 0.0, 0.102]
+    tool_dir: [0.0, 0.0, -1.0]
+    pre_dist: 0.08

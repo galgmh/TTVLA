@@ -1,0 +1,13 @@
+task_id: thermal_lift_hot_cup
+scene_config: sim/configs/scene/cup_on_table.yaml
+instructions:
+  - "Grasp the cup at a thermally safe region and lift it"
+  - "Probe the cup temperature, then grasp a safe area and raise the cup"
+  - "Avoid hot regions, grasp the cup safely, and lift it"
+  - "Explore the cup temperature and pick it up from a safe contact point"
+
+success:
+  required_grasp_region: thermally_safe
+  candidate_contact_regions: [lower, middle, upper, handle]
+  max_grasp_temperature_c: 45.0
+  min_lift_height_m: 0.06

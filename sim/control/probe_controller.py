@@ -3,7 +3,8 @@
 状态机::
 
     RESET -> APPROACH -> SEEK_CONTACT -> HOLD
-          -> RETRACT_OPEN -> RETRACT_MOVE -> RETRACT_SETTLE -> DONE
+          -> RETRACT_OPEN -> RELEASE_SETTLE -> DONE
+                         -> RETRACT_MOVE -> RETRACT_SETTLE -> DONE
                                      \\-> FAILED（未建立接触）
 
 * RESET      同步控制器到实测位姿，指位保持张开；随后直接进入 APPROACH；
@@ -13,6 +14,8 @@
              ``controller.finger_speed_m_per_s`` 向零宽度闭合手指，直到检测到接触；
 * HOLD       保持 TCP 不动，并持续下发零宽度夹爪目标；
 * RETRACT_OPEN   保持 TCP 不动，先张开手指；
+* RELEASE_SETTLE 不退回预接触位时，在原地张开并等待杯子稳定；下一段控制器
+  随后读取释放后的实际杯子位姿并重新规划；
 * RETRACT_MOVE   仅在夹爪完全张开后，退回预接触位；
 * RETRACT_SETTLE 在预接触位停留 ``timing.post_contact_s``。
 
@@ -55,9 +58,20 @@ def _numpy(tensor) -> np.ndarray:
 class ProbeController:
     """一集一次的单区域触碰。"""
 
-    def __init__(self, bundle, spec):
+    def __init__(
+        self,
+        bundle,
+        spec,
+        *,
+        retract_to_precontact: bool = True,
+        hold_decision: Callable[[], bool] | None = None,
+        approach_mode: str = "global",
+    ):
         self.bundle = bundle
         self.spec = spec
+        self.retract_to_precontact = bool(retract_to_precontact)
+        self.hold_decision = hold_decision
+        self.approach_mode = str(approach_mode)
         task = bundle.cfg
         self.dt = float(task["controller"]["decimation"]) * float(task["controller"]["sim_dt"])
         self.decimation = int(task["controller"]["decimation"])
@@ -128,6 +142,8 @@ class ProbeController:
         self,
         on_sample: Callable[[int], None] | None = None,
         on_control: Callable[[int], None] | None = None,
+        *,
+        start_at_contact: bool = False,
     ) -> ProbeOutcome:
         """执行一整集。
 
@@ -135,7 +151,12 @@ class ProbeController:
         ``on_control`` 在每个 20 Hz 策略步执行前回调。因此控制帧表示
         “当前观测/状态 + 本步将执行的指令”。
         """
-        self._begin()
+        if start_at_contact:
+            if not hasattr(self, "_begin_at_contact"):
+                raise ValueError("this controller cannot start from contact")
+            self._begin_at_contact()
+        else:
+            self._begin()
         if on_sample is not None:
             on_sample(self.sim_step)
         while self.phase not in ("DONE", "FAILED"):
@@ -176,6 +197,7 @@ class ProbeController:
             self.pose,
             cup_top_z=self.cup_top_z,
             hover_clearance_m=HOVER_CLEARANCE_M,
+            transition_mode=self.approach_mode,
         )
         self.phase = "APPROACH"
         self.phase_steps = 0
@@ -194,7 +216,12 @@ class ProbeController:
             self.failure_reason = reason
         if self.contact_start_s is not None and self.contact_end_s is None:
             self.contact_end_s = self.step_index * self.dt
-        if self.phase in ("RETRACT_OPEN", "RETRACT_MOVE", "RETRACT_SETTLE"):
+        if self.phase in (
+            "RETRACT_OPEN",
+            "RELEASE_SETTLE",
+            "RETRACT_MOVE",
+            "RETRACT_SETTLE",
+        ):
             self._set_phase("FAILED")
         else:
             self._set_phase("RETRACT_OPEN")
@@ -227,6 +254,12 @@ class ProbeController:
                 pos_now, quat_now, open_width=self.width_start
             )
             return
+        elif self.phase == "RELEASE_SETTLE":
+            pos_now, quat_now = tcp_pose(self.bundle)
+            self.last_command = ctrl.retract_open(
+                pos_now, quat_now, open_width=self.width_start
+            )
+            return
         elif self.phase in ("RETRACT_MOVE", "RETRACT_SETTLE"):
             self.last_command = ctrl.retract_move(
                 self.pose.pre_pos, self.pose.quat, open_width=self.width_start
@@ -254,8 +287,13 @@ class ProbeController:
             if self._approach_cursor >= len(self.approach_trajectory):
                 # 轨迹按时间结束后直接插入，不再等待 at_pose/settled。
                 # 跟踪误差过大时直接判失败，不能重新引入无限等待。
+                target_pos = (
+                    self.pose.pos
+                    if self.approach_mode == "direct"
+                    else self.pose.pre_pos
+                )
                 if not self.controller.at_pose(
-                    self.pose.pre_pos,
+                    target_pos,
                     self.pose.quat,
                     pos_tol=0.03,
                     rot_tol=0.35,
@@ -264,10 +302,15 @@ class ProbeController:
                     return
                 self._insert_from = np.asarray(self.controller.cmd_pos, dtype=np.float64).copy()
                 distance = float(np.linalg.norm(self.pose.pos - self._insert_from))
-                self._insert_steps = max(
-                    1, int(np.ceil(distance / (SEEK_INSERT_SPEED_M_PER_S * self.dt)))
-                )
-                self._insert_done = False
+                if self.approach_mode == "direct":
+                    self._insert_steps = 1
+                    self._insert_done = True
+                else:
+                    self._insert_steps = max(
+                        1,
+                        int(np.ceil(distance / (SEEK_INSERT_SPEED_M_PER_S * self.dt))),
+                    )
+                    self._insert_done = False
                 self._set_phase("SEEK_CONTACT")
             return
 
@@ -291,14 +334,25 @@ class ProbeController:
         if self.phase == "HOLD":
             if self.phase_steps * self.dt >= float(self.spec.contact_hold_s):
                 self.contact_end_s = self.step_index * self.dt
-                self._set_phase("RETRACT_OPEN")
+                if self.hold_decision is not None and self.hold_decision():
+                    self._set_phase("DONE")
+                else:
+                    self._set_phase("RETRACT_OPEN")
             return
 
         if self.phase == "RETRACT_OPEN":
             if self.bundle.gripper_width() >= self.width_start - 2.0e-4:
-                self._set_phase("RETRACT_MOVE")
+                if not self.retract_to_precontact:
+                    self._set_phase("RELEASE_SETTLE")
+                else:
+                    self._set_phase("RETRACT_MOVE")
             elif self.phase_steps * self.dt >= float(self.timing["retract_open_timeout_s"]):
                 self._fail("retract_open_timeout")
+            return
+
+        if self.phase == "RELEASE_SETTLE":
+            if self.phase_steps * self.dt >= float(self.timing["post_contact_s"]):
+                self._set_phase("DONE" if not self.failure_reason else "FAILED")
             return
 
         if self.phase == "RETRACT_MOVE":
